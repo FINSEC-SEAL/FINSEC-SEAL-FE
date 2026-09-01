@@ -38,3 +38,16 @@
 - Reverification: Node 24.19.0 / pnpm 11.19.0에서 typecheck, 3 files / 13 tests,
   line coverage 72.8%, production build, production dependency audit, `git diff --check` 전부 통과
 - Gate: fixed commit 생성 후 선임 second review 요청
+
+## F3 — Second senior review
+
+- Result: approved
+- Reviewed fixed commit: `8b14e8a5959e53705326db888f5abeb5f474a889`
+- Independent verification:
+  - `ManifestIssue.path`/`severity` Backend 계약과 화면 path 표시 일치
+  - current Attestation이 canonical `PASS`/`REVIEW`/`BLOCKED`를 표시하고
+    malformed/stale는 `INVALID`/`STALE`로 분리
+  - recovery queue 재조회 후 성공 receipt 유지
+  - Node 24.19.0 / pnpm 11.19.0, typecheck PASS, 13/13 tests PASS, production build PASS
+- Remaining findings: none
+- Gate: F3 PASS
