@@ -1,10 +1,10 @@
 import type { ReactNode } from 'react'
 import type { ReleaseLifecycle } from '../api/contracts'
 
-export function StatusBadge({ status }: { status: ReleaseLifecycle | 'ACTIVE' | 'ARCHIVED' | 'STALE' }) {
+export function StatusBadge({ status }: { status: ReleaseLifecycle | 'ACTIVE' | 'ARCHIVED' | 'STALE' | 'INVALID' }) {
   const tone = ['PASS', 'ACTIVE'].includes(status)
     ? 'positive'
-    : ['BLOCKED', 'ARCHIVED', 'STALE'].includes(status)
+    : ['BLOCKED', 'ARCHIVED', 'STALE', 'INVALID'].includes(status)
       ? 'critical'
       : ['REVIEW', 'NEEDS_REVALIDATION'].includes(status)
         ? 'warning'
@@ -68,4 +68,3 @@ export function formatDate(value: string | null | undefined): string {
     timeStyle: 'short',
   }).format(new Date(value))
 }
-

@@ -69,8 +69,9 @@ export interface Release {
 }
 
 export interface ManifestIssue {
-  pointer: string
+  path: string
   code: string
+  severity: 'ERROR' | 'WARNING'
   message: string
 }
 
@@ -145,4 +146,3 @@ export interface RecoveryResult {
   recoveredBy: string
   recoveredAt: string
 }
-

@@ -70,6 +70,22 @@ describe('Role A feature consoles', () => {
     expect(create).not.toHaveBeenCalled()
   })
 
+  it('renders the backend manifest issue path contract', async () => {
+    vi.spyOn(api, 'listReleases').mockResolvedValue([release])
+    vi.spyOn(api, 'validateRelease').mockResolvedValue({
+      valid: false,
+      issues: [{ path: '/model/parameters/temperature', code: 'TYPE', severity: 'ERROR', message: 'temperature must be a JSON number' }],
+    })
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    await user.click(screen.getByRole('button', { name: 'Manifest 검증' }))
+
+    expect(await screen.findByText('/model/parameters/temperature')).toBeInTheDocument()
+    expect(screen.getByText('temperature must be a JSON number')).toBeInTheDocument()
+  })
+
   it('marks an invalidated Attestation as historical and stale', async () => {
     vi.spyOn(api, 'attestation').mockResolvedValue({
       id: '0198f200-0000-7000-8000-000000000003',
@@ -89,6 +105,27 @@ describe('Role A feature consoles', () => {
     expect(await screen.findByRole('heading', { name: 'Historical attestation' })).toBeInTheDocument()
     expect(screen.getByText('STALE / NEEDS REVALIDATION')).toBeInTheDocument()
     expect(screen.getByText('BLOCKED')).toBeInTheDocument()
+  })
+
+  it('shows the confirmed Decision instead of assuming a current Attestation passed', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue({
+      id: '0198f200-0000-7000-8000-000000000008',
+      releaseDecisionId: '0198f200-0000-7000-8000-000000000009',
+      document: { decision: { value: 'REVIEW' } },
+      documentHash: `sha256:${'e'.repeat(64)}`,
+      generatedAt: '2026-09-01T00:00:00Z',
+      disclaimerVersion: 'finsec-internal/v1',
+      stale: false,
+      invalidation: null,
+    })
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="role-a-console" />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+
+    expect(await screen.findByRole('heading', { name: 'Current attestation' })).toBeInTheDocument()
+    expect(screen.getAllByText('REVIEW')).toHaveLength(2)
+    expect(screen.queryByText('PASS')).not.toBeInTheDocument()
   })
 
   it('does not submit a recovery until the operator types the exact resolution', async () => {
@@ -118,6 +155,43 @@ describe('Role A feature consoles', () => {
 
     expect(await screen.findByRole('alert')).toHaveTextContent('RELEASE를 정확히 입력하세요.')
     expect(recover).not.toHaveBeenCalled()
+  })
+
+  it('keeps the recovery success receipt visible after refreshing the queue', async () => {
+    const pending: PendingRecovery = {
+      idempotencyRecordId: '0198f200-0000-7000-8000-000000000010',
+      actorId: 'original-actor',
+      httpMethod: 'POST',
+      requestPath: '/api/v1/agents',
+      idempotencyKey: 'original-key',
+      requestDigest: `sha256:${'f'.repeat(64)}`,
+      expiresAt: '2026-09-01T00:00:00Z',
+      executionFinishedAt: '2026-09-01T00:00:00Z',
+      recoveryReason: 'HTTP_5XX_RESPONSE',
+      createdAt: '2026-09-01T00:00:00Z',
+    }
+    vi.spyOn(api, 'pendingRecoveries').mockResolvedValueOnce([pending]).mockResolvedValueOnce([])
+    vi.spyOn(api, 'recover').mockResolvedValue({
+      id: '0198f200-0000-7000-8000-000000000011',
+      idempotencyRecordId: pending.idempotencyRecordId,
+      resolution: 'RELEASE',
+      stateAfterRecovery: 'RELEASED',
+      responseDigest: null,
+      recoveredBy: 'operator:platform',
+      recoveredAt: '2026-09-01T00:00:00Z',
+    })
+    const user = userEvent.setup()
+    render(<RecoveryPage actorId="operator:platform" onActorChange={vi.fn()} />)
+
+    await user.type(screen.getByLabelText('Recovery key'), 'x'.repeat(32))
+    await user.click(screen.getByRole('button', { name: 'Recovery queue 조회' }))
+    await user.click(await screen.findByRole('button', { name: '검증 결과 등록' }))
+    await user.type(screen.getByLabelText('검증 참조'), 'ops:incident/FINSEC-2026-0002')
+    await user.type(screen.getByLabelText(/RELEASE 입력/), 'RELEASE')
+    await user.click(screen.getByRole('button', { name: 'RELEASE 기록' }))
+
+    expect(await screen.findByRole('status')).toHaveTextContent('RELEASED: recovery 0198f200')
+    expect(screen.getByText('대기 중인 recovery가 없습니다')).toBeInTheDocument()
   })
 
   it('renders scoped append-only audit records', async () => {

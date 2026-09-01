@@ -37,12 +37,13 @@ Frontend의 A 범위는 Backend에 저장된 Platform/Data/Evidence를 안전하
 ## 검증 결과
 
 - TypeScript strict project reference typecheck: PASS
-- Vitest: 3 files / 10 tests PASS, line coverage 64.8%
-- Vite production build: PASS, JS gzip 약 68.6 kB
+- Vitest: 3 files / 13 tests PASS, line coverage 72.8%
+- Vite production build: PASS, JS gzip 약 68.7 kB
 - production dependency audit: known vulnerability 0건
 - 테스트 범위: mutation actor/idempotency headers, Problem trace preservation,
   recovery credential header/exact confirmation, inventory/Agent form, malformed manifest,
-  stale Attestation, Audit, A-role boundary, navigation/accessibility name
+  backend manifest issue `path`, stale/current Attestation Decision, recovery receipt persistence,
+  Audit, A-role boundary, navigation/accessibility name
 
 ## 역할 밖 미구현
 

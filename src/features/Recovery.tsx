@@ -20,8 +20,9 @@ export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onAc
   const [message, setMessage] = useState('')
   const [error, setError] = useState<unknown>()
 
-  async function load() {
-    setBusy(true); setError(undefined); setMessage('')
+  async function load(preserveMessage = false) {
+    setBusy(true); setError(undefined)
+    if (!preserveMessage) setMessage('')
     try { setPending(await api.pendingRecoveries(operatorKey, actorId)); setLoaded(true) }
     catch (cause) { setError(cause) } finally { setBusy(false) }
   }
@@ -55,7 +56,7 @@ export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onAc
     try {
       const result = await api.recover(request, operatorKey, actorId)
       setMessage(`${result.stateAfterRecovery}: recovery ${result.id.slice(0, 8)}가 audit에 기록됐습니다.`)
-      setSelected(null); await load()
+      setSelected(null); await load(true)
     } catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
@@ -81,4 +82,3 @@ export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onAc
     </form> : null}
   </>
 }
-
