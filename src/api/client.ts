@@ -1,0 +1,176 @@
+import type {
+  Agent,
+  AgentCreate,
+  ApiEnvelope,
+  ApiProblem,
+  Attestation,
+  AuditRecord,
+  Fingerprint,
+  JsonValue,
+  PendingRecovery,
+  RecoveryRequest,
+  RecoveryResult,
+  Release,
+  ValidationResult,
+} from './contracts'
+
+const defaultBaseUrl = import.meta.env.VITE_FINSEC_API_BASE_URL ?? 'http://localhost:8080'
+
+export class FinsecApiError extends Error {
+  readonly status: number
+  readonly code: string
+  readonly traceId?: string
+  readonly retryable: boolean
+
+  constructor(status: number, problem: ApiProblem) {
+    super(problem.detail ?? problem.title ?? `HTTP ${status}`)
+    this.name = 'FinsecApiError'
+    this.status = status
+    this.code = problem.code ?? 'UNKNOWN_ERROR'
+    this.traceId = problem.traceId
+    this.retryable = problem.retryable ?? false
+  }
+}
+
+export interface RequestContext {
+  actorId: string
+  idempotencyKey?: string
+  operatorRecoveryKey?: string
+}
+
+function newIdempotencyKey(prefix: string): string {
+  return `${prefix}-${crypto.randomUUID()}`
+}
+
+export class FinsecApiClient {
+  constructor(private readonly baseUrl = defaultBaseUrl) {}
+
+  private async request<T>(
+    path: string,
+    init: RequestInit = {},
+    context?: RequestContext,
+  ): Promise<T> {
+    const headers = new Headers(init.headers)
+    headers.set('Accept', 'application/json')
+    if (context?.actorId) headers.set('X-Actor-Id', context.actorId)
+    if (context?.idempotencyKey) headers.set('Idempotency-Key', context.idempotencyKey)
+    if (context?.operatorRecoveryKey) {
+      headers.set('X-Operator-Recovery-Key', context.operatorRecoveryKey)
+    }
+    if (init.body !== undefined && !headers.has('Content-Type')) {
+      headers.set('Content-Type', 'application/json')
+    }
+    const response = await fetch(`${this.baseUrl}${path}`, { ...init, headers })
+    if (!response.ok) {
+      let problem: ApiProblem = { status: response.status, title: response.statusText }
+      try {
+        problem = (await response.json()) as ApiProblem
+      } catch {
+        // Preserve the status when an intermediary returns a non-JSON response.
+      }
+      throw new FinsecApiError(response.status, problem)
+    }
+    return ((await response.json()) as ApiEnvelope<T>).data
+  }
+
+  listAgents(actorId: string): Promise<Agent[]> {
+    return this.request('/api/v1/agents', {}, { actorId })
+  }
+
+  createAgent(input: AgentCreate, actorId: string): Promise<Agent> {
+    return this.request('/api/v1/agents', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }, { actorId, idempotencyKey: newIdempotencyKey('agent-create') })
+  }
+
+  archiveAgent(agentId: string, actorId: string): Promise<Agent> {
+    return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}`, {
+      method: 'DELETE',
+    }, { actorId, idempotencyKey: newIdempotencyKey('agent-archive') })
+  }
+
+  listReleases(agentId: string, actorId: string): Promise<Release[]> {
+    return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {}, { actorId })
+  }
+
+  createRelease(agentId: string, manifest: JsonValue, actorId: string): Promise<Release> {
+    return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {
+      method: 'POST',
+      body: JSON.stringify(manifest),
+    }, { actorId, idempotencyKey: newIdempotencyKey('release-create') })
+  }
+
+  validateRelease(releaseId: string, actorId: string): Promise<ValidationResult> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}:validate`, {
+      method: 'POST',
+      body: '{}',
+    }, { actorId, idempotencyKey: newIdempotencyKey('release-validate') })
+  }
+
+  analyzeRelease(releaseId: string, actorId: string): Promise<Release> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}:analyze`, {
+      method: 'POST',
+      body: '{}',
+    }, { actorId, idempotencyKey: newIdempotencyKey('release-analyze') })
+  }
+
+  fingerprint(releaseId: string, actorId: string): Promise<Fingerprint> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
+  }
+
+  attestation(releaseId: string, actorId: string): Promise<Attestation> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/attestation`, {}, { actorId })
+  }
+
+  audit(resourceType: string, resourceId: string, actorId: string): Promise<AuditRecord[]> {
+    const params = new URLSearchParams({ resourceType, resourceId, limit: '50' })
+    return this.request(`/api/v1/audit-records?${params}`, {}, { actorId })
+  }
+
+  pendingRecoveries(operatorKey: string, actorId: string): Promise<PendingRecovery[]> {
+    return this.request('/api/v1/platform/idempotency-recoveries/pending', {}, {
+      actorId,
+      operatorRecoveryKey: operatorKey,
+    })
+  }
+
+  recover(input: RecoveryRequest, operatorKey: string, actorId: string): Promise<RecoveryResult> {
+    return this.request('/api/v1/platform/idempotency-recoveries', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }, {
+      actorId,
+      operatorRecoveryKey: operatorKey,
+      idempotencyKey: newIdempotencyKey('operator-recovery'),
+    })
+  }
+
+  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string): Promise<void> {
+    const response = await fetch(
+      `${this.baseUrl}/api/v1/releases/${encodeURIComponent(releaseId)}/evidence-export?format=${format}`,
+      { headers: { 'X-Actor-Id': actorId } },
+    )
+    if (!response.ok) {
+      let problem: ApiProblem = { status: response.status, title: response.statusText }
+      try {
+        problem = (await response.json()) as ApiProblem
+      } catch {
+        // Preserve the status when an intermediary returns a non-JSON response.
+      }
+      throw new FinsecApiError(response.status, problem)
+    }
+    const blob = await response.blob()
+    const disposition = response.headers.get('Content-Disposition') ?? ''
+    const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `finsec-attestation.${format}`
+    const href = URL.createObjectURL(blob)
+    const link = document.createElement('a')
+    link.href = href
+    link.download = name
+    link.click()
+    URL.revokeObjectURL(href)
+  }
+}
+
+export const api = new FinsecApiClient()
+
