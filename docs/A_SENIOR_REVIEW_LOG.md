@@ -51,3 +51,13 @@
   - Node 24.19.0 / pnpm 11.19.0, typecheck PASS, 13/13 tests PASS, production build PASS
 - Remaining findings: none
 - Gate: F3 PASS
+
+## F4 — Final browser smoke
+
+- Production build preview: `http://127.0.0.1:4173/` HTTP 200, page title/asset load PASS
+- Real browser navigation: Overview → Agents → Agent 등록 폼 → Recovery 렌더링 PASS
+- Accessibility snapshot: 주요 navigation, heading, form label/button accessible name 확인
+- Credential handling: Recovery key 필드는 password input이고 localStorage/sessionStorage 모두 비어 있음
+- Expected environment observation: Backend를 함께 실행하지 않은 smoke에서 초기 API 2건은
+  `Failed to fetch`를 반환했고, UI가 error banner로 표시함
+- Gate: F4 PASS

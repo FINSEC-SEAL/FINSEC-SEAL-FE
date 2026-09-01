@@ -40,6 +40,8 @@ Frontend의 A 범위는 Backend에 저장된 Platform/Data/Evidence를 안전하
 - Vitest: 3 files / 13 tests PASS, line coverage 72.8%
 - Vite production build: PASS, JS gzip 약 68.7 kB
 - production dependency audit: known vulnerability 0건
+- Playwright 실브라우저 production preview smoke: HTTP 200, Overview/Agents/등록 폼/Recovery
+  렌더링과 내비게이션 PASS, recovery key browser storage 미저장 확인
 - 테스트 범위: mutation actor/idempotency headers, Problem trace preservation,
   recovery credential header/exact confirmation, inventory/Agent form, malformed manifest,
   backend manifest issue `path`, stale/current Attestation Decision, recovery receipt persistence,
