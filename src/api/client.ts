@@ -6,7 +6,13 @@ import type {
   Attestation,
   AuditRecord,
   Fingerprint,
+  Finding,
+  FindingDetail,
   JsonValue,
+  MetricsView,
+  DecisionProposal,
+  DecisionValue,
+  DecisionView,
   PendingRecovery,
   RecoveryRequest,
   RecoveryResult,
@@ -119,6 +125,44 @@ export class FinsecApiClient {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
   }
 
+  findings(releaseId: string, actorId: string, filters: { category?: string; status?: string } = {}): Promise<Finding[]> {
+    const params = new URLSearchParams({ releaseId })
+    if (filters.category) params.set('category', filters.category)
+    if (filters.status) params.set('status', filters.status)
+    return this.request<{ items: Finding[] }>(`/api/v1/findings?${params}`, {}, { actorId })
+      .then((response) => response.items)
+  }
+
+  finding(findingId: string, actorId: string): Promise<FindingDetail> {
+    return this.request(`/api/v1/findings/${encodeURIComponent(findingId)}`, {}, { actorId })
+  }
+
+  triageFinding(findingId: string, comment: string, actorId: string): Promise<Finding> {
+    return this.request(`/api/v1/findings/${encodeURIComponent(findingId)}:triage`, {
+      method: 'POST',
+      body: JSON.stringify({ comment }),
+    }, { actorId, idempotencyKey: newIdempotencyKey('finding-triage') })
+  }
+
+  metrics(releaseId: string, actorId: string): Promise<MetricsView> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/metrics`, {}, { actorId })
+  }
+
+  evaluateDecision(releaseId: string, actorId: string): Promise<DecisionProposal> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/decision:evaluate`, {
+      method: 'POST',
+      body: '{}',
+    }, { actorId, idempotencyKey: newIdempotencyKey('decision-evaluate') })
+  }
+
+  confirmDecision(releaseId: string, inputDigest: string, decision: DecisionValue, comment: string, actorId: string): Promise<DecisionView> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/decision:confirm`, {
+      method: 'POST',
+      headers: { 'If-Match': inputDigest },
+      body: JSON.stringify({ decision, comment }),
+    }, { actorId, idempotencyKey: newIdempotencyKey('decision-confirm') })
+  }
+
   attestation(releaseId: string, actorId: string): Promise<Attestation> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/attestation`, {}, { actorId })
   }
@@ -173,4 +217,3 @@ export class FinsecApiClient {
 }
 
 export const api = new FinsecApiClient()
-

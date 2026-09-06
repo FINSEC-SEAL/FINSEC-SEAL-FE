@@ -146,3 +146,140 @@ export interface RecoveryResult {
   recoveredBy: string
   recoveredAt: string
 }
+
+export type OracleOutcome =
+  | 'ATTACK_SUCCESS'
+  | 'ATTACK_BLOCKED'
+  | 'INCONCLUSIVE'
+  | 'NORMAL_SUCCESS'
+  | 'NORMAL_FAILURE'
+
+export type OracleType =
+  | 'CROSS_CUSTOMER'
+  | 'SENSITIVE_FIELD'
+  | 'EXFILTRATION'
+  | 'HIGH_IMPACT_MUTATION'
+  | 'NORMAL_TASK'
+
+export interface OracleResult {
+  id: string
+  runId: string
+  testCaseRunId: string
+  sourceEventId: string | null
+  oracleType: OracleType
+  oracleVersion: string
+  outcome: OracleOutcome
+  reasonCode: string
+  invariantId: string
+  evidence: JsonValue
+  evidenceDigest: string
+  evaluatedAt: string
+  createdAt: string
+}
+
+export interface Finding {
+  id: string
+  releaseId: string
+  sourceOracleResultId: string
+  category: string
+  severity: string
+  title: string
+  status: string
+  violatedInvariant: string
+  rootCause: JsonValue
+  findingGroupKey: string | null
+  firstSeenRunId: string
+  latestSeenRunId: string
+  createdAt: string
+  updatedAt: string
+}
+
+export interface FindingDetail {
+  finding: Finding
+  oracleResult: OracleResult
+  relatedFindings: Finding[]
+}
+
+export interface MetricValue {
+  name: string
+  status: 'AVAILABLE' | 'N_A'
+  numerator: number | null
+  denominator: number | null
+  value: number | null
+  reason: string | null
+  sourceRunIds: string[]
+}
+
+export interface TrialEvaluation {
+  runId: string
+  caseRunId: string
+  mode: string
+  caseType: string
+  category: string
+  severity: string
+  status: string
+  outcomes: OracleOutcome[]
+  reasonCodes: string[]
+  forbiddenAttempt: boolean
+  policyDeniedBeforeSideEffect: boolean
+  operationalError: boolean
+}
+
+export interface ReleaseMetrics {
+  attackSuccessRate: MetricValue
+  attackBlockRate: MetricValue
+  heldOutAttackSuccessRate: MetricValue
+  normalTaskSuccessRate: MetricValue
+  falseBlockRate: MetricValue
+  operationalErrorRate: MetricValue
+  unauthorizedRecordExposureCount: number
+  sensitiveFieldExposureCount: number
+  exfiltrationSuccessCount: number
+  highImpactMutationCount: number
+  normalConclusiveTrials: number
+  trials: TrialEvaluation[]
+}
+
+export interface MetricsView {
+  releaseId: string
+  metrics: ReleaseMetrics
+  /** Forward-compatible B/C replay evidence. The current backend may omit this until orchestration is wired. */
+  replaySummary?: ReplaySummary | null
+}
+
+export interface ReplayComparison {
+  baselineRunId: string
+  replayRunId: string
+  category?: string | null
+  comparable: boolean
+  mismatchReasons: string[]
+}
+
+export interface ReplaySummary {
+  totalCount: number
+  comparableCount: number
+  nonComparableCount: number
+  evidenceComplete: boolean
+  items: ReplayComparison[]
+}
+
+export type DecisionValue = 'PASS' | 'REVIEW' | 'BLOCKED'
+
+export interface DecisionProposal {
+  releaseId: string
+  proposedDecision: DecisionValue
+  gatePolicyVersion: string
+  inputDigest: string
+  inputSnapshot: JsonValue
+}
+
+export interface DecisionView {
+  id: string
+  releaseId: string
+  decision: DecisionValue
+  gatePolicyVersion: string
+  inputDigest: string
+  proposedAt: string
+  confirmedBy: string
+  confirmedAt: string
+}
