@@ -9,14 +9,16 @@ import { Overview } from './features/Overview'
 import { RecoveryPage } from './features/Recovery'
 import { FindingsPage } from './features/Findings'
 import { AssurancePage } from './features/Assurance'
+import { ExecutionPage } from './features/Execution'
 
-type Page = 'overview' | 'agents' | 'releases' | 'findings' | 'assurance' | 'evidence' | 'recovery' | 'audit'
+type Page = 'overview' | 'agents' | 'releases' | 'execution' | 'findings' | 'assurance' | 'evidence' | 'recovery' | 'audit'
 
 const navigation: Array<{ id: Page; label: string; mark: string; section?: boolean }> = [
   { id: 'overview', label: '개요', mark: '◐' },
   { id: 'agents', label: 'Agents', mark: 'A' },
   { id: 'releases', label: 'Releases', mark: 'R' },
-  { id: 'findings', label: 'Findings', mark: 'F', section: true },
+  { id: 'execution', label: 'Runs & Trace', mark: 'X', section: true },
+  { id: 'findings', label: 'Findings', mark: 'F' },
   { id: 'assurance', label: 'Assurance', mark: 'D' },
   { id: 'evidence', label: 'Evidence', mark: 'E', section: true },
   { id: 'audit', label: 'Audit', mark: 'T' },
@@ -68,7 +70,7 @@ export default function App() {
           {item.section ? <span className="nav-divider" /> : null}
           <button className={page === item.id ? 'nav-item nav-item--active' : 'nav-item'} onClick={() => navigate(item.id)} aria-current={page === item.id ? 'page' : undefined}>
             <span className="nav-mark" aria-hidden="true">{item.mark}</span>{item.label}{item.id === 'recovery' ? <span className="restricted-dot" title="Operator only" aria-hidden="true" /> : null}</button></div>)}</nav>
-        <div className="sidebar-footer"><p>Shared console</p><strong>Platform · Data · Evidence</strong><small>Role A foundation · Role D Finding / Oracle / Assurance</small></div>
+        <div className="sidebar-footer"><p>Shared console</p><strong>Platform · Data · Evidence</strong><small>Role A foundation · Role B execution · Role D assurance</small></div>
       </aside>
       <div className="workspace">
         <header className="topbar"><div className="breadcrumb"><span>FINSEC</span><b>/</b><strong>{navigation.find((item) => item.id === page)?.label}</strong></div>
@@ -79,6 +81,7 @@ export default function App() {
             {page === 'overview' ? <Overview agents={agents} releases={releases} onNavigate={navigate} /> : null}
             {page === 'agents' ? <AgentsPage agents={agents} actorId={actorId} onChanged={reload} onSelect={selectAgent} /> : null}
             {page === 'releases' ? <ReleasesPage agents={agents} actorId={actorId} initialAgent={selectedAgent} onReleaseSelect={(release) => setSelectedReleaseId(release.id)} onReleaseInventory={(items) => setReleases((current) => [...current.filter((release) => release.agentId !== items[0]?.agentId), ...items].sort((a, b) => b.updatedAt.localeCompare(a.updatedAt)))} /> : null}
+            {page === 'execution' ? <ExecutionPage releases={releases} actorId={actorId} /> : null}
             {page === 'findings' ? <FindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} /> : null}
             {page === 'assurance' ? <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} /> : null}
             {page === 'evidence' ? <EvidencePage releases={releases} actorId={actorId} /> : null}

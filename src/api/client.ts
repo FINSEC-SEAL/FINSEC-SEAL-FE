@@ -13,6 +13,7 @@ import type {
   DecisionProposal,
   DecisionValue,
   DecisionView,
+  TestRun, EventHistory, EventChainVerification, OracleResult, TestRunStart, TestRunRegistered,
   PendingRecovery,
   RecoveryRequest,
   RecoveryResult,
@@ -124,6 +125,13 @@ export class FinsecApiClient {
   fingerprint(releaseId: string, actorId: string): Promise<Fingerprint> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
   }
+
+  testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
+  startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
+  eventHistory(runId: string, actorId: string): Promise<EventHistory> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=0&limit=100`, {}, { actorId }) }
+  verifyEventChain(runId: string, actorId: string): Promise<EventChainVerification> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/events:verify`, {}, { actorId }) }
+  runFindings(runId: string, actorId: string): Promise<Finding[]> { return this.request<{items:Finding[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/findings`, {}, { actorId }).then(v=>v.items) }
+  runOracleResults(runId: string, actorId: string): Promise<OracleResult[]> { return this.request<{items:OracleResult[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/oracle-results`, {}, { actorId }).then(v=>v.items) }
 
   findings(releaseId: string, actorId: string, filters: { category?: string; status?: string } = {}): Promise<Finding[]> {
     const params = new URLSearchParams({ releaseId })
