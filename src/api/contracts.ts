@@ -283,3 +283,10 @@ export interface DecisionView {
   confirmedBy: string
   confirmedAt: string
 }
+
+export interface TestRun { id:string; releaseId:string; suiteId:string; contractVersionId:string|null; mode:'BASELINE'|'SEAL_REPLAY'|'HELD_OUT'|'REGRESSION'; status:string; agentArtifactFingerprint:string; releaseFingerprint:string; fixtureVersion:string; fixtureDigest:string; totalCases:number; completedCases:number; operationalErrorCount:number; latestSequence:number; latestEventType:string|null; eventHeadHash:string|null; summary:JsonValue; startedAt:string|null; completedAt:string|null; createdAt:string }
+export interface ExecutionEvent { schemaVersion:string; eventId:string; traceId:string; runId:string; testCaseRunId:string|null; sequence:number; occurredAt:string; eventType:string; toolName:string|null; input:JsonValue; output:JsonValue; payloadDigest:string; policyDecision:JsonValue; reasonCode:string|null; metadata:JsonValue; prevEventHash:string|null; eventHash:string }
+export interface EventHistory { items:ExecutionEvent[]; headSequence:number; nextCursor:number|null }
+export interface EventChainVerification { runId:string; valid:boolean; eventCount:number; firstInvalidSequence:number|null; headHash:string|null }
+export interface TestRunStart { releaseId:string; suiteId:string; mode:TestRun['mode']; contractVersionId:string|null; caseIds:string[]; randomSeed:number|null }
+export interface TestRunRegistered { runId:string; status:string; statusUrl:string; streamUrl:string }
