@@ -1,6 +1,6 @@
 import { useState } from 'react'
 import type { Attestation, Release } from '../api/contracts'
-import { api } from '../api/client'
+import { api, type PlatformClient } from '../api/client'
 import { EmptyState, ErrorBanner, PageHeader, ShortHash, StatusBadge, formatDate } from '../components/Primitives'
 
 type AttestationDecision = 'PASS' | 'REVIEW' | 'BLOCKED'
@@ -13,7 +13,7 @@ function readDecision(attestation: Attestation): AttestationDecision | null {
   return value === 'PASS' || value === 'REVIEW' || value === 'BLOCKED' ? value : null
 }
 
-export function EvidencePage({ releases, actorId }: { releases: Release[]; actorId: string }) {
+export function EvidencePage({ releases, actorId, client = api, simulated = false }: { releases: Release[]; actorId: string; client?: PlatformClient; simulated?: boolean }) {
   const [releaseId, setReleaseId] = useState(releases[0]?.id ?? '')
   const [attestation, setAttestation] = useState<Attestation | null>(null)
   const [busy, setBusy] = useState(false)
@@ -22,19 +22,19 @@ export function EvidencePage({ releases, actorId }: { releases: Release[]; actor
   async function inspect() {
     if (!releaseId) return
     setBusy(true); setError(undefined); setAttestation(null)
-    try { setAttestation(await api.attestation(releaseId, actorId)) }
+    try { setAttestation(await client.attestation(releaseId, actorId)) }
     catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
   async function download(format: 'json' | 'html') {
     if (!releaseId) return
     setBusy(true); setError(undefined)
-    try { await api.downloadAttestation(releaseId, format, actorId) }
+    try { await client.downloadAttestation(releaseId, format, actorId) }
     catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
   return <>
-    <PageHeader eyebrow="EVIDENCE PROJECTION" title="Attestation" description="확정된 ReleaseDecision의 immutable input snapshot을 재계산 없이 JSON·HTML 증적으로 projection합니다." />
+    <PageHeader eyebrow="EVIDENCE PROJECTION" title="구성과 증거" description="확정된 판정의 입력과 증적을 확인합니다. 과거 보고서와 현재 구성의 상태를 구분합니다." />
     <ErrorBanner error={error} onDismiss={() => setError(undefined)} />
     <section className="panel attestation-picker"><label>Release<select value={releaseId} onChange={(event) => { setReleaseId(event.target.value); setAttestation(null) }}>
       <option value="">선택하세요</option>{releases.map((release) => <option key={release.id} value={release.id}>v{release.version} · {release.businessPurpose} · {release.effectiveStatus}</option>)}</select></label>
@@ -47,7 +47,8 @@ export function EvidencePage({ releases, actorId }: { releases: Release[]; actor
           {attestation.stale ? <div className="stale-notice"><strong>STALE / NEEDS REVALIDATION</strong><p>기존 증적은 보존되지만 현재 Release의 상태를 인증하지 않습니다.</p></div> : null}
           <dl className="detail-grid"><div><dt>Document hash</dt><dd><ShortHash value={attestation.documentHash} /></dd></div><div><dt>Generated</dt><dd>{formatDate(attestation.generatedAt)}</dd></div>
             <div><dt>Decision</dt><dd>{decision ?? 'INVALID'}</dd></div><div><dt>Disclaimer</dt><dd>{attestation.disclaimerVersion}</dd></div></dl>
-          <div className="button-row"><button className="secondary-button" onClick={() => void download('json')}>JSON 내려받기</button><button className="primary-button" onClick={() => void download('html')}>HTML 내려받기</button></div>
+          <div className="button-row"><button className="secondary-button" disabled={simulated || busy || !decision} onClick={() => void download('json')}>JSON 내려받기</button><button className="primary-button" disabled={simulated || busy || !decision} onClick={() => void download('html')}>HTML 내려받기</button></div>
+          {simulated ? <p className="muted">DEMO_ONLY · 합성 예시의 실제 증적 내보내기는 비활성화됩니다.</p> : null}
         </article>
         <article className="panel document-preview"><div className="panel-heading"><div><p className="eyebrow">CANONICAL DOCUMENT</p><h2>Evidence snapshot</h2></div></div><pre>{JSON.stringify(attestation.document, null, 2)}</pre></article>
       </section>

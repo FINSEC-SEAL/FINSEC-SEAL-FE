@@ -173,4 +173,4 @@ export class FinsecApiClient {
 }
 
 export const api = new FinsecApiClient()
-
+export type PlatformClient = Pick<FinsecApiClient, keyof FinsecApiClient>

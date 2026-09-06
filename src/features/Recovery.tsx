@@ -1,6 +1,6 @@
 import { useState, type FormEvent } from 'react'
 import type { PendingRecovery, RecoveryRequest } from '../api/contracts'
-import { api } from '../api/client'
+import { api, type PlatformClient } from '../api/client'
 import { EmptyState, ErrorBanner, PageHeader, ShortHash, formatDate } from '../components/Primitives'
 
 function utf8Base64(value: string): string {
@@ -10,7 +10,7 @@ function utf8Base64(value: string): string {
   return btoa(binary)
 }
 
-export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onActorChange: (actor: string) => void }) {
+export function RecoveryPage({ actorId, onActorChange, client = api, simulated = false }: { actorId: string; onActorChange: (actor: string) => void; client?: PlatformClient; simulated?: boolean }) {
   const [operatorKey, setOperatorKey] = useState('')
   const [pending, setPending] = useState<PendingRecovery[]>([])
   const [selected, setSelected] = useState<PendingRecovery | null>(null)
@@ -23,7 +23,7 @@ export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onAc
   async function load(preserveMessage = false) {
     setBusy(true); setError(undefined)
     if (!preserveMessage) setMessage('')
-    try { setPending(await api.pendingRecoveries(operatorKey, actorId)); setLoaded(true) }
+    try { setPending(await client.pendingRecoveries(operatorKey, actorId)); setLoaded(true) }
     catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
@@ -54,15 +54,18 @@ export function RecoveryPage({ actorId, onActorChange }: { actorId: string; onAc
     }
     setBusy(true); setError(undefined); setMessage('')
     try {
-      const result = await api.recover(request, operatorKey, actorId)
+      const result = await client.recover(request, operatorKey, actorId)
       setMessage(`${result.stateAfterRecovery}: recovery ${result.id.slice(0, 8)}가 audit에 기록됐습니다.`)
       setSelected(null); await load(true)
     } catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
   return <>
-    <PageHeader eyebrow="FAIL-CLOSED OPERATIONS" title="Idempotency recovery" description="원 요청의 실행 여부를 외부 증거로 확인한 후에만 reservation을 RELEASE 또는 COMPLETE합니다." />
-    <div className="critical-notice"><strong>자동 복구 금지</strong><p>TTL이 지났다는 이유만으로 재실행하지 마세요. DB·업무 결과·사고 티켓을 교차 확인해야 합니다.</p></div>
+    <PageHeader eyebrow="FAIL-CLOSED OPERATIONS" title="운영 복구 대기열" description="실행 여부가 불명확한 요청은 증거 확인 전까지 재실행하지 않습니다. 운영자만 복구 결과를 기록할 수 있습니다." />
+    <section className="recovery-notices" aria-label="운영 복구 안내">
+      {simulated ? <div className="notice notice--blue"><strong>복구 폼 체험 · 서버로 전송하지 않습니다.</strong><p>실제 운영 키를 입력하지 마세요. 아래 버튼은 이 브라우저의 합성 대기열만 변경합니다.</p><button className="secondary-button" onClick={() => { setOperatorKey('demo-only-not-a-real-recovery-key'); onActorChange('operator:demo') }}>샘플 운영자 설정</button></div> : null}
+      <div className="critical-notice"><strong>자동 복구 금지</strong><p>TTL이 지났다는 이유만으로 재실행하지 마세요. DB·업무 결과·사고 티켓을 교차 확인해야 합니다.</p></div>
+    </section>
     <ErrorBanner error={error} onDismiss={() => setError(undefined)} />
     {message ? <div className="success-banner" role="status">{message}</div> : null}
     <section className="panel credential-panel"><label>Operator actor<input value={actorId} onChange={(event) => onActorChange(event.target.value)} placeholder="operator:platform" /></label>

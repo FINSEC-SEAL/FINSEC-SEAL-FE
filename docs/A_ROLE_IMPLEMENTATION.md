@@ -1,5 +1,7 @@
 # A Role Implementation — Frontend
 
+> 아래 구현/테스트 수치는 최초 A 콘솔의 기록입니다. 이후 전체 제품 UI와 샘플 B/C/D 화면이 추가됐습니다. 현재 역할별 수정 위치와 실제 API 연결 상태는 [프론트엔드 역할별 인수인계](FRONTEND_ROLE_HANDOFF.md), 디자인 적용 내용은 [Figma 인수인계](FIGMA_FRONTEND_HANDOFF.md)를 우선 확인하세요. 아래의 “역할 밖 미구현”은 최초 A 구현 범위를 뜻하며, 현재 B/C/D 샘플 화면이 없다는 의미는 아닙니다.
+
 ## 이 레포에서 A의 책임
 
 Frontend의 A 범위는 Backend에 저장된 Platform/Data/Evidence를 안전하게 입력·조회하는

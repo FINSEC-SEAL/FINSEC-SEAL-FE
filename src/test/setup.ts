@@ -1,5 +1,7 @@
 import '@testing-library/jest-dom/vitest'
 
+Object.defineProperty(window, 'scrollTo', { value: () => {}, writable: true })
+
 Object.defineProperty(globalThis, 'crypto', {
   value: {
     ...globalThis.crypto,
@@ -7,4 +9,3 @@ Object.defineProperty(globalThis, 'crypto', {
   },
   configurable: true,
 })
-

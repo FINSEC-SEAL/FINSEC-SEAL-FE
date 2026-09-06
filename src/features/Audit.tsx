@@ -1,9 +1,9 @@
 import { useState, type FormEvent } from 'react'
 import type { AuditRecord } from '../api/contracts'
-import { api } from '../api/client'
+import { api, type PlatformClient } from '../api/client'
 import { EmptyState, ErrorBanner, PageHeader, ShortHash, formatDate } from '../components/Primitives'
 
-export function AuditPage({ actorId }: { actorId: string }) {
+export function AuditPage({ actorId, client = api }: { actorId: string; client?: PlatformClient }) {
   const [records, setRecords] = useState<AuditRecord[]>([])
   const [searched, setSearched] = useState(false)
   const [busy, setBusy] = useState(false)
@@ -13,13 +13,13 @@ export function AuditPage({ actorId }: { actorId: string }) {
     event.preventDefault(); setBusy(true); setError(undefined)
     const data = new FormData(event.currentTarget)
     try {
-      setRecords(await api.audit(String(data.get('resourceType')), String(data.get('resourceId')), actorId))
+      setRecords(await client.audit(String(data.get('resourceType')), String(data.get('resourceId')), actorId))
       setSearched(true)
     } catch (cause) { setError(cause) } finally { setBusy(false) }
   }
 
   return <>
-    <PageHeader eyebrow="PROVENANCE" title="Audit records" description="Resource scope가 DB에서 검증된 append-only audit를 조회합니다." />
+    <PageHeader eyebrow="AUDIT & PROVENANCE" title="감사 로그" description="누가 어떤 리소스에 무엇을 했는지 변경 전후 digest로 확인합니다." />
     <ErrorBanner error={error} onDismiss={() => setError(undefined)} />
     <form className="panel audit-search" onSubmit={search}><label>Resource type<select name="resourceType" defaultValue="AGENT_RELEASE"><option>AGENT</option><option>AGENT_RELEASE</option><option>TEST_RUN</option><option>RELEASE_ATTESTATION</option><option>IDEMPOTENCY_RECOVERY</option></select></label>
       <label>Resource UUID<input name="resourceId" required placeholder="00000000-0000-0000-0000-000000000000" /></label><button className="primary-button" disabled={busy}>{busy ? '조회 중…' : 'Audit 조회'}</button></form>
@@ -29,4 +29,3 @@ export function AuditPage({ actorId }: { actorId: string }) {
       <details><summary>Metadata</summary><pre>{JSON.stringify(record.metadata, null, 2)}</pre></details></div></article>)}</div>
   </>
 }
-
