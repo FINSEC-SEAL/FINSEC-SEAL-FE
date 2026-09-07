@@ -17,7 +17,7 @@
 | 공통 UI | 브랜드, Sidebar, Topbar, hash 탐색, 모바일 메뉴, 공통 카드·표·알림·확인창 | 실제 리소스 ID가 유지되는 상세 탐색, 서버 상태와 공통 화면 연결 |
 | A | Agent 등록·조회·보관, Release 등록·검증·분석·Fingerprint, Attestation·Audit·Recovery의 기존 API client 연결 유지 | 새 검증 요약/구성 변경 화면과 실제 데이터 연결, Run projection·SSE 소비 계층, 새 DTO 정합성 확인 |
 | B | 실행 설정·목록, 대표 공격 Trace, 취소·연결 끊김의 대화형 예시 | 실제 실행 생성·취소와 상태/이벤트 연결, 선택한 사례의 실제 Trace 표시 |
-| C | 정책 목록·규칙·승인 확인창·충돌 예시, Gateway·Replay 비교 화면 | Candidate/검증/diff/승인 API, 실제 정책 판단과 비교 가능성 연결 |
+| C | LIVE 저장 계약 목록·규칙·JSON·diff·검증·승인·거절 연결, SIMULATED Gateway·Replay 예시 | 후보 생성·저장 orchestration, 원 명세 경로/session, 패치와 실제 Gateway·Replay 연결 |
 | D | Finding·Oracle 근거·지표·Held-out/정상업무·판정 보고서 예시 | 이미 있는 조회·평가 API 연결, 실제 판정 확정 및 A 증적 화면 연결 |
 
 **작업 원칙: 담당 화면을 처음부터 새로 만들기보다, 기존 UI에서 샘플 데이터와 버튼 동작을 자기 도메인의 실제 계약으로 교체합니다.** 공통 파일 분리는 아래 8절의 협업 제안이며 아직 적용되지 않았습니다.
@@ -100,6 +100,7 @@ VITE_FINSEC_ACTOR_ID=role-a-console
 | `#/demo/trace` | `TracePage` / `VerificationPages.tsx` | B 실행 표시, A 이벤트 조회, D Oracle 근거 | 샘플 |
 | `#/demo/findings`, `#/demo/finding` | `FindingsPage`, `FindingDetail` / `VerificationPages.tsx` | D, 정책 후보 링크는 C 협업 | 샘플 |
 | `#/demo/policies`, `#/demo/policy` | `PoliciesPage`, `PolicyDetail` / `VerificationPages.tsx` | C | 샘플 |
+| `#/live/policies`, `#/live/policy` | `StoredContractReviewPage` / `features/policy/` | C, 저장·승인 기반은 A | 실제 저장 목록·검토·검증·승인·거절. [연결 계약과 제약](C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md) |
 | `#/demo/gateway` | `GatewayPage` / `VerificationPages.tsx` | C 판단, B 호출 사실, D 결과 | 샘플 |
 | `#/demo/replay` | `ReplayPage`, `ComparisonEvidence` / `VerificationPages.tsx` | B 실행 + C 적용/비교 조건 + D 평가 | 샘플 |
 | `#/demo/verification` | `VerificationPage` / `VerificationPages.tsx` | D 결과, B 실행, C 집행 | 샘플 |
@@ -187,25 +188,26 @@ BE의 `runtime/AgentRuntimeService.java`, `runtime/AgentToolLoopService.java`, `
 
 ### 어디를 수정하나요?
 
-`VerificationPages.tsx`의 `PoliciesPage`, `PolicyDetail`, `GatewayPage`, `rules`가 주 작업 대상입니다.
-`ReplayPage`의 비교 가능성/정책 정보와 `FindingDetail`의 정책 후보 영역은 B/D와 함께 연결합니다.
+LIVE 저장 정책 검토는 `src/features/policy/StoredContractReviewPage.tsx`에서 시작합니다. `wire.ts`는 A 목록/변경 응답과 C 검토 응답을 검사하고, `client.ts`는 검토자 키를 전달합니다. `PolicyReviewDetails.tsx`와 `policyDisplay.ts`는 저장된 내용만 표시합니다.
+`VerificationPages.tsx`의 `PoliciesPage`, `PolicyDetail`, `GatewayPage`, `rules`는 SIMULATED 체험입니다. `ReplayPage`의 비교 조건과 `FindingDetail`의 패치 후보 연결은 후속 B/D 협업 범위입니다.
 
-### 어떻게 이어서 구현하나요?
+### 현재 연결된 범위와 다음 작업
 
-1. **Candidate 생성·조회 → 결정적 validation → diff → 사람 승인/거절**을 각각 실제 서버 상태로 연결합니다. 현재 `w.approved`, 체크박스, 충돌 버튼은 데모 상태입니다. 체크만 했다고 서버 정책을 승인된 것으로 표시하지 않습니다.
-2. **BE의 기존 core를 재사용하고 HTTP 경계를 정합니다.** dev에는 `SafetyContractSchemaValidator`, `SafetyContractSemanticValidator`, `ReleaseToolCatalogContractAdapter`, 정책 evaluator와 `EnforcePolicyPostCallResponseGuard`가 있습니다. 정책 목록/후보/승인용 Controller는 확인되지 않았으므로 C가 A와 persistence·version·audit·권한·오류 계약을 합의해야 합니다. core 구현이 없다고 새로 만들거나, 반대로 승인 API까지 있다고 간주하지 않습니다.
-3. **Tool 수와 규칙을 실제 카탈로그에서 표시합니다.** 샘플 화면의 `7개 tool`/`등록된 7개 tool`은 API 계약이 아닙니다. Manifest 1.1의 정상 실행 Tool은 5개이며, `LOAN_DECISION_UPDATE`는 별도 server catalog의 `agentExecutable=false`, `HUMAN_ONLY` 대상입니다. 이 수치와 허용 범위를 화면 문자열로 결정하지 않습니다.
-4. **JSON 발췌를 실제 요청 payload로 보내지 않습니다.** 현재 `DEMO_ONLY_NOT_API_PAYLOAD` JSON은 설명용입니다. 실제 candidate DTO/schema, validation result, before/after hash와 승인 version을 연결합니다.
-5. **승인 충돌을 실제 오류와 연결합니다.** 샘플 `STALE_BASE_HASH`는 확정된 서버 오류 계약이 아닙니다. 합의된 최신 base/hash와 조건부 요청 방식으로 승인하고, 충돌 시 의견 보존 → 최신 diff 재조회 → 재동의를 요구합니다. 자동 승인/자동 재전송을 하지 않습니다.
-6. **Gateway의 사실을 분리합니다.** C의 ALLOW/DENY·reason과 B의 실제 API 호출/응답, D의 Oracle 결과를 별개 필드로 표시합니다. 정책 평가 오류는 공격 차단 성공이 아닙니다. post-call response guard의 격리도 pre-call DENY와 구분해야 합니다.
-7. **Replay의 통제 조건을 서버에서 확인합니다.** artifact, resolved model/parameters, attack case, variant, trial, fixture digest, runtime/tool/RAG 조건이 같다는 C의 검증 결과가 있어야 `동일 조건 비교 가능`을 표시합니다. Contract만 달라졌다면 releaseFingerprint가 다른 것은 정상일 수 있습니다.
+1. **저장 후보 조회 → 결정적 validation → diff 검토 → 사람 승인/거절**을 LIVE에 연결했습니다. 목록에서 버전을 직접 선택하고 C 검토 상세를 다시 읽습니다. 후보 생성 모델 호출·저장 orchestration과 패치 후보 생성은 별도 후속 작업입니다. 체크박스만으로 서버 상태를 승인으로 바꾸지 않습니다.
+2. **A 저장 API와 기존 C core를 사용합니다.** 실제 A 경로는 `GET /api/v1/platform/contracts?releaseId=...` 및 `POST /api/v1/platform/contracts/{versionId}:validate|approve|reject`입니다. C의 `GET /api/v1/platform/contracts/{versionId}/review`가 정확한 JSON 문자열, 기록된 승인 기준, 재귀 diff, 저장 validation과 공개 검토 기록을 제공합니다. 이 C 조회는 [BE PR36](https://github.com/FINSEC-SEAL/FINSEC-SEAL-BE/pull/36)이 필요합니다. 원 명세 경로와 reviewer-session 연결은 별도 통합 대상입니다.
+3. **정책 규칙을 저장값 그대로 표시합니다.** 허용 Tool, 고객·객체·필드·건수, 외부 전송, workflow, 사람 전용 행동, 도구 신뢰와 결과 규칙을 읽습니다. 브라우저에서 정책 의미·hash·diff를 다시 계산하지 않습니다. 수치 원문을 보존할 수 없거나 지원하지 않는 구조이면 정확한 저장 JSON을 표시합니다.
+4. **실제 버전과 서버 판단을 분리합니다.** `CANDIDATE`만 검증하고, `VALIDATED`의 저장 결과가 VALID/WARN일 때 승인 검토를 열 수 있습니다. 서버가 현재 권한·Release·proof·hash 조건을 최종 검사합니다. APPROVED/REJECTED/SUPERSEDED는 읽기 전용입니다. 없는 정상업무 영향이나 승인 시각은 만들지 않습니다.
+5. **승인 충돌과 처리 미확정을 구분합니다.** body의 `resourceHash`로 quoted `If-Match`를 고정합니다. 일반 409는 의견 보존 → 최신 조회 → 재동의가 필요합니다. 응답 유실·5xx·잘못된 성공 응답은 미확정으로 남기고 자동 재전송하지 않습니다. 명시적 재전송도 동일 key/body/Content-Type/If-Match를 유지합니다. 페이지·별칭·모드 이동 후 메모리 상태의 한계는 [C 인수인계](C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md)를 확인합니다.
+6. **Gateway의 실제 집행 연결은 남아 있습니다.** C의 ALLOW/DENY·reason, B의 실제 API 호출/응답, D의 Oracle 결과를 구분해야 합니다. 평가 오류는 공격 차단 성공이 아닙니다. 실제 호출 전 DENY와 응답 전달 전 격리를 검증하는 작업을 승인 UI 완료로 대체하지 않습니다.
+7. **Replay의 통제 조건을 서버에서 확인해야 합니다.** artifact, resolved model/parameters, attack case, variant, trial, fixture digest, runtime/tool/RAG 조건의 C 검증 결과가 있어야 동일 조건 비교가 가능합니다. Contract만 바뀌었다면 releaseFingerprint가 다른 것은 정상일 수 있습니다. FA-01/02/03의 C 역할은 정해진 순서의 집행·검증 단계에서 진행합니다.
 
 ### 완료 조건
 
-- [ ] 후보·검증 실패·승인 대기·승인·거절·충돌·무결성 실패를 구분합니다.
-- [ ] 승인된 Contract는 읽기 전용이고 실제 version/hash/reviewer가 표시됩니다.
-- [ ] 승인되지 않은 후보로 ENFORCE/Replay가 실행되지 않습니다.
-- [ ] DENY, API 미호출, post-call 격리, Oracle 판정이 근거와 함께 구분됩니다.
+- [x] 저장 후보·검증 실패·승인 대기·승인·거절·충돌·처리 미확정을 구분하는 화면과 API 연결을 구현했습니다.
+- [x] 승인본을 읽기 전용으로 표시하고 실제 version/hash와 있는 reviewer 기록만 표시합니다.
+- [ ] 후보·패치 모델 호출, 결과 검증 및 저장 orchestration을 연결합니다.
+- [ ] 승인되지 않은 후보로 ENFORCE/Replay가 실행되지 않음을 실제 실행 경로에서 검증합니다.
+- [ ] DENY의 API 미호출, 격리의 모델 미전달, Oracle 판정과 정상업무 보존을 실제 근거로 확인합니다.
 - [ ] 비교 조건 불일치 시 개선 효과를 단정하지 않고 재검증 행동을 안내합니다.
 
 ## 7. D — Evaluation / Release Assurance
@@ -272,12 +274,12 @@ BE의 `runtime/AgentRuntimeService.java`, `runtime/AgentToolLoopService.java`, `
 
 ### 8.3 여러 명이 동시에 수정할 때
 
-현재 `VerificationPages.tsx` 하나에 역할별 화면이 모여 있습니다. 다음은 **후속 작업 제안이며 현재 존재하는 폴더가 아닙니다.**
+`VerificationPages.tsx`에는 역할별 샘플 화면이 모여 있습니다. `src/features/policy/`에는 C의 LIVE 저장 정책 검토가 구현됐습니다. 아래 다른 폴더 분리는 **후속 작업 제안**입니다.
 
 | 분리 제안 | 옮길 대상 |
 | --- | --- |
 | `src/features/runtime/` | B: Runs, Trace |
-| `src/features/policy/` | C: Policies, Policy detail, Gateway |
+| `src/features/policy/` | C: LIVE 저장 정책 검토 구현됨. Gateway는 후속 연결 |
 | `src/features/evaluation/` | D: Findings, Verification, Reports |
 | `src/features/release/` | A: ReleaseContext, ReleaseOverview, Changed |
 

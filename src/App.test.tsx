@@ -1,6 +1,7 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import App from './App'
+import type { StoredContractReview } from './features/policy/wire'
 import { mainNavigation, pageLabels } from './product/model'
 
 const envelope = (data: unknown) => new Response(JSON.stringify({ data, traceId: 'trace-test', timestamp: '2026-09-01T00:00:00Z' }), { status: 200 })
@@ -63,7 +64,7 @@ describe('FINAgent SEAL product shell', () => {
   })
 
   it('marks unconnected runtime pages explicitly in LIVE_API', async () => {
-    window.history.replaceState(null, '', '/#/live/policy')
+    window.history.replaceState(null, '', '/#/live/gateway')
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
     render(<App />)
     expect(await screen.findByText('실제 데이터와 합성 결과를 섞지 않습니다.')).toBeInTheDocument()
@@ -120,6 +121,174 @@ describe('FINAgent SEAL product shell', () => {
     await screen.findByRole('heading', { name:/에이전트의 위험한 행동/ })
     act(() => { window.location.hash = '/demo/reports'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
     expect(await screen.findByRole('heading', { name:'검증 보고서' })).toBeInTheDocument()
+  })
+})
+
+const liveAgentId = '019903ac-abcd-7000-8000-000000000001'
+const liveReleaseId = '019903ac-abcd-7000-8000-000000000002'
+const selectedReleaseId = '019903ac-abcd-7000-8000-000000000012'
+const liveVersionId = '019903ac-abcd-7000-8000-000000000003'
+const reviewerKey = 'SYNTHETIC_APP_REVIEWER_CANARY_0123456789'
+const resourceHash = `sha256:${'b'.repeat(64)}`
+const policyHash = `sha256:${'a'.repeat(64)}`
+const consent = '정책 변경 내용과 검토 의견을 확인했습니다.'
+
+function storedReview(): StoredContractReview {
+  const policy = { schemaVersion: '1.0', contractId: 'live-loan-review', version: 7,
+    purpose: 'LOAN_DOCUMENT_COMPLETENESS_REVIEW',
+    allowedTools: ['CASE_CONTEXT_READ', 'DOCUMENT_READER', 'CUSTOMER_DATA_READ', 'LOAN_POLICY_SEARCH', 'REVIEW_NOTE_WRITE'],
+    resourcePolicies: { DOCUMENT_READER: { caseScope: 'CURRENT_CASE_ONLY', documentScope: 'ALLOWED_DOCUMENTS_ONLY' }, REVIEW_NOTE_WRITE: { caseScope: 'CURRENT_CASE_ONLY' } },
+    customerScope: { type: 'CURRENT_APPLICANT_ONLY' }, fieldPolicy: { CUSTOMER_DATA_READ: { allowed: ['incomeBand', 'employmentStatus'], denyUnknown: true } },
+    cardinality: { CUSTOMER_DATA_READ: { maxRequestedRecords: 1, maxReturnedRecords: 1 } },
+    externalEgress: { allowed: false, allowedDestinations: [] }, workflow: { allowedStages: ['DOCUMENT_REVIEW'] },
+    highImpactActions: { LOAN_DECISION_UPDATE: 'HUMAN_ONLY' }, toolTrust: { requireTrustedTool: true, allowedTrustLevels: ['TRUSTED_INTERNAL'] },
+    outputPolicy: { reviewStatusAllowed: ['READY_FOR_HUMAN_REVIEW', 'NEEDS_MORE_DOCUMENTS'] }, metadata: { templateVersion: 'loan-review/1', validatorVersion: '1.0' } }
+  return { identity: { versionId: liveVersionId, workspaceId: liveAgentId, releaseId: selectedReleaseId, contractKey: 'live-loan-review', version: 7 },
+    state: 'VALIDATED', policyHash, resourceHash, storedPolicyJson: JSON.stringify(policy, null, 2), canonicalPolicyJson: JSON.stringify(policy),
+    baseline: null, validation: { status: 'VALID', issues: [] }, review: null,
+    changes: [{ pointer: '', kind: 'ADDED', beforeJson: null, afterJson: JSON.stringify(policy, null, 2) }] }
+}
+
+function platformContract(review: StoredContractReview) {
+  return { id: review.identity.versionId, workspaceId: review.identity.workspaceId, releaseId: review.identity.releaseId,
+    contractKey: review.identity.contractKey, version: review.identity.version, state: review.state,
+    policyHash: review.policyHash, resourceHash: review.resourceHash, policy: { private: reviewerKey }, review: { sessionId: reviewerKey } }
+}
+
+// Synthetic HTTP fixtures cross the real inventory client and the C client, wire and review page.
+function livePolicyApi() {
+  let current = storedReview()
+  const handlers = { review: () => envelope(current) }
+  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
+    const url = new URL(String(input), window.location.origin)
+    if (url.pathname === '/api/v1/agents') return envelope([{ id: liveAgentId, agentKey: 'live-loan-agent', name: 'Live Loan Agent', purposeSummary: 'Document review', status: 'ACTIVE', createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z' }])
+    if (url.pathname === `/api/v1/agents/${liveAgentId}/releases`) return envelope([liveReleaseId, selectedReleaseId].map((id, index) => ({
+      id, agentId: liveAgentId, version: `${index + 1}.0.0`, businessPurpose: '대출 서류 검토', manifestSchemaVersion: '1.0',
+      agentArtifactFingerprint: policyHash, releaseFingerprint: policyHash, safetyContractHash: policyHash,
+      lifecycleState: 'REVIEW', effectiveStatus: 'REVIEW', revalidationReason: null, analyzedAt: '2026-09-07T00:00:00Z',
+      lastTestedAt: null, createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z',
+    })))
+    if (url.pathname === '/api/v1/platform/contracts') return envelope(url.searchParams.get('releaseId') === selectedReleaseId ? [platformContract(current)] : [])
+    if (url.pathname === `/api/v1/platform/contracts/${liveVersionId}/review`) return handlers.review()
+    if (init.method === 'POST' && url.pathname === `/api/v1/platform/contracts/${liveVersionId}:approve`) {
+      current = { ...current, state: 'APPROVED', resourceHash: `sha256:${'c'.repeat(64)}` }
+      return envelope(platformContract(current))
+    }
+    throw new Error('Unexpected synthetic app HTTP route')
+  })
+  const contracts = () => fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.startsWith('/api/v1/platform/contracts'))
+  return { fetch, handlers, contracts, posts: () => contracts().filter(([, init]) => init?.method === 'POST') }
+}
+
+async function applyLiveReviewer(user: ReturnType<typeof userEvent.setup>) {
+  await screen.findByRole('heading', { name: '안전 정책 검토' })
+  await user.selectOptions(screen.getByLabelText('정책 Release'), selectedReleaseId)
+  await user.type(screen.getByLabelText('검토자 키'), reviewerKey)
+  await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
+  await user.click(await screen.findByRole('button', { name: '계약 live-loan-review v7 선택' }))
+}
+
+describe('live stored contract review routing', () => {
+  it.each(['policies', 'policy'])('connects LIVE %s to explicit review and approval while preserving release selection', async route => {
+    window.history.replaceState(null, '', `/#/live/${route}`)
+    const backend = livePolicyApi()
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: '안전 정책 검토' })
+    expect(screen.getByLabelText('정책 Release')).toHaveValue('')
+    expect(backend.contracts()).toHaveLength(0)
+    await user.selectOptions(screen.getByLabelText('정책 Release'), selectedReleaseId)
+    await user.type(screen.getByLabelText('검토자 키'), reviewerKey)
+    expect(backend.contracts()).toHaveLength(0)
+    await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
+    await user.click(await screen.findByRole('button', { name: '계약 live-loan-review v7 선택' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON').textContent).toBe(storedReview().storedPolicyJson))
+    expect(screen.getByRole('table', { name: '저장 계약 식별자' }).textContent).toContain(selectedReleaseId)
+    expect(new URL(String(backend.contracts()[0]![0])).searchParams.get('releaseId')).toBe(selectedReleaseId)
+    expect(backend.posts()).toHaveLength(0)
+    await user.click(screen.getByRole('button', { name: '승인 검토' }))
+    const dialog = await screen.findByRole('dialog', { name: '계약 승인 확인' })
+    const submit = within(dialog).getByRole('button', { name: '승인 요청 전송' })
+    expect(submit).toBeDisabled()
+    await user.type(within(dialog).getByLabelText('검토 의견'), '저장된 변경 내역과 검증 결과를 검토했습니다.')
+    await user.click(within(dialog).getByRole('checkbox', { name: consent }))
+    expect(backend.posts()).toHaveLength(0)
+    await user.click(submit)
+    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    const [postUrl, post] = backend.posts()[0]!
+    expect(new URL(String(postUrl)).pathname).toBe(`/api/v1/platform/contracts/${liveVersionId}:approve`)
+    expect(post?.body).toBe(JSON.stringify({ comment: '저장된 변경 내역과 검증 결과를 검토했습니다.' }))
+    expect(new Headers(post?.headers).get('If-Match')).toBe(`"${resourceHash}"`)
+    expect(new Headers(post?.headers).get('Idempotency-Key')).toMatch(/^contract-approve-[0-9a-f-]{36}$/)
+    for (const [, init] of backend.contracts()) {
+      const headers = new Headers(init?.headers)
+      expect(headers.get('X-Contract-Reviewer-Key')).toBe(reviewerKey)
+      expect(headers.has('X-Actor-Id')).toBe(false)
+      expect(headers.has('Cookie')).toBe(false)
+      expect(init?.credentials).toBe('omit')
+      expect(init?.cache).toBe('no-store')
+    }
+    expect(document.body.textContent).not.toContain(reviewerKey)
+    expect(screen.queryByRole('button', { name: '승인 범위 확인 · 재검증' })).not.toBeInTheDocument()
+    const count = backend.contracts().length
+    const navigation = within(screen.getByRole('navigation', { name: '주요 메뉴' }))
+    await user.click(navigation.getByRole('button', { name: '워크스페이스' }))
+    await screen.findByRole('heading', { name: '검증 워크스페이스' })
+    await user.click(navigation.getByRole('button', { name: '안전 정책' }))
+    await screen.findByRole('heading', { name: '안전 정책 검토' })
+    expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue('')
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    expect(backend.contracts()).toHaveLength(count)
+  })
+
+  it('shows a safe C API failure without displaying a synthetic policy or server detail', async () => {
+    window.history.replaceState(null, '', '/#/live/policy')
+    const backend = livePolicyApi()
+    backend.handlers.review = () => new Response(JSON.stringify({ status: 503, code: 'CONTRACT_REVIEW_UNAVAILABLE', title: reviewerKey, detail: reviewerKey, instance: `/${reviewerKey}`, retryable: true }), { status: 503 })
+    const user = userEvent.setup()
+    render(<App />)
+    await applyLiveReviewer(user)
+    expect(await screen.findByRole('alert')).toHaveTextContent('요청을 완료하지 못했습니다. 서버 상태를 확인해 주세요.')
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '승인 검토' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '승인 범위 확인 · 재검증' })).not.toBeInTheDocument()
+    expect(screen.queryByText('SIMULATED · 합성 체험')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain(reviewerKey)
+    expect(backend.posts()).toHaveLength(0)
+  })
+
+  it('clears a consented live dialog on hash mode change and adds no requests in demo mode', async () => {
+    window.history.replaceState(null, '', '/#/live/policy')
+    const backend = livePolicyApi()
+    const user = userEvent.setup()
+    render(<App />)
+    await applyLiveReviewer(user)
+    await user.click(await screen.findByRole('button', { name: '승인 검토' }))
+    const dialog = await screen.findByRole('dialog', { name: '계약 승인 확인' })
+    await user.type(within(dialog).getByLabelText('검토 의견'), '이전 모드의 승인 의견')
+    await user.click(within(dialog).getByRole('checkbox', { name: consent }))
+    expect(within(dialog).getByRole('button', { name: '승인 요청 전송' })).toBeEnabled()
+    const fetchCount = backend.fetch.mock.calls.length
+    const contractCount = backend.contracts().length
+    act(() => { window.location.hash = '/demo/policy'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    expect(await screen.findByText('SIMULATED · 합성 체험')).toBeInTheDocument()
+    expect(await screen.findByRole('button', { name: '승인 범위 확인 · 재검증' })).toBeInTheDocument()
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('검토자 키')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain('이전 모드의 승인 의견')
+    expect(backend.fetch).toHaveBeenCalledTimes(fetchCount)
+    act(() => { window.location.hash = '/live/policy'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    await screen.findByRole('heading', { name: '안전 정책 검토' })
+    expect(screen.getByLabelText('검토자 키')).toHaveValue('')
+    expect(screen.getByLabelText('정책 Release')).toHaveValue('')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    expect(backend.contracts()).toHaveLength(contractCount)
+    expect(backend.posts()).toHaveLength(0)
+    expect(document.body.textContent).not.toContain('이전 모드의 승인 의견')
   })
 })
 
