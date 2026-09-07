@@ -5,6 +5,7 @@ import type { Agent, PendingRecovery, Release } from '../api/contracts'
 import { AgentsPage, ReleasesPage } from './AgentsReleases'
 import { AuditPage } from './Audit'
 import { EvidencePage } from './Evidence'
+import { ExecutionPage } from './Execution'
 import { RecoveryPage } from './Recovery'
 
 const agent: Agent = {
@@ -84,6 +85,50 @@ describe('Role A feature consoles', () => {
 
     expect(await screen.findByText('/model/parameters/temperature')).toBeInTheDocument()
     expect(screen.getByText('temperature must be a JSON number')).toBeInTheDocument()
+  })
+
+  it('loads ready suites and recent runs for the active release in execution console', async () => {
+    vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+      { id: 'suite-2', releaseId: release.id, version: '1.1', status: 'READY', suiteHash: 'sha256:suite-2', caseCount: 8 },
+    ])
+    vi.spyOn(api, 'listTestRuns').mockResolvedValue([
+      { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE', status: 'COMPLETED', totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z' },
+    ])
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    expect(await screen.findByRole('option', { name: /1\.0 · READY · 12 cases/ })).toBeInTheDocument()
+    expect(screen.getByRole('option', { name: /BASELINE · COMPLETED · 12\/12/ })).toBeInTheDocument()
+  })
+
+  it('applies run filters and refreshes recent runs from the current release', async () => {
+    const listSuites = vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+    ])
+    const listRuns = vi.spyOn(api, 'listTestRuns').mockResolvedValue([
+      { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'HELD_OUT', status: 'COMPLETED', totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z' },
+    ])
+    const user = userEvent.setup()
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    await user.selectOptions(screen.getByLabelText('Run mode filter'), 'HELD_OUT')
+    await user.selectOptions(screen.getByLabelText('Run status filter'), 'COMPLETED')
+    await user.click(screen.getByRole('button', { name: '목록 새로고침' }))
+
+    expect(listSuites).toHaveBeenCalledWith(release.id, 'role-b-console')
+    expect(listRuns).toHaveBeenLastCalledWith(release.id, 'role-b-console', { mode: 'HELD_OUT', status: 'COMPLETED', limit: 10 })
+  })
+
+  it('requires a READY suite before starting a B run', async () => {
+    vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'DRAFT', suiteHash: 'sha256:suite', caseCount: 12 },
+    ])
+    vi.spyOn(api, 'listTestRuns').mockResolvedValue([])
+    const start = vi.spyOn(api, 'startTestRun')
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled()
+    expect(start).not.toHaveBeenCalled()
   })
 
   it('marks an invalidated Attestation as historical and stale', async () => {

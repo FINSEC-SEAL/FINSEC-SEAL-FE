@@ -98,4 +98,5 @@ describe('Role D console', () => {
     expect(screen.getByText('POLICY VERSION MISMATCH')).toBeInTheDocument()
     expect(screen.getByText('Review required')).toBeInTheDocument()
   })
+
 })

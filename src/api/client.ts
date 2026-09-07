@@ -13,7 +13,7 @@ import type {
   DecisionProposal,
   DecisionValue,
   DecisionView,
-  TestRun, EventHistory, EventChainVerification, OracleResult, TestRunStart, TestRunRegistered,
+  TestRun, EventHistory, EventChainVerification, OracleResult, TestRunStart, TestRunRegistered, TestSuiteSummary, TestRunSummary, ReplayComparison,
   PendingRecovery,
   RecoveryRequest,
   RecoveryResult,
@@ -45,18 +45,37 @@ export interface RequestContext {
   operatorRecoveryKey?: string
 }
 
+export interface FinsecApiClientOptions {
+  timeoutMs?: number
+  maxRetries?: number
+  retryDelayMs?: number
+}
+
 function newIdempotencyKey(prefix: string): string {
   return `${prefix}-${crypto.randomUUID()}`
 }
 
+function isRetryableNetworkError(error: unknown): boolean {
+  if (error instanceof DOMException && error.name === 'AbortError') return true
+  if (error instanceof TypeError) return true
+  if (error instanceof Error) {
+    return /(fetch|network|Failed to fetch|aborted|timeout|temporar)/i.test(error.message)
+  }
+  return false
+}
+
 export class FinsecApiClient {
-  constructor(private readonly baseUrl = defaultBaseUrl) {}
+  constructor(
+    private readonly baseUrl = defaultBaseUrl,
+    private readonly options: FinsecApiClientOptions = {},
+  ) {}
 
   private async request<T>(
     path: string,
     init: RequestInit = {},
     context?: RequestContext,
   ): Promise<T> {
+    const { timeoutMs = 30000, maxRetries = 2, retryDelayMs = 250 } = this.options
     const headers = new Headers(init.headers)
     headers.set('Accept', 'application/json')
     if (context?.actorId) headers.set('X-Actor-Id', context.actorId)
@@ -67,17 +86,70 @@ export class FinsecApiClient {
     if (init.body !== undefined && !headers.has('Content-Type')) {
       headers.set('Content-Type', 'application/json')
     }
-    const response = await fetch(`${this.baseUrl}${path}`, { ...init, headers })
-    if (!response.ok) {
-      let problem: ApiProblem = { status: response.status, title: response.statusText }
+
+    let lastError: unknown
+
+    for (let attempt = 0; attempt <= maxRetries; attempt += 1) {
+      const controller = new AbortController()
+      const timeout = setTimeout(() => controller.abort(), timeoutMs)
+
       try {
-        problem = (await response.json()) as ApiProblem
-      } catch {
-        // Preserve the status when an intermediary returns a non-JSON response.
+        const response = await fetch(`${this.baseUrl}${path}`, { ...init, headers, signal: controller.signal })
+        if (!response.ok) {
+          let problem: ApiProblem = { status: response.status, title: response.statusText }
+          try {
+            problem = (await response.json()) as ApiProblem
+          } catch {
+            // Preserve the status when an intermediary returns a non-JSON response.
+          }
+          const error = new FinsecApiError(response.status, problem)
+          if (attempt < maxRetries && error.retryable) {
+            await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+            continue
+          }
+          throw error
+        }
+        return ((await response.json()) as ApiEnvelope<T>).data
+      } catch (error) {
+        lastError = error
+        if (error instanceof FinsecApiError && error.retryable && attempt < maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+          continue
+        }
+        if (isRetryableNetworkError(error) && attempt < maxRetries) {
+          await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
+          continue
+        }
+        if (error instanceof DOMException && error.name === 'AbortError') {
+          const timeoutError = new FinsecApiError(408, {
+            title: 'Request timed out',
+            detail: 'The request timed out while waiting for a response.',
+            code: 'REQUEST_TIMEOUT',
+            retryable: true,
+          })
+          throw timeoutError
+        }
+        if (error instanceof Error && /aborted|timeout/i.test(error.message)) {
+          const timeoutError = new FinsecApiError(408, {
+            title: 'Request timed out',
+            detail: error.message,
+            code: 'REQUEST_TIMEOUT',
+            retryable: true,
+          })
+          throw timeoutError
+        }
+        throw error
+      } finally {
+        clearTimeout(timeout)
       }
-      throw new FinsecApiError(response.status, problem)
     }
-    return ((await response.json()) as ApiEnvelope<T>).data
+
+    throw lastError instanceof Error ? lastError : new FinsecApiError(500, {
+      title: 'Request failed',
+      detail: 'The request failed without a usable response.',
+      code: 'REQUEST_FAILED',
+      retryable: false,
+    })
   }
 
   listAgents(actorId: string): Promise<Agent[]> {
@@ -124,6 +196,27 @@ export class FinsecApiClient {
 
   fingerprint(releaseId: string, actorId: string): Promise<Fingerprint> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
+  }
+
+  listTestSuites(releaseId: string, actorId: string): Promise<TestSuiteSummary[]> {
+    return this.request<{ items: TestSuiteSummary[] }>(`/api/v1/releases/${encodeURIComponent(releaseId)}/test-suites`, {}, { actorId })
+      .then((response) => response.items)
+  }
+
+  listTestRuns(releaseId: string, actorId: string, filters: { mode?: TestRun['mode']; status?: string; limit?: number; cursor?: string } = {}): Promise<TestRunSummary[]> {
+    const params = new URLSearchParams()
+    if (filters.mode) params.set('mode', filters.mode)
+    if (filters.status) params.set('status', filters.status)
+    if (filters.limit) params.set('limit', String(filters.limit))
+    if (filters.cursor) params.set('cursor', filters.cursor)
+    const query = params.size ? `?${params.toString()}` : ''
+    return this.request<{ items: TestRunSummary[] }>(`/api/v1/releases/${encodeURIComponent(releaseId)}/test-runs${query}`, {}, { actorId })
+      .then((response) => response.items)
+  }
+
+  listReplayComparisons(releaseId: string, actorId: string): Promise<ReplayComparison[]> {
+    return this.request<{ items: ReplayComparison[] }>(`/api/v1/releases/${encodeURIComponent(releaseId)}/replay-comparisons`, {}, { actorId })
+      .then((response) => response.items)
   }
 
   testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
@@ -226,5 +319,5 @@ export class FinsecApiClient {
 
 export const api = new FinsecApiClient()
 export type PlatformClient = Pick<FinsecApiClient,
-  'listAgents' | 'createAgent' | 'archiveAgent' | 'listReleases' | 'createRelease' | 'validateRelease' | 'analyzeRelease' | 'fingerprint' | 'attestation' | 'downloadAttestation' | 'audit' | 'pendingRecoveries' | 'recover'
+  'listAgents' | 'createAgent' | 'archiveAgent' | 'listReleases' | 'createRelease' | 'validateRelease' | 'analyzeRelease' | 'fingerprint' | 'attestation' | 'downloadAttestation' | 'audit' | 'pendingRecoveries' | 'recover' | 'listTestSuites' | 'listTestRuns' | 'listReplayComparisons' | 'startTestRun' | 'testRun'
 >
