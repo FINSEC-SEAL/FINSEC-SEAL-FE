@@ -21,7 +21,7 @@
 
 위 `EntryPages.tsx`와 `VerificationPages.tsx`는 `src/product/`, 나머지는 `src/` 기준입니다.
 **각자 어디를 어떻게 수정할지, 이미 있는 BE API와 미확정 계약, Replay 책임 경계, PR 완료 조건은 [역할별 인수인계](docs/FRONTEND_ROLE_HANDOFF.md)에 정리했습니다.**
-현재 B·C·D 화면은 샘플이며, 백엔드에 일부 API가 존재하더라도 프론트 실연동이 끝난 것은 아닙니다.
+SIMULATED는 준비된 합성 체험을 유지합니다. LIVE_API의 테스트 실행은 B 실행 콘솔, 발견된 위험은 D Finding 콘솔, 검증 보고서는 D Metrics & Decision 콘솔에 연결됩니다. 구성·증거 메뉴에서는 기존 Attestation을 조회합니다.
 
 ## Design system
 
@@ -37,7 +37,7 @@
 - resource-scoped append-only audit 조회
 - fail-closed idempotency reservation의 operator recovery
 
-공격 추적, Finding, 정책 승인, 전후 비교, Held-out/정상업무, 보고서와 예외 상태의 **대화형 UI**도 제공합니다. 현재 이 부분은 준비된 합성 fixture만 사용하며 실제 B·C·D 실행 API에 연결되지 않았습니다. 실제 Attack 실행, Policy 판단, Oracle/Metric/Gate/Decision 계산은 담당 서비스의 책임입니다.
+공격 추적, Finding, 정책 승인, 전후 비교, Held-out/정상업무, 보고서와 예외 상태의 **대화형 UI**도 제공합니다. SIMULATED에서는 준비된 합성 fixture만 사용합니다. LIVE_API에서는 B 실행·Trace 및 D Finding·Metric·Decision API를 사용하며, 정책 승인과 시각적 전후 비교 체험은 아직 샘플 모드에서 제공합니다. 실제 Attack 실행, Policy 판단, Oracle/Metric/Gate/Decision 계산은 담당 서비스의 책임입니다.
 
 샘플 등록값과 입력은 메모리에만 유지되며 페이지 새로고침·모드 전환 시 사라집니다. 실제 비밀키·고객정보를 입력하지 마세요. SIMULATED에서는 실제 정책 변경·판정 확정·HTML/JSON 증적 내보내기를 수행하지 않습니다.
 

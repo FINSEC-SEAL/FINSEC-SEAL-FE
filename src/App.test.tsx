@@ -47,7 +47,7 @@ describe('FINAgent SEAL product shell', () => {
       String(input).endsWith('/api/v1/agents') ? envelope([{ id:'agent-1', agentKey:'loan-agent', name:'Live Agent', purposeSummary:'Document review', status:'ACTIVE', createdAt:'2026-09-01T00:00:00Z', updatedAt:'2026-09-01T00:00:00Z' }]) : envelope([]))
     render(<App />)
     expect(await screen.findByRole('heading', { name: '검증 워크스페이스' })).toBeInTheDocument()
-    expect(screen.getByText('실행 API 미연결')).toBeInTheDocument()
+    expect(screen.getByText('실행 집계 미연결')).toBeInTheDocument()
     expect(screen.getAllByText('N/A', { selector: '.metric-card strong' })).toHaveLength(2)
     expect(fetch).toHaveBeenCalledTimes(2)
     expect(screen.queryByText('SIMULATED · 합성 체험')).not.toBeInTheDocument()
@@ -120,5 +120,24 @@ describe('FINAgent SEAL product shell', () => {
     await screen.findByRole('heading', { name:/에이전트의 위험한 행동/ })
     act(() => { window.location.hash = '/demo/reports'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
     expect(await screen.findByRole('heading', { name:'검증 보고서' })).toBeInTheDocument()
+  })
+})
+
+
+describe('merged live console navigation', () => {
+  it.each([
+    ['테스트 실행', 'Runs & Trace'],
+    ['발견된 위험', 'Findings'],
+    ['검증 보고서', 'Metrics & Decision'],
+  ])('opens the live %s feature from the product menu', async (menu, heading) => {
+    window.history.replaceState(null, '', '/#/live/overview')
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: '검증 워크스페이스' })
+    await user.click(within(screen.getByRole('navigation', { name: '주요 메뉴' })).getByRole('button', { name: menu }))
+    expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument()
+    expect(screen.getByText('LIVE_API · API 모드')).toBeInTheDocument()
+    expect(screen.queryByText('SIMULATED · 합성 체험')).not.toBeInTheDocument()
   })
 })

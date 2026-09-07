@@ -6,7 +6,14 @@ import type {
   Attestation,
   AuditRecord,
   Fingerprint,
+  Finding,
+  FindingDetail,
   JsonValue,
+  MetricsView,
+  DecisionProposal,
+  DecisionValue,
+  DecisionView,
+  TestRun, EventHistory, EventChainVerification, OracleResult, TestRunStart, TestRunRegistered,
   PendingRecovery,
   RecoveryRequest,
   RecoveryResult,
@@ -119,6 +126,51 @@ export class FinsecApiClient {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
   }
 
+  testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
+  startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
+  eventHistory(runId: string, actorId: string): Promise<EventHistory> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=0&limit=100`, {}, { actorId }) }
+  verifyEventChain(runId: string, actorId: string): Promise<EventChainVerification> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/events:verify`, {}, { actorId }) }
+  runFindings(runId: string, actorId: string): Promise<Finding[]> { return this.request<{items:Finding[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/findings`, {}, { actorId }).then(v=>v.items) }
+  runOracleResults(runId: string, actorId: string): Promise<OracleResult[]> { return this.request<{items:OracleResult[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/oracle-results`, {}, { actorId }).then(v=>v.items) }
+
+  findings(releaseId: string, actorId: string, filters: { category?: string; status?: string } = {}): Promise<Finding[]> {
+    const params = new URLSearchParams({ releaseId })
+    if (filters.category) params.set('category', filters.category)
+    if (filters.status) params.set('status', filters.status)
+    return this.request<{ items: Finding[] }>(`/api/v1/findings?${params}`, {}, { actorId })
+      .then((response) => response.items)
+  }
+
+  finding(findingId: string, actorId: string): Promise<FindingDetail> {
+    return this.request(`/api/v1/findings/${encodeURIComponent(findingId)}`, {}, { actorId })
+  }
+
+  triageFinding(findingId: string, comment: string, actorId: string): Promise<Finding> {
+    return this.request(`/api/v1/findings/${encodeURIComponent(findingId)}:triage`, {
+      method: 'POST',
+      body: JSON.stringify({ comment }),
+    }, { actorId, idempotencyKey: newIdempotencyKey('finding-triage') })
+  }
+
+  metrics(releaseId: string, actorId: string): Promise<MetricsView> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/metrics`, {}, { actorId })
+  }
+
+  evaluateDecision(releaseId: string, actorId: string): Promise<DecisionProposal> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/decision:evaluate`, {
+      method: 'POST',
+      body: '{}',
+    }, { actorId, idempotencyKey: newIdempotencyKey('decision-evaluate') })
+  }
+
+  confirmDecision(releaseId: string, inputDigest: string, decision: DecisionValue, comment: string, actorId: string): Promise<DecisionView> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/decision:confirm`, {
+      method: 'POST',
+      headers: { 'If-Match': inputDigest },
+      body: JSON.stringify({ decision, comment }),
+    }, { actorId, idempotencyKey: newIdempotencyKey('decision-confirm') })
+  }
+
   attestation(releaseId: string, actorId: string): Promise<Attestation> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/attestation`, {}, { actorId })
   }
@@ -173,4 +225,6 @@ export class FinsecApiClient {
 }
 
 export const api = new FinsecApiClient()
-export type PlatformClient = Pick<FinsecApiClient, keyof FinsecApiClient>
+export type PlatformClient = Pick<FinsecApiClient,
+  'listAgents' | 'createAgent' | 'archiveAgent' | 'listReleases' | 'createRelease' | 'validateRelease' | 'analyzeRelease' | 'fingerprint' | 'attestation' | 'downloadAttestation' | 'audit' | 'pendingRecoveries' | 'recover'
+>

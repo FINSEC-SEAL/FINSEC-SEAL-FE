@@ -63,12 +63,13 @@ export function AgentsPage({ agents, actorId, onChanged, onSelect, client = api 
   </>
 }
 
-export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory, client = api }: {
+export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory, onReleaseSelect, client = api }: {
   client?: PlatformClient
   agents: Agent[]
   actorId: string
   initialAgent: Agent | null
   onReleaseInventory: (releases: Release[], agentId: string) => void
+  onReleaseSelect?: (release: Release) => void
 }) {
   const [agentId, setAgentId] = useState(initialAgent?.id ?? agents.find((a) => a.status === 'ACTIVE')?.id ?? '')
   const [releases, setReleases] = useState<Release[]>([])
@@ -95,7 +96,7 @@ export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory
       if (new TextEncoder().encode(manifestText).length > 2 * 1024 * 1024) throw new Error('Manifest는 최대 2 MB까지 등록할 수 있습니다.')
       const parsed = JSON.parse(manifestText) as JsonValue
       const created = await client.createRelease(agentId, parsed, actorId)
-      setManifestText(''); await load(); setSelected(created)
+      setManifestText(''); await load(); setSelected(created); onReleaseSelect?.(created)
     } catch (cause) { setError(cause instanceof SyntaxError ? new Error('Manifest JSON 문법을 확인하세요.') : cause) }
     finally { setBusy(false) }
   }
@@ -117,7 +118,7 @@ export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory
       <aside className="panel release-sidebar"><label>Agent<select value={agentId} onChange={(event) => { setAgentId(event.target.value); setSelected(null) }}>
         <option value="">선택하세요</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.status}</option>)}</select></label>
         <div className="release-list">{releases.length === 0 ? <p className="muted">등록된 Release가 없습니다.</p> : releases.map((release) =>
-          <button key={release.id} className={selected?.id === release.id ? 'release-item release-item--active' : 'release-item'} onClick={() => { setSelected(release); setValidation(null); setFingerprint(null) }}>
+          <button key={release.id} className={selected?.id === release.id ? 'release-item release-item--active' : 'release-item'} onClick={() => { setSelected(release); onReleaseSelect?.(release); setValidation(null); setFingerprint(null) }}>
             <span><strong>v{release.version}</strong><small>{release.id.slice(0, 8)}</small></span><StatusBadge status={release.effectiveStatus} /></button>)}</div>
       </aside>
       <div className="release-main">

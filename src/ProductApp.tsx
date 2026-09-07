@@ -6,6 +6,9 @@ import { Badge, Brand, Modal, Notice } from './components/Product'
 import { AgentsPage, ReleasesPage } from './features/AgentsReleases'
 import { AuditPage } from './features/Audit'
 import { EvidencePage } from './features/Evidence'
+import { ExecutionPage } from './features/Execution'
+import { FindingsPage as LiveFindingsPage } from './features/Findings'
+import { AssurancePage } from './features/Assurance'
 import { RecoveryPage } from './features/Recovery'
 import { createDemoPlatform, DEMO_RELEASE_ID, demoManifest } from './demo/platform'
 import { ReleaseInventory, StartPage, WorkspacePage } from './product/EntryPages'
@@ -19,7 +22,7 @@ export default function App() {
   return <ProductApp key={route.mode} mode={route.mode} page={route.page} go={go} />
 }
 const detailPages: Page[] = ['release','trace','finding','policy','gateway','replay','verification','report']
-const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports']
+const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report']
 const detailTitles: Partial<Record<Page, [string,string]>> = {
   release: ['이 에이전트는 어디까지 허용되나요?','대출서류 검토의 업무 경계와 검증 구성을 먼저 확인하세요.'],
   trace: ['공격은 어디서 실제 행동이 됐나요?','도구 제안, 정책 판단, API 응답, 실제 영향을 순서대로 확인합니다.'],
@@ -40,6 +43,7 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
   const [agents, setAgents] = useState<Agent[]>([])
   const [releases, setReleases] = useState<Release[]>([])
   const [selectedAgent, setSelectedAgent] = useState<Agent | null>(null)
+  const [selectedReleaseId, setSelectedReleaseId] = useState('')
   const [loading, setLoading] = useState(true)
   const [loaded, setLoaded] = useState(false)
   const [error, setError] = useState<unknown>()
@@ -66,13 +70,16 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
   useEffect(() => { if (!menuOpen) return; const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }; window.addEventListener('keydown', close); return () => window.removeEventListener('keydown', close) }, [menuOpen])
   function start() { if (!simulated) { go('demo','start'); return } workflow.start(); navigate('trace') }
   function body() {
-    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 공격·정책·판정 기능은 담당 서비스 연결이 필요합니다.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
+    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 실행·위험·판정 API는 각 메뉴에서 사용하고, 정책 승인 체험은 샘플 모드에서 확인하세요.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
+    if (!simulated && (page === 'runs' || page === 'trace')) return <ExecutionPage releases={releases} actorId={actorId} />
+    if (!simulated && page === 'findings') return <LiveFindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
+    if (!simulated && ['reports','report','verification'].includes(page)) return <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (page === 'start') return <StartPage navigate={navigate} start={start} simulated={simulated} />
     if (page === 'overview') return <WorkspacePage agents={agents} releases={releases} navigate={navigate} workflow={workflow} simulated={simulated} start={start} />
     if (page === 'agents') return <AgentsPage agents={agents} actorId={actorId} client={client} onChanged={reload} onSelect={agent => { setSelectedAgent(agent); navigate('releases') }} />
     if (page === 'releases') return <ReleaseInventory releases={releases} agents={agents} navigate={navigate} simulated={simulated} selectAgent={setSelectedAgent} />
-    if (page === 'manifest') return <>{simulated && <Notice title="체험용 기본 구조 검사 · 실제 strict schema 검증 아님" tone="amber">아래 값은 UI 체험용이며 실제 hash 계산·보안 검증을 수행하지 않습니다.<details className="section-gap"><summary>붙여넣을 샘플 JSON</summary><pre className="code-block">{demoManifest}</pre></details></Notice>}<ReleasesPage agents={agents} actorId={actorId} initialAgent={selectedAgent} client={client} onReleaseInventory={(items, agentId) => setReleases(current => [...current.filter(r => r.agentId !== agentId), ...items])} /></>
-    if (page === 'evidence' || (!simulated && page === 'reports')) return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}<EvidencePage releases={releases} actorId={actorId} client={client} simulated={simulated} /></>
+    if (page === 'manifest') return <>{simulated && <Notice title="체험용 기본 구조 검사 · 실제 strict schema 검증 아님" tone="amber">아래 값은 UI 체험용이며 실제 hash 계산·보안 검증을 수행하지 않습니다.<details className="section-gap"><summary>붙여넣을 샘플 JSON</summary><pre className="code-block">{demoManifest}</pre></details></Notice>}<ReleasesPage agents={agents} actorId={actorId} initialAgent={selectedAgent} onReleaseSelect={release => setSelectedReleaseId(release.id)} client={client} onReleaseInventory={(items, agentId) => setReleases(current => [...current.filter(r => r.agentId !== agentId), ...items])} /></>
+    if (page === 'evidence') return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}<EvidencePage releases={releases} actorId={actorId} client={client} simulated={simulated} /></>
     if (page === 'audit') return <>{simulated && <Notice title="샘플 감사 리소스">Resource type: AGENT_RELEASE<br /><code>{DEMO_RELEASE_ID}</code></Notice>}<AuditPage actorId={actorId} client={client} /></>
     if (page === 'recovery') return <RecoveryPage actorId={actorId} onActorChange={actor => { setActorId(actor); setActorDraft(actor) }} client={client} simulated={simulated} />
     const props = { navigate, workflow }
@@ -98,7 +105,7 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
       </main>
     </div>
     {resetOpen && <Modal title="이 데모를 초기 상태로 돌릴까요?" onClose={() => setResetOpen(false)}><p>고정된 샘플 Release v1.2.0의 실행·정책 승인·보고서 표시만 초기화합니다. 직접 등록한 에이전트와 다른 서버의 데이터는 변경하지 않습니다.</p><Notice title="Fixture · fixture-demo-v1 / digest f1…">원본 합성 fixture는 보존됩니다. 서버 요청은 전송하지 않습니다.</Notice>{workflow.active && <Notice title="활성 실행이 있어 초기화할 수 없습니다." tone="amber">{workflow.progress} / 40 trials. 실행을 취소하거나 완료를 기다려 주세요.</Notice>}<div className="form-actions"><button className="secondary-button" onClick={() => setResetOpen(false)}>돌아가기</button><button className="danger-button" disabled={workflow.active} onClick={() => { workflow.reset(); setResetOpen(false); navigate('release') }}>샘플 검증 초기화</button></div></Modal>}
-    {modeOpen && <Modal title="워크스페이스 환경 설정" onClose={() => setModeOpen(false)}><Notice title={simulated ? '현재: SIMULATED' : '현재: LIVE_API'} tone={simulated ? 'blue' : 'amber'}>{simulated ? '실제 네트워크 요청 없이 모든 UI를 체험합니다. 실제 비밀키·고객정보를 입력하지 마세요.' : '등록·분석·복구는 실제 백엔드에 전송됩니다. 공격·정책·판정 API는 아직 미연결입니다.'}</Notice>
+    {modeOpen && <Modal title="워크스페이스 환경 설정" onClose={() => setModeOpen(false)}><Notice title={simulated ? '현재: SIMULATED' : '현재: LIVE_API'} tone={simulated ? 'blue' : 'amber'}>{simulated ? '실제 네트워크 요청 없이 모든 UI를 체험합니다. 실제 비밀키·고객정보를 입력하지 마세요.' : '등록·분석·실행·위험 검토·판정·복구는 실제 백엔드에 전송됩니다. 정책 승인 체험은 샘플 모드에서 제공합니다.'}</Notice>
       {!simulated && <form onSubmit={e => { e.preventDefault(); setActorId(actorDraft); setModeOpen(false) }} className="stack section-gap"><label>API actor ID<input value={actorDraft} onChange={e => setActorDraft(e.target.value)} required /></label><button className="secondary-button">Actor 적용</button></form>}
       <p className="muted section-gap">모드를 전환하면 현재 체험 상태와 미저장 입력이 초기화됩니다.</p><div className="form-actions"><button className="secondary-button" onClick={() => setModeOpen(false)}>닫기</button><button className="primary-button" onClick={() => { setModeOpen(false); go(simulated ? 'live' : 'demo', simulated ? 'overview' : 'start') }}>{simulated ? '실제 API 연결 모드로' : '샘플 체험 모드로'}</button></div></Modal>}
   </div>
