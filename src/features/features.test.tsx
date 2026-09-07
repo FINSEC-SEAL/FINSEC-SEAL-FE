@@ -95,6 +95,7 @@ describe('Role A feature consoles', () => {
     vi.spyOn(api, 'listTestRuns').mockResolvedValue([
       { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE', status: 'COMPLETED', totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z' },
     ])
+    vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
     render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
 
     expect(await screen.findByRole('option', { name: /1\.0 · READY · 12 cases/ })).toBeInTheDocument()
@@ -108,6 +109,7 @@ describe('Role A feature consoles', () => {
     const listRuns = vi.spyOn(api, 'listTestRuns').mockResolvedValue([
       { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'HELD_OUT', status: 'COMPLETED', totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z' },
     ])
+    vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
     const user = userEvent.setup()
     render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
 
@@ -115,7 +117,7 @@ describe('Role A feature consoles', () => {
     await user.selectOptions(screen.getByLabelText('Run status filter'), 'COMPLETED')
     await user.click(screen.getByRole('button', { name: '목록 새로고침' }))
 
-    expect(listSuites).toHaveBeenCalledWith(release.id, 'role-b-console')
+      expect(listSuites).toHaveBeenCalledWith(release.id, 'role-b-console', { status: 'READY', limit: 20 })
     expect(listRuns).toHaveBeenLastCalledWith(release.id, 'role-b-console', { mode: 'HELD_OUT', status: 'COMPLETED', limit: 10 })
   })
 
@@ -124,11 +126,185 @@ describe('Role A feature consoles', () => {
       { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'DRAFT', suiteHash: 'sha256:suite', caseCount: 12 },
     ])
     vi.spyOn(api, 'listTestRuns').mockResolvedValue([])
+    vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
     const start = vi.spyOn(api, 'startTestRun')
     render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
 
     expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled()
     expect(start).not.toHaveBeenCalled()
+  })
+
+  it('loads replay comparisons for the current release', async () => {
+    vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+    ])
+    vi.spyOn(api, 'listTestRuns').mockResolvedValue([])
+    const listReplayComparisons = vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([
+      { baselineRunId: 'run-baseline', replayRunId: 'run-replay', category: 'FA-03', comparable: false, mismatchReasons: ['MODEL_CONFIG_MISMATCH'] },
+    ])
+
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    expect(await screen.findByText('FA-03')).toBeInTheDocument()
+    expect(screen.getByText(/MODEL_CONFIG_MISMATCH/)).toBeInTheDocument()
+    expect(listReplayComparisons).toHaveBeenCalledWith(release.id, 'role-b-console')
+  })
+
+  it('opens the replay run directly from a replay comparison item', async () => {
+    vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+    ])
+    vi.spyOn(api, 'listTestRuns').mockResolvedValue([])
+    vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([
+      { baselineRunId: 'run-baseline', replayRunId: 'run-replay', category: 'FA-03', comparable: false, mismatchReasons: ['MODEL_CONFIG_MISMATCH'] },
+    ])
+    vi.spyOn(api, 'testRun').mockResolvedValue({
+      id: 'run-replay', releaseId: release.id, suiteId: 'suite-1', contractVersionId: null, mode: 'SEAL_REPLAY', status: 'COMPLETED',
+      agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`, releaseFingerprint: `sha256:${'2'.repeat(64)}`, fixtureVersion: '1.0', fixtureDigest: `sha256:${'3'.repeat(64)}`,
+      totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, latestEventType: 'RUN_COMPLETED',
+      eventHeadHash: `sha256:${'4'.repeat(64)}`, summary: {}, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z', createdAt: '2026-09-01T00:00:00Z',
+    })
+    vi.spyOn(api, 'eventHistory').mockResolvedValue({ items: [], headSequence: 20, nextCursor: null })
+    vi.spyOn(api, 'verifyEventChain').mockResolvedValue({ runId: 'run-replay', valid: true, eventCount: 0, firstInvalidSequence: null, headHash: `sha256:${'4'.repeat(64)}` })
+    vi.spyOn(api, 'runOracleResults').mockResolvedValue([])
+    vi.spyOn(api, 'runFindings').mockResolvedValue([])
+    const user = userEvent.setup()
+
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    await user.click(await screen.findByRole('button', { name: 'Replay run 열기' }))
+
+    expect(screen.getByLabelText('Test Run ID')).toHaveValue('run-replay')
+    expect(await screen.findByText(/execution events/)).toBeInTheDocument()
+  })
+
+  it('filters oracle and finding results by the selected classifications', async () => {
+    vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+      { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+    ])
+    vi.spyOn(api, 'listTestRuns').mockResolvedValue([
+      { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE', status: 'COMPLETED', totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z' },
+    ])
+    vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
+    vi.spyOn(api, 'testRun').mockResolvedValue({
+      id: 'run-1', releaseId: release.id, suiteId: 'suite-1', contractVersionId: null, mode: 'BASELINE', status: 'COMPLETED',
+      agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`, releaseFingerprint: `sha256:${'2'.repeat(64)}`, fixtureVersion: '1.0', fixtureDigest: `sha256:${'3'.repeat(64)}`,
+      totalCases: 12, completedCases: 12, operationalErrorCount: 0, latestSequence: 20, latestEventType: 'RUN_COMPLETED',
+      eventHeadHash: `sha256:${'4'.repeat(64)}`, summary: {}, startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:02:00Z', createdAt: '2026-09-01T00:00:00Z',
+    })
+    vi.spyOn(api, 'eventHistory').mockResolvedValue({ items: [], headSequence: 20, nextCursor: null })
+    vi.spyOn(api, 'verifyEventChain').mockResolvedValue({ runId: 'run-1', valid: true, eventCount: 0, firstInvalidSequence: null, headHash: `sha256:${'4'.repeat(64)}` })
+    vi.spyOn(api, 'runOracleResults').mockResolvedValue([
+      { id: 'oracle-1', runId: 'run-1', testCaseRunId: 'case-1', sourceEventId: null, oracleType: 'EXFILTRATION', oracleVersion: '1.0', outcome: 'ATTACK_SUCCESS', reasonCode: 'EXFIL', invariantId: 'INV-01', evidence: {}, evidenceDigest: `sha256:${'5'.repeat(64)}`, evaluatedAt: '2026-09-01T00:00:00Z', createdAt: '2026-09-01T00:00:00Z' },
+      { id: 'oracle-2', runId: 'run-1', testCaseRunId: 'case-2', sourceEventId: null, oracleType: 'NORMAL_TASK', oracleVersion: '1.0', outcome: 'NORMAL_SUCCESS', reasonCode: 'OK', invariantId: 'INV-02', evidence: {}, evidenceDigest: `sha256:${'6'.repeat(64)}`, evaluatedAt: '2026-09-01T00:00:00Z', createdAt: '2026-09-01T00:00:00Z' },
+    ])
+    vi.spyOn(api, 'runFindings').mockResolvedValue([
+      { id: 'finding-1', releaseId: release.id, sourceOracleResultId: 'oracle-1', category: 'FA-04', severity: 'HIGH', title: 'Outbound exfiltration', status: 'OPEN', violatedInvariant: 'INV-01', rootCause: {}, findingGroupKey: null, firstSeenRunId: 'run-1', latestSeenRunId: 'run-1', createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+      { id: 'finding-2', releaseId: release.id, sourceOracleResultId: 'oracle-2', category: 'FA-02', severity: 'LOW', title: 'Benign note', status: 'TRIAGED', violatedInvariant: 'INV-02', rootCause: {}, findingGroupKey: null, firstSeenRunId: 'run-1', latestSeenRunId: 'run-1', createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z' },
+    ])
+    const user = userEvent.setup()
+
+    render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+    await user.click(await screen.findByRole('button', { name: 'Run 조회' }))
+    await user.selectOptions(screen.getByLabelText('Oracle outcome filter'), 'ATTACK_SUCCESS')
+    await user.selectOptions(screen.getByLabelText('Finding category filter'), 'FA-04')
+    await user.selectOptions(screen.getByLabelText('Finding severity filter'), 'HIGH')
+    await user.selectOptions(screen.getByLabelText('Finding status filter'), 'OPEN')
+
+    expect(screen.getByText('EXFILTRATION')).toBeInTheDocument()
+    expect(screen.queryByText('NORMAL_TASK')).not.toBeInTheDocument()
+    expect(screen.getByText('FA-04 · Outbound exfiltration')).toBeInTheDocument()
+    expect(screen.queryByText('FA-02 · Benign note')).not.toBeInTheDocument()
+  })
+
+  it('subscribes to SSE for active runs and appends realtime events', async () => {
+    const nativeEventSource = globalThis.EventSource
+    const listeners = new Map<string, Array<(event: MessageEvent) => void>>()
+
+    class MockEventSource {
+      static instances: MockEventSource[] = []
+      onopen: ((this: EventSource, ev: Event) => unknown) | null = null
+      onerror: ((this: EventSource, ev: Event) => unknown) | null = null
+      constructor(public url: string) {
+        MockEventSource.instances.push(this)
+      }
+      addEventListener(type: string, listener: EventListenerOrEventListenerObject) {
+        const fn = typeof listener === 'function'
+          ? (listener as (event: MessageEvent) => void)
+          : ((event: MessageEvent) => listener.handleEvent(event))
+        const current = listeners.get(type) ?? []
+        current.push(fn)
+        listeners.set(type, current)
+      }
+      close() {}
+      emit(type: string, payload: unknown) {
+        const event = { data: JSON.stringify(payload) } as MessageEvent
+        ;(listeners.get(type) ?? []).forEach((listener) => listener(event))
+      }
+    }
+
+    // @ts-expect-error test-only EventSource replacement
+    globalThis.EventSource = MockEventSource
+
+    try {
+      vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+        { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+      ])
+      vi.spyOn(api, 'listTestRuns').mockResolvedValue([
+        { id: 'run-1', releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE', status: 'RUNNING', totalCases: 12, completedCases: 5, operationalErrorCount: 0, latestSequence: 10, startedAt: '2026-09-01T00:00:00Z', completedAt: null },
+      ])
+      vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
+      vi.spyOn(api, 'testRun').mockResolvedValue({
+        id: 'run-1', releaseId: release.id, suiteId: 'suite-1', contractVersionId: null, mode: 'BASELINE', status: 'RUNNING',
+        agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`, releaseFingerprint: `sha256:${'2'.repeat(64)}`, fixtureVersion: '1.0', fixtureDigest: `sha256:${'3'.repeat(64)}`,
+        totalCases: 12, completedCases: 5, operationalErrorCount: 0, latestSequence: 10, latestEventType: 'RUN_STARTED',
+        eventHeadHash: `sha256:${'4'.repeat(64)}`, summary: {}, startedAt: '2026-09-01T00:00:00Z', completedAt: null, createdAt: '2026-09-01T00:00:00Z',
+      })
+      vi.spyOn(api, 'eventHistory').mockResolvedValue({ items: [], headSequence: 10, nextCursor: null })
+      vi.spyOn(api, 'verifyEventChain').mockResolvedValue({ runId: 'run-1', valid: true, eventCount: 0, firstInvalidSequence: null, headHash: `sha256:${'4'.repeat(64)}` })
+      vi.spyOn(api, 'runOracleResults').mockResolvedValue([])
+      vi.spyOn(api, 'runFindings').mockResolvedValue([])
+      const user = userEvent.setup()
+
+      render(<ExecutionPage releases={[release]} actorId="role-b-console" />)
+
+      await waitFor(() => {
+        expect(screen.getByLabelText('Test Run ID')).toHaveValue('run-1')
+      })
+      await user.click(await screen.findByRole('button', { name: 'Run 조회' }))
+      const stream = MockEventSource.instances[0]
+      expect(stream.url).toContain('/api/v1/test-runs/run-1/events')
+
+      stream.onopen?.call(stream as unknown as EventSource, new Event('open'))
+      await waitFor(() => {
+        expect(screen.getByText(/Live stream:/)).toHaveTextContent('LIVE')
+      })
+
+      stream.emit('trace.event', {
+        schemaVersion: '1.0',
+        eventId: 'event-11',
+        traceId: 'trace-1',
+        runId: 'run-1',
+        testCaseRunId: null,
+        sequence: 11,
+        occurredAt: '2026-09-01T00:01:00Z',
+        eventType: 'TOOL_CALLED',
+        toolName: 'CUSTOMER_DATA_READ',
+        input: {},
+        output: {},
+        payloadDigest: `sha256:${'7'.repeat(64)}`,
+        policyDecision: {},
+        reasonCode: null,
+        metadata: {},
+        prevEventHash: `sha256:${'8'.repeat(64)}`,
+        eventHash: `sha256:${'9'.repeat(64)}`,
+      })
+
+      expect(await screen.findByText('1 execution events')).toBeInTheDocument()
+    } finally {
+      globalThis.EventSource = nativeEventSource
+    }
   })
 
   it('marks an invalidated Attestation as historical and stale', async () => {

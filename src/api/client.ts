@@ -198,8 +198,13 @@ export class FinsecApiClient {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
   }
 
-  listTestSuites(releaseId: string, actorId: string): Promise<TestSuiteSummary[]> {
-    return this.request<{ items: TestSuiteSummary[] }>(`/api/v1/releases/${encodeURIComponent(releaseId)}/test-suites`, {}, { actorId })
+  listTestSuites(releaseId: string, actorId: string, filters: { status?: string; limit?: number; cursor?: string } = {}): Promise<TestSuiteSummary[]> {
+    const params = new URLSearchParams()
+    if (filters.status) params.set('status', filters.status)
+    if (filters.limit) params.set('limit', String(filters.limit))
+    if (filters.cursor) params.set('cursor', filters.cursor)
+    const query = params.size ? `?${params.toString()}` : ''
+    return this.request<{ items: TestSuiteSummary[] }>(`/api/v1/releases/${encodeURIComponent(releaseId)}/test-suites${query}`, {}, { actorId })
       .then((response) => response.items)
   }
 

@@ -92,9 +92,9 @@ describe('FinsecApiClient', () => {
     }))
     const client = new FinsecApiClient('http://api.test')
 
-    const suites = await client.listTestSuites('release-1', 'role-b-console')
+    const suites = await client.listTestSuites('release-1', 'role-b-console', { status: 'READY', limit: 20 })
 
-    expect(fetchMock).toHaveBeenCalledWith('http://api.test/api/v1/releases/release-1/test-suites', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('http://api.test/api/v1/releases/release-1/test-suites?status=READY&limit=20', expect.objectContaining({
       headers: expect.any(Headers),
     }))
     expect(suites).toEqual([{ id: 'suite-1', releaseId: 'release-1', version: '1.0', status: 'READY', suiteHash: 'sha256:abc', caseCount: 12 }])
