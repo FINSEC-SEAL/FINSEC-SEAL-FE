@@ -92,14 +92,17 @@ function api(initial: StoredContractReview[] = [snapshot()]) {
     list: (release: string) => Reply
     detail: (id: string) => Reply
     post: (path: string, init: RequestInit) => Reply
+    operation: (id: string, init: RequestInit) => Reply
   } = {
     list: selected => response([...views.values()].filter(view => view.identity.releaseId === selected).map(view => platformVersion(view))),
     detail: id => response(views.get(id)),
     post: () => problem(409, 'INVALID_STATE_TRANSITION'),
+    operation: () => problem(404, 'RESOURCE_NOT_FOUND'),
   }
   const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
     const url = new URL(String(input))
     if (init.method === 'POST') return handlers.post(url.pathname, init)
+    if (url.pathname.startsWith('/api/v1/operations/')) return handlers.operation(url.pathname.split('/').at(-1)!, init)
     if (url.pathname.endsWith('/review')) return handlers.detail(url.pathname.split('/').at(-2)!)
     if (url.pathname === '/api/v1/platform/contracts') return handlers.list(url.searchParams.get('releaseId')!)
     throw new Error('Unexpected synthetic HTTP route')
@@ -572,5 +575,445 @@ describe('selection races and uncertain operations', () => {
     expect(screen.getByText('요청 처리 여부가 미확정입니다.')).toBeInTheDocument()
     unavailable('동일 요청 재전송 검토'); unavailable('계약 검증'); unavailable('거절 검토')
     expect(backend.posts()).toHaveLength(1)
+  })
+})
+
+const generationId = '019903ac-abcd-7000-8000-000000000070'
+const findingId = '019903ac-abcd-7000-8000-000000000071'
+const proposalId = '019903ac-abcd-7000-8000-000000000072'
+const generationCanary = 'SYNTHETIC_GENERATION_PRIVATE_CANARY'
+
+// Test-authored HTTP records only; this does not execute an A worker or B model.
+function generationView(kind: 'CONTRACT' | 'PATCH' = 'CONTRACT', status = 'QUEUED', outcome: string | null = null,
+  view = snapshot(), overrides: Record<string, unknown> = {}) {
+  const terminal = ['SUCCEEDED', 'FAILED', 'RECOVERY_REQUIRED'].includes(status)
+  const candidate = ['VALID', 'WARN', 'PROPOSED'].includes(outcome ?? '')
+  return { operationId: generationId, kind, status, statusUrl: `/api/v1/operations/${generationId}`, releaseId,
+    outcome, result: status === 'SUCCEEDED' ? { assessment: outcome, issues: [{ code: generationCanary }],
+      ...(candidate ? { contractVersionId: view.identity.versionId, policyHash: view.policyHash, resourceHash,
+        ...(kind === 'PATCH' ? { patchProposalId: proposalId } : {}) } : {}) } : null,
+    errorCode: status === 'RECOVERY_REQUIRED' ? 'EXECUTION_UNCERTAIN' : status === 'FAILED' ? generationCanary : null,
+    errorStage: status === 'RECOVERY_REQUIRED' ? 'WORKER' : status === 'FAILED' ? 'ADMISSION' : null,
+    retryable: true, createdAt: '2026-09-07T01:00:00Z',
+    startedAt: status === 'QUEUED' || status === 'FAILED' ? null : '2026-09-07T01:00:01Z',
+    finishedAt: terminal ? '2026-09-07T01:00:02Z' : null,
+    rawModel: generationCanary, provider: { private: key }, ...overrides }
+}
+
+function admitted(kind: 'CONTRACT' | 'PATCH' = 'CONTRACT', overrides: Record<string, unknown> = {}) {
+  const view = generationView(kind, 'QUEUED', null, snapshot(), overrides)
+  return new Response(JSON.stringify({ data: view, traceId, timestamp: '2026-09-07T01:00:00Z' }), {
+    status: 202, headers: { 'Content-Type': 'application/json', Location: String(view.statusUrl) },
+  })
+}
+
+function operationGets(backend: ReturnType<typeof api>) {
+  return backend.fetchMock.mock.calls.filter(([input, init]) => init?.method !== 'POST' && String(input).includes('/operations/'))
+}
+function generationPosts(backend: ReturnType<typeof api>) {
+  return backend.posts().filter(([input]) => String(input).includes('contracts:generate') || String(input).endsWith('/patch-proposals'))
+}
+function generationRegion() { return within(screen.getByRole('region', { name: '후보 생성 작업' })) }
+
+async function startPatch(user: User) {
+  await user.type(screen.getByLabelText('패치 출처 Finding ID'), findingId)
+  await user.click(screen.getByRole('button', { name: '패치 후보 생성' }))
+}
+
+function mutationLifecycle(backend: ReturnType<typeof api>, generationKind: 'CONTRACT' | 'PATCH' = 'CONTRACT') {
+  backend.handlers.post = (path, init) => {
+    if (path.endsWith('contracts:generate') || path.endsWith('/patch-proposals')) return admitted(generationKind)
+    const id = path.split('/').at(-1)!.split(':')[0]!
+    const previous = backend.views.get(id)!
+    const next = path.endsWith(':validate') ? validated({ ...previous, state: 'VALIDATED', resourceHash: changedHash,
+      validation: { status: 'VALID', issues: [] } })
+      : { ...previous, state: path.endsWith(':approve') ? 'APPROVED' as const : 'REJECTED' as const, resourceHash: baseHash }
+    expect(init.credentials).toBe('omit')
+    backend.views.set(id, next)
+    return response(platformVersion(next))
+  }
+}
+
+describe('generation admission and explicit stored candidate review', () => {
+  it.each(['VALID', 'WARN'])('opens initial %s only on request, then separately validates and approves the fresh stored hash', async outcome => {
+    const backend = api([]); mutationLifecycle(backend)
+    backend.handlers.operation = () => { backend.views.set(versionId, snapshot()); return response(generationView('CONTRACT', 'SUCCEEDED', outcome)) }
+    const user = userEvent.setup(); page(); await loadList(user)
+    expect(await screen.findByText('저장된 계약이 없습니다')).toBeInTheDocument()
+    await user.dblClick(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await generationRegion().findByText(outcome, { exact: true })).toBeInTheDocument()
+    expect(generationPosts(backend)).toHaveLength(1)
+    expect(operationGets(backend)).toHaveLength(1)
+    expect(backend.fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/review'))).toHaveLength(0)
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    const post = generationPosts(backend)[0]!
+    expect(String(post[0])).toBe(`https://api.test/api/v1/releases/${releaseId}/contracts:generate`)
+    expect(JSON.parse(String(post[1]?.body))).toEqual({ templateKey: 'loan-review/1' })
+    expect(new Headers(post[1]?.headers).has('If-Match')).toBe(false)
+    await user.click(screen.getByRole('button', { name: '생성된 후보 검토' }))
+    expect(await screen.findByLabelText('계약 JSON')).toHaveTextContent('loan-review')
+    await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled())
+    expect(backend.posts()).toHaveLength(2)
+    const dialog = await confirm(user, '승인')
+    expect(dialog.textContent).toContain(changedHash)
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(new Headers(backend.posts()[2]![1]?.headers).get('If-Match')).toBe(`"${changedHash}"`)
+    expect(JSON.parse(String(backend.posts()[2]![1]?.body))).toEqual({ comment: '변경 범위와 검증 결과 확인' })
+    expect(document.body.textContent).not.toContain(generationCanary)
+    expect(document.body.textContent).not.toContain(key)
+  })
+
+  it.each(['CANDIDATE', 'VALIDATED'] as const)('binds a PATCH already %s to its proposal while using the current resource hash', async state => {
+    const base = snapshot()
+    const candidate = snapshot({ identity: { ...base.identity, versionId: secondVersionId, version: 8 }, state,
+      resourceHash: changedHash, validation: state === 'VALIDATED' ? { status: 'VALID', issues: [] } : null })
+    const backend = api([base]); mutationLifecycle(backend, 'PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); page(); await load(user); await startPatch(user)
+    expect(await generationRegion().findByText('PROPOSED')).toBeInTheDocument()
+    expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 7')
+    const admission = generationPosts(backend)[0]!
+    expect(String(admission[0])).toBe(`https://api.test/api/v1/findings/${findingId}/patch-proposals`)
+    expect(JSON.parse(String(admission[1]?.body))).toEqual({ baseContractVersionId: versionId })
+    await user.click(screen.getByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    if (state === 'CANDIDATE') {
+      await user.click(screen.getByRole('button', { name: '계약 검증' }))
+      await waitFor(() => expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled())
+      expect(JSON.parse(String(backend.posts()[1]![1]?.body))).toEqual({})
+    }
+    const dialog = await confirm(user, '승인')
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    const approve = backend.posts().at(-1)!
+    expect(String(approve[0])).toContain(`${secondVersionId}:approve`)
+    expect(JSON.parse(String(approve[1]?.body))).toEqual({ comment: '변경 범위와 검증 결과 확인', patchProposalId: proposalId })
+    expect(new Headers(approve[1]?.headers).get('If-Match')).toBe(`"${changedHash}"`)
+  })
+
+  it('keeps candidate-specific proposal binding after replacing the Release generation record and does not transfer it to another candidate', async () => {
+    const base = validated()
+    const candidate = validated({ identity: { ...base.identity, versionId: secondVersionId, version: 8 }, resourceHash: changedHash })
+    const backend = api([base]); mutationLifecycle(backend, 'PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); page(); await load(user, base); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    // A new terminal initial generation replaces only the Release record, not this exact candidate's binding.
+    mutationLifecycle(backend)
+    backend.handlers.operation = () => response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID'))
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await generationRegion().findByText('INVALID')).toBeInTheDocument()
+    await selectVersion(user, base)
+    let dialog = await confirm(user, '승인')
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(JSON.parse(String(backend.posts().at(-1)![1]?.body))).not.toHaveProperty('patchProposalId')
+    await selectVersion(user, candidate)
+    dialog = await confirm(user, '승인')
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    await waitFor(() => expect(backend.posts().at(-1)![0]).toContain(`${secondVersionId}:approve`))
+    expect(JSON.parse(String(backend.posts().at(-1)![1]?.body))).toHaveProperty('patchProposalId', proposalId)
+  })
+
+  it('rejects the generated candidate through the existing version endpoint without a proposal rejection claim', async () => {
+    const candidate = snapshot({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 } })
+    const backend = api(); mutationLifecycle(backend, 'PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); page(); await load(user); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    const dialog = await confirm(user, '거절')
+    await user.click(within(dialog).getByRole('button', { name: '거절 요청 전송' }))
+    expect(await screen.findByText('계약 거절 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(JSON.parse(String(backend.posts().at(-1)![1]?.body))).toEqual({ comment: '변경 범위와 검증 결과 확인' })
+    expect(document.body.textContent).not.toContain('제안 거절 완료')
+  })
+
+  it.each(['missing', 'duplicate', 'release', 'policy', 'workspace', 'contractKey', 'detailIdentity', 'detailPolicy', 'detailFailure', 'sameBase', 'olderVersion'])('does not hand off a generated PATCH with %s stored evidence', async defect => {
+    const candidate = snapshot({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 } })
+    const backend = api(); backend.handlers.post = () => admitted('PATCH')
+    backend.handlers.operation = () => response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', defect === 'sameBase' ? snapshot() : candidate))
+    const user = userEvent.setup(); page(); await load(user); await startPatch(user)
+    expect(await generationRegion().findByText('PROPOSED')).toBeInTheDocument()
+    const boundCandidate = defect === 'sameBase' ? snapshot() : defect === 'olderVersion'
+      ? { ...candidate, identity: { ...candidate.identity, version: 6 } } : candidate
+    const flat = platformVersion(boundCandidate)
+    backend.handlers.list = () => response(defect === 'missing' ? [] : defect === 'duplicate' ? [flat, flat] : [{ ...flat,
+      ...(defect === 'release' ? { releaseId: secondReleaseId } : {}),
+      ...(defect === 'policy' ? { policyHash: baseHash } : {}),
+      ...(defect === 'workspace' ? { workspaceId: traceId } : {}),
+      ...(defect === 'contractKey' ? { contractKey: 'other-policy' } : {}),
+    }])
+    backend.handlers.detail = () => defect === 'detailFailure' ? problem(503, generationCanary) : response({ ...candidate,
+      ...(defect === 'detailIdentity' ? { identity: { ...candidate.identity, version: 99 } } : {}),
+      ...(defect === 'detailPolicy' ? { policyHash: baseHash } : {}),
+    })
+    await user.click(screen.getByRole('button', { name: '생성된 후보 검토' }))
+    expect(await screen.findByText('생성 완료 · 저장 후보 조회 실패')).toBeInTheDocument()
+    unavailable('계약 검증'); unavailable('승인 검토'); unavailable('거절 검토')
+    expect(generationRegion().getByText('PROPOSED')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    expect(document.body.textContent).not.toContain(generationCanary)
+  })
+})
+
+describe('generation unknown admission and Operation polling', () => {
+  it.each(['lost202', 'abort', '503', 'malformed202', 'in-progress', 'conflict'])('never resubmits %s unknown admission after input, scope and clock changes', async failure => {
+    const backend = api(); backend.handlers.post = () => {
+      if (failure === 'lost202') return Promise.reject(new TypeError(generationCanary))
+      if (failure === 'abort') return Promise.reject(new DOMException(generationCanary, 'AbortError'))
+      if (failure === 'malformed202') return response({ private: generationCanary }, 202)
+      return problem(failure === '503' ? 503 : 409, failure === 'in-progress' ? 'IDEMPOTENCY_IN_PROGRESS' : failure === 'conflict' ? 'IDEMPOTENCY_CONFLICT' : generationCanary)
+    }
+    const user = userEvent.setup(); const rendered = page(); await load(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await screen.findByText('생성 접수 여부 미확정')).toBeInTheDocument()
+    await user.type(screen.getByLabelText('패치 출처 Finding ID'), findingId)
+    unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성')
+    expect(screen.queryByRole('button', { name: /재전송/ })).not.toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('정책 Release'), secondReleaseId)
+    await loadList(user)
+    await user.selectOptions(screen.getByLabelText('정책 Release'), releaseId)
+    await load(user)
+    fireEvent.change(screen.getByLabelText('검토자 키'), { target: { value: `${key}changed` } })
+    await loadList(user, `${key}changed`); await selectVersion(user)
+    const nextClient = new ContractReviewClient('https://other.test')
+    rendered.rerender(<StoredContractReviewPage releases={[release(), release(secondReleaseId)]} preferredReleaseId={releaseId} client={nextClient} />)
+    await loadList(user, `${key}changed`); await selectVersion(user)
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2099-01-01T00:00:00Z'))
+      await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
+      await selectVersion(user)
+      unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성')
+      expect(screen.getByText('생성 접수 여부 미확정')).toBeInTheDocument()
+      expect(backend.posts()).toHaveLength(1)
+      expect(operationGets(backend)).toHaveLength(0)
+      expect(document.body.textContent).not.toContain(generationCanary)
+      expect(document.body.textContent).not.toContain(key)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('records pending admission before dispatch and keeps it when navigation abort is ignored', async () => {
+    const backend = api(); const admission = deferred<Response>()
+    backend.handlers.post = () => admission.promise
+    const user = userEvent.setup(); page(); await load(user)
+    fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(backend.posts()).toHaveLength(1)
+    expect(screen.getByText('생성 접수 응답 대기 중')).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '계약 목록 조회' })); await selectVersion(user)
+    expect(backend.posts()[0]![1]?.signal?.aborted).toBe(true)
+    unavailable('초기 계약 후보 생성')
+    await act(async () => admission.reject(new TypeError(generationCanary)))
+    expect(await screen.findByText('생성 접수 여부 미확정')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+  })
+
+  it('allows a separately prepared explicit request after a definitive first admission rejection', async () => {
+    const backend = api(); backend.handlers.post = () => problem(403, 'CONTRACT_AUTH_REQUIRED')
+    const user = userEvent.setup(); page(); await load(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await generationRegion().findByText('검토자 키를 확인해 주세요.')).toBeInTheDocument()
+    expect(screen.queryByText('생성 접수 여부 미확정')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(generationPosts(backend)).toHaveLength(2)
+    expect(new Headers(generationPosts(backend)[1]![1]?.headers).get('Idempotency-Key'))
+      .not.toBe(new Headers(generationPosts(backend)[0]![1]?.headers).get('Idempotency-Key'))
+  })
+
+  it.each([
+    ['CONTRACT', 'SUCCEEDED', 'INVALID'], ['PATCH', 'SUCCEEDED', 'INVALID'], ['PATCH', 'SUCCEEDED', 'NO_CHANGE_NEEDED'],
+    ['CONTRACT', 'FAILED', null], ['PATCH', 'RECOVERY_REQUIRED', null],
+  ] as const)('keeps %s %s %s terminal results separate from candidates and automatic POST', async (kind, status, outcome) => {
+    const backend = api(); backend.handlers.post = () => admitted(kind)
+    backend.handlers.operation = () => response(generationView(kind, status, outcome))
+    const user = userEvent.setup(); page(); await load(user)
+    if (kind === 'PATCH') await startPatch(user)
+    else await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await generationRegion().findByText(status, { exact: true })).toBeInTheDocument()
+    if (outcome) expect(generationRegion().getByText(outcome, { exact: true })).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '생성된 후보 검토' })).not.toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    expect(operationGets(backend)).toHaveLength(1)
+    if (status === 'RECOVERY_REQUIRED') { unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성') }
+    expect(document.body.textContent).not.toContain(generationCanary)
+  })
+
+  it.each(['key', 'client', 'release', 'signature'] as const)('holds the single Operation GET lock across %s changes and ignores the old result', async scope => {
+    const backend = api(); backend.handlers.post = () => admitted()
+    const pending = deferred<Response>(); let outstanding = 0; let maximum = 0
+    backend.handlers.operation = () => { outstanding++; maximum = Math.max(maximum, outstanding); return pending.promise.finally(() => { outstanding-- }) }
+    const user = userEvent.setup(); const rendered = page(); await load(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    await waitFor(() => expect(operationGets(backend)).toHaveLength(1))
+    const oldSignal = operationGets(backend)[0]![1]?.signal
+    if (scope === 'key') fireEvent.change(screen.getByLabelText('검토자 키'), { target: { value: `${key}x` } })
+    if (scope === 'client') rendered.rerender(<StoredContractReviewPage releases={[release()]} preferredReleaseId={releaseId} client={new ContractReviewClient('https://second.test')} />)
+    if (scope === 'signature') rendered.rerender(<StoredContractReviewPage releases={[{ ...release(), updatedAt: '2026-09-08T01:00:00Z' }]} preferredReleaseId={releaseId} client={client} />)
+    if (scope === 'release') { await user.selectOptions(screen.getByLabelText('정책 Release'), secondReleaseId); await loadList(user); await user.selectOptions(screen.getByLabelText('정책 Release'), releaseId) }
+    await loadList(user, scope === 'key' ? `${key}x` : key); await selectVersion(user)
+    expect(oldSignal?.aborted).toBe(true)
+    unavailable('생성 상태 다시 조회')
+    expect(operationGets(backend)).toHaveLength(1)
+    await act(async () => scope === 'client' ? pending.reject(new TypeError(generationCanary))
+      : pending.resolve(response(generationView('CONTRACT', 'SUCCEEDED', 'VALID'))))
+    expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '생성된 후보 검토' })).not.toBeInTheDocument()
+    backend.handlers.operation = () => { outstanding++; maximum = Math.max(maximum, outstanding); outstanding--; return response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID')) }
+    await user.click(screen.getByRole('button', { name: '생성 상태 다시 조회' }))
+    expect(await generationRegion().findByText('INVALID')).toBeInTheDocument()
+    expect(maximum).toBe(1); expect(outstanding).toBe(0)
+    expect(backend.posts()).toHaveLength(1)
+  })
+
+  it('polls only after settlement, separates GET failure, and stops timers on error, terminal and unmount', async () => {
+    vi.useFakeTimers()
+    try {
+      const backend = api(); backend.handlers.post = () => admitted()
+      const slow = deferred<Response>(); backend.handlers.operation = () => slow.promise
+      const rendered = page()
+      fireEvent.change(screen.getByLabelText('검토자 키'), { target: { value: key } })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '계약 목록 조회' })) })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' })) })
+      expect(operationGets(backend)).toHaveLength(1)
+      await act(async () => { await vi.advanceTimersByTimeAsync(15000) })
+      expect(operationGets(backend)).toHaveLength(1)
+      await act(async () => slow.resolve(response(generationView('CONTRACT', 'RUNNING'))))
+      backend.handlers.operation = () => problem(503, generationCanary)
+      await act(async () => { await vi.advanceTimersByTimeAsync(1500) })
+      expect(operationGets(backend)).toHaveLength(2)
+      expect(screen.getByText('생성 상태 조회 실패')).toBeInTheDocument()
+      expect(generationRegion().getByText('RUNNING')).toBeInTheDocument()
+      expect(generationRegion().getByText(generationId)).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(20000) })
+      expect(operationGets(backend)).toHaveLength(2)
+      backend.handlers.operation = () => response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID'))
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '생성 상태 다시 조회' })) })
+      expect(generationRegion().getByText('INVALID')).toBeInTheDocument()
+      expect(screen.queryByText('생성 상태 조회 실패')).not.toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(20000) })
+      expect(operationGets(backend)).toHaveLength(3)
+      const unmountedRead = deferred<Response>()
+      backend.handlers.operation = () => unmountedRead.promise
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' })) })
+      expect(operationGets(backend)).toHaveLength(4)
+      const lastSignal = operationGets(backend).at(-1)![1]?.signal
+      rendered.unmount()
+      expect(lastSignal?.aborted).toBe(true)
+      await act(async () => unmountedRead.resolve(response(generationView('CONTRACT', 'RUNNING'))))
+      await act(async () => { await vi.advanceTimersByTimeAsync(20000) })
+      expect(operationGets(backend)).toHaveLength(4)
+      expect(backend.posts()).toHaveLength(2)
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('generation handoff scope and current approval consent', () => {
+  it.each(['key', 'client', 'signature'] as const)('does not attach an earlier %s scope proposal to a new approval', async scope => {
+    const candidate = validated({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 }, resourceHash: changedHash })
+    const backend = api(); mutationLifecycle(backend, 'PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); const rendered = page(); await load(user); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    await confirm(user, '승인')
+    if (scope === 'key') fireEvent.change(screen.getByLabelText('검토자 키'), { target: { value: `${key}x` } })
+    else if (scope === 'client') rendered.rerender(<StoredContractReviewPage releases={[release()]} preferredReleaseId={releaseId} client={new ContractReviewClient('https://second.test')} />)
+    else rendered.rerender(<StoredContractReviewPage releases={[{ ...release(), updatedAt: '2026-09-08T02:00:00Z' }]} preferredReleaseId={releaseId} client={client} />)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    await loadList(user, scope === 'key' ? `${key}x` : key); await selectVersion(user, candidate)
+    unavailable('생성된 후보 검토')
+    backend.handlers.post = () => problem(409, 'RESOURCE_CONFLICT')
+    const dialog = await confirm(user, '승인')
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('이전 동의를 해제했습니다. 최신 내용을 확인하고 다시 검토해 주세요.')).toBeInTheDocument()
+    expect(screen.queryByText('계약 승인 요청이 처리되었습니다.')).not.toBeInTheDocument()
+    // This generic stored mutation is not proof of A accepting a patch without its required link.
+    expect(JSON.parse(String(backend.posts().at(-1)![1]?.body))).not.toHaveProperty('patchProposalId')
+    expect(generationPosts(backend)).toHaveLength(1)
+  })
+
+  it('preserves a proposal across 409 reinspection but requires fresh consent and current hash', async () => {
+    const candidate = validated({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 }, resourceHash: changedHash })
+    const backend = api(); mutationLifecycle(backend, 'PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); page(); await load(user); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    let dialog = await confirm(user, '승인')
+    const ordinaryPost = backend.handlers.post
+    let rejected = false
+    backend.handlers.post = (path, init) => {
+      if (path.endsWith(':approve') && !rejected) {
+        rejected = true; backend.views.set(secondVersionId, { ...candidate, resourceHash: baseHash })
+        return problem(409, 'RESOURCE_CONFLICT')
+      }
+      return ordinaryPost(path, init)
+    }
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('이전 동의를 해제했습니다. 최신 내용을 확인하고 다시 검토해 주세요.')).toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled())
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(2)
+    await user.click(screen.getByRole('button', { name: '승인 검토' }))
+    dialog = screen.getByRole('dialog', { name: '계약 승인 확인' })
+    expect(within(dialog).getByRole('checkbox', { name: consent })).not.toBeChecked()
+    expect(within(dialog).getByRole('button', { name: '승인 요청 전송' })).toBeDisabled()
+    expect(dialog.textContent).toContain(baseHash)
+    await user.click(within(dialog).getByRole('checkbox', { name: consent }))
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(new Headers(backend.posts().at(-1)![1]?.headers).get('If-Match')).toBe(`"${baseHash}"`)
+    expect(JSON.parse(String(backend.posts().at(-1)![1]?.body))).toHaveProperty('patchProposalId', proposalId)
+  })
+
+  it('blocks approval if the same bound candidate now reports a different immutable policy hash', async () => {
+    const candidate = validated({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 } })
+    const backend = api(); backend.handlers.post = () => admitted('PATCH')
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate)) }
+    const user = userEvent.setup(); page(); await load(user); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await waitFor(() => expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 8'))
+    backend.views.set(secondVersionId, { ...candidate, policyHash: baseHash })
+    await user.click(screen.getByRole('button', { name: '최신 계약 다시 조회' }))
+    expect(await screen.findByText('저장 후보와 패치 제안의 연결을 확인할 수 없습니다.')).toBeInTheDocument()
+    unavailable('승인 검토')
+    expect(backend.posts()).toHaveLength(1)
+  })
+
+  it('blocks replacement generation during candidate handoff and ignores its late detail after selection changes', async () => {
+    const candidate = snapshot({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 } })
+    const backend = api(); backend.handlers.post = () => admitted()
+    backend.handlers.operation = () => { backend.views.set(secondVersionId, candidate); return response(generationView('CONTRACT', 'SUCCEEDED', 'VALID', candidate)) }
+    const user = userEvent.setup(); page(); await load(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    await generationRegion().findByText('VALID')
+    const slow = deferred<Response>()
+    backend.handlers.detail = id => id === secondVersionId ? slow.promise : response(backend.views.get(id))
+    await user.click(screen.getByRole('button', { name: '생성된 후보 검토' }))
+    unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성')
+    await selectVersion(user)
+    await act(async () => slow.resolve(response(candidate)))
+    expect(screen.getByLabelText('계약 JSON')).toHaveTextContent('"version": 7')
+    expect(backend.posts()).toHaveLength(1)
+  })
+
+  it('does not generate from an unresolved stored mutation or before the initial list has loaded', async () => {
+    const backend = api(); const listing = deferred<Response>()
+    backend.handlers.list = () => listing.promise
+    const user = userEvent.setup(); page(); await loadList(user)
+    unavailable('초기 계약 후보 생성')
+    await act(async () => listing.resolve(response([platformVersion(snapshot())])))
+    await selectVersion(user)
+    backend.handlers.post = () => Promise.reject(new TypeError(key))
+    await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText('요청 처리 여부가 미확정입니다.')).toBeInTheDocument()
+    await user.type(screen.getByLabelText('패치 출처 Finding ID'), findingId)
+    unavailable('패치 후보 생성')
+    expect(generationPosts(backend)).toHaveLength(0)
   })
 })

@@ -2,7 +2,7 @@ import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { Release } from '../../api/contracts'
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader } from '../../components/Primitives'
 import { Badge, DataTable, Modal, Notice, Panel } from '../../components/Product'
-import { ContractRequestError, ContractReviewClient, prepareContractMutation, type ContractAction, type PreparedContractMutation } from './client'
+import { ContractRequestError, ContractReviewClient, prepareContractMutation, type ContractAction, type PreparedContractMutation, prepareInitialGeneration, preparePatchGeneration, type PreparedGeneration, type GenerationOperation, type ProposedPatchOperation } from './client'
 import { PolicyReviewDetails } from './PolicyReviewDetails'
 import type { ContractVersionIdentity, ContractVersionSummary, StoredContractReview } from './wire'
 
@@ -10,6 +10,8 @@ const defaultClient = new ContractReviewClient()
 const actionNames = { validate: '검증', approve: '승인', reject: '거절' } as const
 type OperationRecord = { operation: PreparedContractMutation; epoch: number; phase: 'pending' | 'unknown' }
 type MutationResult = { ok: true; version: ContractVersionSummary } | { ok: false; error: ContractRequestError }
+type GenerationRecord = { request: PreparedGeneration; epoch: number; releaseSignature: string; client: ContractReviewClient; phase: 'submitting' | 'unknown' | 'rejected' | 'accepted'; operation: GenerationOperation | null; error: ContractRequestError | null; readError: ContractRequestError | null }
+type PatchBinding = { identity: ContractVersionIdentity; operation: ProposedPatchOperation; epoch: number; releaseSignature: string; client: ContractReviewClient }
 type Session = { id: number; releaseId: string; releaseSignature: string; reviewerKey: string; epoch: number; client: ContractReviewClient }
 
 function targetKey(identity: ContractVersionIdentity): string {
@@ -37,6 +39,25 @@ function eligible(review: StoredContractReview, action: ContractAction): boolean
   return review.state === 'VALIDATED' && (review.validation?.status === 'VALID' || review.validation?.status === 'WARN')
 }
 
+function generationBlocked(record: GenerationRecord | undefined): boolean {
+  return Boolean(record && (record.phase === 'submitting' || record.phase === 'unknown'
+    || (record.phase === 'accepted' && record.operation?.status !== 'SUCCEEDED' && record.operation?.status !== 'FAILED')))
+}
+
+type StoredCandidateOperation = Extract<GenerationOperation, { outcome: 'VALID' | 'WARN' | 'PROPOSED' }>
+function candidateOperation(operation: GenerationOperation | null): StoredCandidateOperation | null {
+  return operation?.status === 'SUCCEEDED' && (operation.outcome === 'VALID' || operation.outcome === 'WARN' || operation.outcome === 'PROPOSED') ? operation : null
+}
+
+function candidateMatches(record: GenerationRecord, version: ContractVersionSummary): boolean {
+  const operation = candidateOperation(record.operation)
+  return Boolean(operation && version.identity.releaseId === record.request.releaseId
+    && version.identity.versionId === operation.result.contractVersionId && version.policyHash === operation.result.policyHash
+    && (record.request.kind !== 'PATCH' || (version.identity.workspaceId === record.request.baseIdentity.workspaceId
+      && version.identity.contractKey === record.request.baseIdentity.contractKey
+      && version.identity.versionId !== record.request.baseIdentity.versionId && version.identity.version > record.request.baseIdentity.version)))
+}
+
 export function StoredContractReviewPage({ releases, preferredReleaseId, onReleaseChange, client = defaultClient }: {
   releases: Release[]
   preferredReleaseId?: string
@@ -53,9 +74,28 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   const alive = useRef(true)
   const ledger = useRef(new Map<string, OperationRecord>())
   const [records, setRecords] = useState<ReadonlyMap<string, OperationRecord>>(new Map())
+  const generationLedger = useRef(new Map<string, GenerationRecord>())
+  const [generationRecords, setGenerationRecords] = useState<ReadonlyMap<string, GenerationRecord>>(new Map())
+  const [patchBindings, setPatchBindings] = useState<ReadonlyMap<string, PatchBinding>>(new Map())
+  const activeSession = useRef<Session | null>(null)
+  const pollToken = useRef(0)
+  const pollTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const pollFlight = useRef<AbortController | null>(null)
+  const queuedPoll = useRef<Session | null>(null)
+  const [generationReading, setGenerationReading] = useState(false)
   const selectedRelease = releases.find(item => item.id === releaseId)
   const currentSession = session && selectedRelease && session.releaseId === releaseId && session.epoch === epoch
     && session.releaseSignature === releaseSignature(selectedRelease) && session.client === client ? session : null
+
+  activeSession.current = currentSession
+
+  // The lock lives above keyed sessions. Abort is not proof that a fetch has settled.
+  useEffect(() => () => {
+    pollToken.current++
+    if (pollTimer.current) clearTimeout(pollTimer.current)
+    pollTimer.current = null; queuedPoll.current = null
+    pollFlight.current?.abort()
+  }, [currentSession])
 
   useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
   useEffect(() => {
@@ -97,6 +137,67 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
     }
   }
 
+  function recordGeneration(record: GenerationRecord) {
+    generationLedger.current.set(record.request.releaseId, record)
+    if (alive.current) setGenerationRecords(new Map(generationLedger.current))
+  }
+
+  function pollGeneration(context: Session) {
+    if (!alive.current || activeSession.current !== context) return
+    if (pollFlight.current) { queuedPoll.current = context; return }
+    const record = generationLedger.current.get(context.releaseId)
+    if (record?.phase !== 'accepted' || !record.operation) return
+    if (pollTimer.current) clearTimeout(pollTimer.current)
+    pollTimer.current = null
+    const token = ++pollToken.current
+    const controller = new AbortController(); pollFlight.current = controller
+    setGenerationReading(true)
+    let again = false
+    const current = () => alive.current && activeSession.current === context && pollToken.current === token
+      && generationLedger.current.get(context.releaseId)?.request === record.request
+    void context.client.generationOperation(record.operation, context.reviewerKey, controller.signal)
+      .then(operation => {
+        if (!current()) return
+        recordGeneration({ ...record, operation, readError: null })
+        again = operation.status === 'QUEUED' || operation.status === 'RUNNING'
+      })
+      .catch(cause => { if (current()) recordGeneration({ ...record, readError: safeError(cause) }) })
+      .finally(() => {
+        pollFlight.current = null
+        if (alive.current) setGenerationReading(false)
+        const queued = queuedPoll.current; queuedPoll.current = null
+        if (queued && activeSession.current === queued) pollGeneration(queued)
+        else if (again && current()) pollTimer.current = setTimeout(() => pollGeneration(context), 1500)
+      })
+  }
+
+  async function submitGeneration(request: PreparedGeneration, context: Session, signal: AbortSignal) {
+    if (activeSession.current !== context || request.releaseId !== context.releaseId
+      || generationBlocked(generationLedger.current.get(request.releaseId))) return
+    const record: GenerationRecord = { request, epoch: context.epoch, releaseSignature: context.releaseSignature, client: context.client,
+      phase: 'submitting', operation: null, error: null, readError: null }
+    // Unknown admission has no safe replay window. Never unlock it through navigation or retries.
+    recordGeneration(record)
+    try {
+      const operation = await context.client.submitGeneration(request, context.reviewerKey, signal)
+      if (generationLedger.current.get(request.releaseId)?.request !== request) return
+      recordGeneration({ ...record, phase: 'accepted', operation })
+      if (activeSession.current === context) pollGeneration(context)
+    } catch (cause) {
+      const error = safeError(cause)
+      if (generationLedger.current.get(request.releaseId)?.request === request) {
+        recordGeneration({ ...record, phase: error.outcome === 'unknown' ? 'unknown' : 'rejected', error })
+      }
+    }
+  }
+
+  function bindPatch(identity: ContractVersionIdentity, operation: ProposedPatchOperation, context: Session) {
+    if (activeSession.current !== context) return
+    setPatchBindings(previous => new Map(previous).set(targetKey(identity), {
+      identity, operation, epoch: context.epoch, releaseSignature: context.releaseSignature, client: context.client,
+    }))
+  }
+
   function applyCredentials(event: FormEvent) {
     event.preventDefault()
     if (!selectedRelease || !reviewerKey) return
@@ -121,20 +222,37 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
       </li>)}</ul>
       버전이나 키를 바꿔도 이전 요청이 취소되지는 않습니다. 해당 버전에서 처리 상태를 확인해 주세요.
     </Notice>}
+    {Array.from(generationRecords.values()).filter(record => record.phase === 'unknown' || record.phase === 'submitting').map(record =>
+      <Notice key={record.request.releaseId} title={record.phase === 'unknown' ? '생성 접수 여부 미확정' : '생성 접수 응답 대기 중'} tone="amber">
+        Release <code>{record.request.releaseId}</code> · 요청 참조 <code>{record.request.idempotencyKey}</code>
+        <p>화면 이동은 서버 작업 취소가 아닙니다. 미확정 요청은 재전송하지 않으며 운영 확인이 필요합니다. 이 기록은 현재 페이지 메모리에만 유지됩니다.</p>
+      </Notice>)}
     {!selectedRelease ? <EmptyState title="Release를 선택하세요">검토할 실제 릴리스가 먼저 필요합니다.</EmptyState>
-      : currentSession ? <ReviewSession key={currentSession.id} context={currentSession} records={records} perform={perform} />
+      : currentSession ? <ReviewSession key={currentSession.id} context={currentSession} records={records} perform={perform}
+          generationRecord={generationRecords.get(currentSession.releaseId)} submitGeneration={submitGeneration}
+          pollGeneration={pollGeneration} generationReading={generationReading} patchBindings={patchBindings} bindPatch={bindPatch} />
         : <Notice title="검토할 릴리스와 검토자 키를 입력해 주세요.">계약 목록을 조회한 뒤 검토할 버전을 직접 선택하세요.</Notice>}
   </div>
 }
 
-type Confirmation = { kind: 'new'; action: 'approve' | 'reject'; snapshot: StoredContractReview }
+type Confirmation = { kind: 'new'; action: 'approve' | 'reject'; snapshot: StoredContractReview; patch?: ProposedPatchOperation }
   | { kind: 'retry'; operation: PreparedContractMutation; snapshot: StoredContractReview }
 
-function ReviewSession({ context, records, perform }: {
+function ReviewSession({ context, records, perform, generationRecord, submitGeneration, pollGeneration, generationReading, patchBindings, bindPatch }: {
   context: Session
   records: ReadonlyMap<string, OperationRecord>
   perform: (operation: PreparedContractMutation, context: Session, signal: AbortSignal) => Promise<MutationResult>
+  generationRecord: GenerationRecord | undefined
+  submitGeneration: (request: PreparedGeneration, context: Session, signal: AbortSignal) => Promise<void>
+  pollGeneration: (context: Session) => void
+  generationReading: boolean
+  patchBindings: ReadonlyMap<string, PatchBinding>
+  bindPatch: (identity: ContractVersionIdentity, operation: ProposedPatchOperation, context: Session) => void
 }) {
+  const [findingId, setFindingId] = useState('')
+  const [generationError, setGenerationError] = useState<ContractRequestError | null>(null)
+  const [candidateReadFailed, setCandidateReadFailed] = useState(false)
+  const admissionController = useRef<AbortController | null>(null)
   const [versions, setVersions] = useState<readonly ContractVersionSummary[] | null>(null)
   const [selected, setSelected] = useState<ContractVersionIdentity | null>(null)
   const [review, setReview] = useState<StoredContractReview | null>(null)
@@ -165,9 +283,58 @@ function ReviewSession({ context, records, perform }: {
       .finally(() => { if (current(token)) setBusy(false) })
     return () => {
       mounted.current = false; generation.current++
-      getController.current?.abort(); mutationController.current?.abort()
+      getController.current?.abort(); mutationController.current?.abort(); admissionController.current?.abort()
     }
   }, [context])
+
+  function patchFor(view: StoredContractReview): ProposedPatchOperation | undefined {
+    const binding = patchBindings.get(targetKey(view.identity))
+    return binding && binding.client === context.client && binding.epoch === context.epoch && binding.releaseSignature === context.releaseSignature
+      && sameIdentity(binding.identity, view.identity) && binding.operation.result.policyHash === view.policyHash
+      ? binding.operation : undefined
+  }
+
+  const selectedPatch = review ? patchBindings.get(targetKey(review.identity)) : undefined
+  const patchMismatch = Boolean(review && selectedPatch && selectedPatch.client === context.client
+    && selectedPatch.epoch === context.epoch && selectedPatch.releaseSignature === context.releaseSignature && !patchFor(review))
+
+  function generate(kind: 'CONTRACT' | 'PATCH') {
+    if (generationBlocked(generationRecord) || busy || mutationPending || sending.current || versions === null
+      || (kind === 'PATCH' && (!review || record))) return
+    try {
+      const request = kind === 'CONTRACT' ? prepareInitialGeneration(context.releaseId)
+        : preparePatchGeneration(findingId, review!.identity)
+      setGenerationError(null)
+      const controller = new AbortController(); admissionController.current = controller
+      void submitGeneration(request, context, controller.signal)
+    } catch (cause) { setGenerationError(safeError(cause)) }
+  }
+
+  async function openGeneratedCandidate() {
+    if (!generationRecord || !candidateOperation(generationRecord.operation) || busy || mutationPending
+      || generationRecord.client !== context.client || generationRecord.epoch !== context.epoch || generationRecord.releaseSignature !== context.releaseSignature) return
+    const token = ++generation.current
+    getController.current?.abort()
+    const controller = new AbortController(); getController.current = controller
+    setBusy(true); setReview(null); setSelected(null); setConfirmation(null); setConsent(false); setComment('')
+    setError(null); setCandidateReadFailed(false); setMessage(''); setReconciledKey(null)
+    try {
+      const items = await context.client.listVersions(context.releaseId, context.reviewerKey, controller.signal)
+      if (!current(token)) return
+      const operation = candidateOperation(generationRecord.operation)!
+      const candidate = items.find(item => item.identity.versionId === operation.result.contractVersionId)
+      if (!candidate || !candidateMatches(generationRecord, candidate)) throw new ContractRequestError(null,
+        { code: 'CONTRACT_RESPONSE_INVALID', retryable: false }, 'not_sent')
+      const loaded = await context.client.review(candidate.identity, context.reviewerKey, controller.signal)
+      if (!current(token)) return
+      if (!candidateMatches(generationRecord, loaded)) throw new ContractRequestError(null,
+        { code: 'CONTRACT_RESPONSE_INVALID', retryable: false }, 'not_sent')
+      setVersions(items); setSelected(loaded.identity); setReview(loaded); updateVersion(loaded)
+      if (operation.kind === 'PATCH' && operation.outcome === 'PROPOSED') bindPatch(loaded.identity, operation, context)
+    } catch (cause) {
+      if (current(token)) { setError(safeError(cause)); setCandidateReadFailed(true) }
+    } finally { if (current(token)) setBusy(false) }
+  }
 
   function updateVersion(version: ContractVersionSummary) {
     setVersions(items => items?.map(item => sameIdentity(item.identity, version.identity)
@@ -234,8 +401,9 @@ function ReviewSession({ context, records, perform }: {
   }
 
   function openConfirmation(action: 'approve' | 'reject') {
-    if (!review || !eligible(review, action) || record || busy || mutationPending || sending.current) return
-    setConsent(false); setConfirmation({ kind: 'new', action, snapshot: review })
+    if (!review || !eligible(review, action) || record || busy || mutationPending || sending.current
+      || (action === 'approve' && patchMismatch)) return
+    setConsent(false); setConfirmation({ kind: 'new', action, snapshot: review, patch: action === 'approve' ? patchFor(review) : undefined })
   }
 
   function confirm() {
@@ -245,13 +413,44 @@ function ReviewSession({ context, records, perform }: {
       return
     }
     if (record || !eligible(confirmation.snapshot, confirmation.action)) return
-    try { void send(prepareContractMutation(confirmation.action, confirmation.snapshot, comment)) }
+    if (confirmation.patch !== (confirmation.action === 'approve' ? patchFor(confirmation.snapshot) : undefined)) return
+    try { void send(confirmation.action === 'approve' && confirmation.patch
+      ? prepareContractMutation('approve', confirmation.snapshot, comment, confirmation.patch)
+      : prepareContractMutation(confirmation.action, confirmation.snapshot, comment)) }
     catch (cause) { setError(safeError(cause)); setConsent(false) }
   }
 
   const commentValid = comment.length > 0 && comment.length <= 1000 && comment === comment.trim()
 
   return <div className="stack">
+    <section aria-label="후보 생성 작업">
+      <Panel title="후보 생성 작업" description="생성 접수와 저장 후보 검토는 별도 단계입니다. 검증·승인 요청은 직접 확인한 뒤 전송합니다.">
+        <div className="button-row"><button className="secondary-button" disabled={busy || mutationPending || versions === null || generationBlocked(generationRecord)} onClick={event => { if (event.detail < 2) generate('CONTRACT') }}>초기 계약 후보 생성</button></div>
+        <label>패치 출처 Finding ID<input aria-label="패치 출처 Finding ID" value={findingId} onChange={event => setFindingId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
+        <p className="muted">패치 기준은 현재 선택해 조회한 계약입니다. Finding의 적격성과 최신 기준본은 서버가 확인합니다.</p>
+        <button className="secondary-button" disabled={!review || busy || mutationPending || Boolean(record) || !findingId || generationBlocked(generationRecord)} onClick={event => { if (event.detail < 2) generate('PATCH') }}>패치 후보 생성</button>
+        <ErrorBanner error={generationError ?? generationRecord?.error ?? null} />
+        {generationRecord?.phase === 'accepted' && generationRecord.operation && <>
+          <DataTable caption="후보 생성 상태" headings={['기록', '값']} rows={[
+            ['Operation ID', <code>{generationRecord.operation.operationId}</code>], ['종류', generationRecord.operation.kind],
+            ['상태', generationRecord.operation.status], ['판단 결과', generationRecord.operation.outcome ?? '없음'],
+            ['생성 시각', generationRecord.operation.createdAt], ['시작 시각', generationRecord.operation.startedAt ?? '기록 없음'],
+            ['종료 시각', generationRecord.operation.finishedAt ?? '기록 없음'],
+            ['오류 코드', generationRecord.operation.errorCode ?? '없음'], ['오류 단계', generationRecord.operation.errorStage ?? '없음'],
+          ]} />
+          {generationRecord.operation.status === 'SUCCEEDED' && <ul aria-label="생성 판단 코드">{generationRecord.operation.result.issues.map((issue, index) => <li key={index}><code>{issue.code}</code></li>)}</ul>}
+          {generationRecord.readError && <Notice title="생성 상태 조회 실패" tone="amber">마지막 정상 상태를 유지합니다. 조회 실패는 작업 실패가 아닙니다.<ErrorBanner error={generationRecord.readError} /></Notice>}
+          {generationRecord.operation.status === 'RECOVERY_REQUIRED' && <Notice title="생성 작업 운영 복구 필요" tone="amber">외부 실행 여부가 불확실합니다. 새 생성 요청을 보내지 말고 운영 확인을 진행해 주세요.</Notice>}
+          {generationRecord.operation.status === 'SUCCEEDED' && !candidateOperation(generationRecord.operation) && <Notice title="생성 판단 완료 · 저장 후보 없음">이 결과에서 검토하거나 승인할 새 후보는 없습니다.</Notice>}
+          <div className="button-row">
+            <button className="secondary-button" disabled={generationReading} onClick={() => pollGeneration(context)}>생성 상태 다시 조회</button>
+            {candidateOperation(generationRecord.operation) && <button className="secondary-button" disabled={busy || mutationPending || generationRecord.client !== context.client || generationRecord.epoch !== context.epoch || generationRecord.releaseSignature !== context.releaseSignature} onClick={() => void openGeneratedCandidate()}>생성된 후보 검토</button>}
+          </div>
+          {generationReading && <p role="status">생성 상태를 조회하는 중</p>}
+        </>}
+        {candidateReadFailed && <Notice title="생성 완료 · 저장 후보 조회 실패" tone="amber">생성 요청을 다시 보내지 말고 저장 후보를 다시 조회해 주세요.</Notice>}
+      </Panel>
+    </section>
     <ErrorBanner error={error} />
     {error && <p className="muted"><code>{error.code}</code>{error.status !== null && ` · HTTP ${error.status}`}{error.traceId && <> · 요청 추적 <code>{error.traceId}</code></>}</p>}
     {message && <div className="success-banner" role="status">{message}</div>}
@@ -282,11 +481,12 @@ function ReviewSession({ context, records, perform }: {
     </Notice>}
     {selected && busy && <LoadingBlock label={record?.phase === 'pending' ? '계약 변경 응답을 기다리는 중' : '저장 계약을 불러오는 중'} />}
     {review && <>
+      {patchMismatch && <Notice title="저장 후보와 패치 제안의 연결을 확인할 수 없습니다." tone="amber">정책 식별자와 hash를 다시 확인해 주세요. 이 연결로 승인 요청을 보내지 않습니다.</Notice>}
       <PolicyReviewDetails review={review} />
       {(review.state === 'CANDIDATE' || review.state === 'VALIDATED') && <Panel title="검토 작업" description="승인 가능 여부와 현재 릴리스 조건은 서버가 최종 확인합니다.">
         <div className="button-row">
           {review.state === 'CANDIDATE' && <button className="secondary-button" disabled={busy || mutationPending || Boolean(record)} onClick={validate}>계약 검증</button>}
-          {review.state === 'VALIDATED' && <button className="primary-button" disabled={busy || mutationPending || Boolean(record) || !eligible(review, 'approve')} onClick={() => openConfirmation('approve')}>승인 검토</button>}
+          {review.state === 'VALIDATED' && <button className="primary-button" disabled={busy || mutationPending || Boolean(record) || patchMismatch || !eligible(review, 'approve')} onClick={() => openConfirmation('approve')}>승인 검토</button>}
           <button className="secondary-button" disabled={busy || mutationPending || Boolean(record)} onClick={() => openConfirmation('reject')}>거절 검토</button>
         </div>
       </Panel>}
@@ -298,6 +498,7 @@ function ReviewSession({ context, records, perform }: {
         ['기준 Policy hash', confirmation.snapshot.baseline ? <code>{confirmation.snapshot.baseline.policyHash}</code> : '기록된 승인 기준본 없음'],
         ['결과 Policy hash', <code>{confirmation.snapshot.policyHash}</code>],
         ['Resource hash · 변경 요청 기준', <code>{confirmation.snapshot.resourceHash}</code>],
+        ...(confirmation.kind === 'new' && confirmation.patch ? [['Patch Proposal ID', <code>{confirmation.patch.result.patchProposalId}</code>]] : []),
       ]} />
       {confirmation.kind === 'new' ? <label className="section-gap">검토 의견<textarea aria-label="검토 의견" value={comment} maxLength={1000} rows={4} onChange={event => { setComment(event.target.value); setConsent(false) }} /></label>
         : <><p>이전 요청과 같은 식별자·내용으로 다시 전송합니다. 아직 처리되지 않았다면 이 요청으로 실행될 수 있습니다.</p><pre className="code-block" aria-label="이전 요청 본문" style={{ whiteSpace: 'pre-wrap' }}>{confirmation.operation.body}</pre></>}
