@@ -273,7 +273,7 @@ describe('Role A feature consoles', () => {
         expect(screen.getByLabelText('Test Run ID')).toHaveValue('run-1')
       })
       await user.click(await screen.findByRole('button', { name: 'Run 조회' }))
-      const stream = MockEventSource.instances[0]
+      const stream = MockEventSource.instances[0]!
       expect(stream.url).toContain('/api/v1/test-runs/run-1/events')
 
       stream.onopen?.call(stream as unknown as EventSource, new Event('open'))

@@ -248,7 +248,7 @@ export interface MetricsView {
 }
 
 export interface ReplayComparison {
-  baselineRunId: string
+  baselineRunId: string | null
   replayRunId: string
   category?: string | null
   comparable: boolean

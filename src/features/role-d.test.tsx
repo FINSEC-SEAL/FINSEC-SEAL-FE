@@ -89,13 +89,14 @@ describe('Role D console', () => {
       },
       replaySummary: {
         totalCount: 1, comparableCount: 0, nonComparableCount: 1, evidenceComplete: false,
-        items: [{ baselineRunId: 'baseline-run', replayRunId: 'replay-run', category: 'FA-04', comparable: false, mismatchReasons: ['POLICY_VERSION_MISMATCH'] }],
+        items: [{ baselineRunId: null, replayRunId: 'replay-run', category: 'FA-04', comparable: false, mismatchReasons: ['REPLAY_LINK_MISSING'] }],
       },
     })
     render(<AssurancePage releases={[release]} actorId="role-d-console" />)
 
     expect(await screen.findByText('NON-COMPARABLE')).toBeInTheDocument()
-    expect(screen.getByText('POLICY VERSION MISMATCH')).toBeInTheDocument()
+    expect(screen.getByText('REPLAY LINK MISSING')).toBeInTheDocument()
+    expect(screen.getByText(/NO BASELINE/)).toBeInTheDocument()
     expect(screen.getByText('Review required')).toBeInTheDocument()
   })
 
