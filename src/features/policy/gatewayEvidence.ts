@@ -1,5 +1,39 @@
 import type { TestRun } from '../../api/contracts'
 
+export const gatewayStages = Object.freeze(['PREFLIGHT', 'TOOL', 'OPERATION', 'BUSINESS_CONTEXT',
+  'OBJECT_SCOPE', 'FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'WORKFLOW', 'HUMAN_BOUNDARY', 'TOOL_TRUST'] as const)
+export type GatewayStage = typeof gatewayStages[number]
+export interface BaselineStageOutcome {
+  readonly stage: GatewayStage
+  readonly enforcement: 'ENFORCED' | 'OBSERVED'
+  readonly outcomeType: 'PASS' | 'DENY' | 'ERROR' | 'SKIPPED'
+  readonly reasonCode: string | null
+}
+export interface ObservedFailure { readonly stage: GatewayStage; readonly reasonCode: string }
+export type GatewayStageDetails =
+  | { readonly status: 'absent' }
+  | { readonly status: 'unreadable' }
+  | { readonly status: 'valid'; readonly mode: 'ENFORCE'; readonly evaluatedStages: readonly GatewayStage[];
+      readonly failedStage: GatewayStage | null }
+  | { readonly status: 'valid'; readonly mode: 'BASELINE'; readonly stageOutcomes: readonly BaselineStageOutcome[];
+      readonly failedStage: GatewayStage | null; readonly observedFailure: ObservedFailure | null }
+export interface CallRecordCounts { readonly policies: number; readonly requests: number; readonly responses: number }
+export interface CallEventRef {
+  readonly eventId: string
+  readonly eventType: 'TOOL_PROPOSED' | 'TOOL_REQUEST' | 'TOOL_RESPONSE'
+  readonly sequence: number
+  readonly occurredAt: string
+  readonly payloadDigest: string
+  readonly eventHash: string
+  readonly prevEventHash: string | null
+}
+export type GatewayCallDetails =
+  | { readonly status: 'absent' }
+  | { readonly status: 'unreadable'; readonly toolCallId: string | null }
+  | { readonly status: 'ambiguous'; readonly toolCallId: string; readonly counts: CallRecordCounts }
+  | { readonly status: 'valid'; readonly toolCallId: string; readonly proposal: CallEventRef;
+      readonly request: CallEventRef | null; readonly response: CallEventRef | null }
+
 export interface GatewayRunOption {
   readonly id: string
   readonly releaseId: string
@@ -21,6 +55,8 @@ export interface GatewayPolicyEvent {
   readonly payloadDigest: string
   readonly eventHash: string
   readonly prevEventHash: string | null
+  readonly stageDetails: GatewayStageDetails
+  readonly callDetails: GatewayCallDetails
 }
 
 export interface GatewayRunEvidence {
@@ -108,7 +144,87 @@ function readDecision(policy: Record<string, unknown>): GatewayPolicyEvent['deci
   }
   return 'UNKNOWN'
 }
-function readEvent(value: unknown, runId: string): GatewayPolicyEvent & { readonly eventType: string } {
+const observedStages = new Set<GatewayStage>(['OBJECT_SCOPE', 'FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'HUMAN_BOUNDARY'])
+const absentStages: GatewayStageDetails = Object.freeze({ status: 'absent' })
+const unreadableStages: GatewayStageDetails = Object.freeze({ status: 'unreadable' })
+function reason(value: unknown): value is string {
+  return typeof value === 'string' && value.length <= 100 && value.trim().length > 0
+}
+function readStages(policy: Record<string, unknown>, decision: GatewayPolicyEvent['decision']): GatewayStageDetails {
+  const has = (key: string) => Object.hasOwn(policy, key)
+  if (!['evaluationMode', 'evaluatedStages', 'stageOutcomes', 'failedStage', 'observedFailedStage',
+    'observedReasonCode'].some(has)) return absentStages
+  if (decision === 'UNKNOWN' || !has('evaluationMode') || !reason(policy.reasonCode)) return unreadableStages
+  if (has('failedCheck') && (!has('failedStage') || policy.failedCheck !== policy.failedStage)) return unreadableStages
+  if (policy.evaluationMode === 'ENFORCE') {
+    if (['stageOutcomes', 'observedFailedStage', 'observedReasonCode'].some(has)
+      || !has('evaluatedStages') || !Array.isArray(policy.evaluatedStages)) return unreadableStages
+    const stages = policy.evaluatedStages
+    if (stages.length === 0 || stages.length > gatewayStages.length
+      || stages.some((stage, index) => stage !== gatewayStages[index])) return unreadableStages
+    if (has('evaluatedChecks') && (!Array.isArray(policy.evaluatedChecks)
+      || policy.evaluatedChecks.length !== stages.length
+      || policy.evaluatedChecks.some((stage, index) => stage !== stages[index]))) return unreadableStages
+    const last = stages[stages.length - 1] as GatewayStage
+    if (decision === 'ALLOW') {
+      if (stages.length !== gatewayStages.length || has('failedStage') || policy.reasonCode !== 'ALLOW') return unreadableStages
+    } else if (!has('failedStage') || policy.failedStage !== last
+      || (decision === 'DENY' && last === 'PREFLIGHT')) return unreadableStages
+    return Object.freeze({ status: 'valid', mode: 'ENFORCE',
+      evaluatedStages: Object.freeze([...stages] as GatewayStage[]), failedStage: decision === 'ALLOW' ? null : last })
+  }
+  if (policy.evaluationMode !== 'BASELINE' || has('evaluatedStages') || has('evaluatedChecks')
+    || !has('stageOutcomes') || !Array.isArray(policy.stageOutcomes)
+    || policy.stageOutcomes.length === 0 || policy.stageOutcomes.length > gatewayStages.length) return unreadableStages
+  const outcomes: BaselineStageOutcome[] = []
+  let observedFailure: ObservedFailure | null = null
+  let terminal: BaselineStageOutcome | null = null
+  for (const [index, value] of policy.stageOutcomes.entries()) {
+    if (value === null || typeof value !== 'object' || Array.isArray(value)) return unreadableStages
+    const row = value as Record<string, unknown>
+    const stage = gatewayStages[index]!
+    const observed = observedStages.has(stage)
+    const enforcement = observed ? 'OBSERVED' : 'ENFORCED'
+    if (row.stage !== stage || row.enforcement !== enforcement) return unreadableStages
+    const skipped = observed && observedFailure !== null
+    if (skipped ? row.outcomeType !== 'SKIPPED' : typeof row.outcomeType !== 'string'
+      || !['PASS', 'DENY', 'ERROR'].includes(row.outcomeType)) return unreadableStages
+    const outcomeType = row.outcomeType as BaselineStageOutcome['outcomeType']
+    if ((outcomeType === 'PASS' || outcomeType === 'SKIPPED')
+      ? Object.hasOwn(row, 'reasonCode') : !reason(row.reasonCode)) return unreadableStages
+    const outcome = Object.freeze({ stage, enforcement, outcomeType,
+      reasonCode: outcomeType === 'PASS' || outcomeType === 'SKIPPED' ? null : row.reasonCode as string })
+    outcomes.push(outcome)
+    if (outcomeType === 'DENY' && observed) observedFailure = Object.freeze({ stage, reasonCode: outcome.reasonCode! })
+    else if (outcomeType === 'DENY' || outcomeType === 'ERROR') {
+      if (index !== policy.stageOutcomes.length - 1 || (stage === 'PREFLIGHT' && outcomeType === 'DENY')) return unreadableStages
+      terminal = outcome
+    }
+  }
+  if (observedFailure === null
+    ? has('observedFailedStage') || has('observedReasonCode')
+    : !has('observedFailedStage') || !has('observedReasonCode')
+      || policy.observedFailedStage !== observedFailure.stage || policy.observedReasonCode !== observedFailure.reasonCode) return unreadableStages
+  if (terminal === null) {
+    if (decision !== 'ALLOW' || outcomes.length !== gatewayStages.length || has('failedStage')
+      || policy.reasonCode !== 'BASELINE_ALLOW') return unreadableStages
+  } else if (decision !== terminal.outcomeType || !has('failedStage') || policy.failedStage !== terminal.stage
+    || policy.reasonCode !== terminal.reasonCode) return unreadableStages
+  return Object.freeze({ status: 'valid', mode: 'BASELINE', stageOutcomes: Object.freeze(outcomes),
+    failedStage: terminal?.stage ?? null, observedFailure })
+}
+
+type CallLink = { readonly status: 'absent' | 'unreadable' } | { readonly status: 'id'; readonly id: string }
+type StoredEvent = Omit<GatewayPolicyEvent, 'callDetails'> & { readonly eventType: string; readonly callLink: CallLink }
+function readCallLink(metadata: unknown): CallLink {
+  if (metadata === undefined || metadata === null) return { status: 'absent' }
+  if (typeof metadata !== 'object' || Array.isArray(metadata)) return { status: 'unreadable' }
+  if (!Object.hasOwn(metadata, 'toolCallId')) return { status: 'absent' }
+  const value = (metadata as Record<string, unknown>).toolCallId
+  return typeof value === 'string' && uuidPattern.test(value)
+    ? { status: 'id', id: value.toLowerCase() } : { status: 'unreadable' }
+}
+function readEvent(value: unknown, runId: string): StoredEvent {
   const row = object(value)
   if (row.schemaVersion !== '1.0' || uuid(row.runId) !== runId) fail()
   const occurredAt = string(row.occurredAt)
@@ -118,15 +234,52 @@ function readEvent(value: unknown, runId: string): GatewayPolicyEvent & { readon
   // Reason codes are recorded text, not a closed enum or an inferred security outcome.
   const nestedReason = typeof policy.reasonCode === 'string' && policy.reasonCode.length <= 100
     ? policy.reasonCode : null
+  const decision = readDecision(policy)
   return Object.freeze({
     eventType: string(row.eventType), eventId: uuid(row.eventId), traceId: uuid(row.traceId), runId,
     testCaseRunId: row.testCaseRunId === null ? null : uuid(row.testCaseRunId),
     sequence: integer(row.sequence), occurredAt, toolName: nullableLabel(row.toolName),
-    decision: readDecision(policy),
+    decision, stageDetails: readStages(policy, decision), callLink: readCallLink(row.metadata),
     reasonCode: nullableLabel(row.reasonCode), decisionReasonCode: nestedReason,
     payloadDigest: hash(row.payloadDigest), eventHash: hash(row.eventHash),
     prevEventHash: row.prevEventHash === null ? null : hash(row.prevEventHash),
   })
+}
+
+interface CallGroup {
+  context: StoredEvent
+  conflict: boolean
+  firstSequence: number
+  policies: number
+  requests: number
+  responses: number
+  policy?: StoredEvent
+  request?: StoredEvent
+  response?: StoredEvent
+}
+function sameCallContext(left: StoredEvent, right: StoredEvent): boolean {
+  return left.testCaseRunId !== null && left.toolName !== null && left.toolName.length > 0
+    && left.runId === right.runId && left.testCaseRunId === right.testCaseRunId
+    && left.traceId === right.traceId && left.toolName === right.toolName
+}
+function callRef(event: StoredEvent, eventType: CallEventRef['eventType']): CallEventRef {
+  return Object.freeze({ eventId: event.eventId, eventType, sequence: event.sequence, occurredAt: event.occurredAt,
+    payloadDigest: event.payloadDigest, eventHash: event.eventHash, prevEventHash: event.prevEventHash })
+}
+function resolveCall(id: string, group: CallGroup, proposal: StoredEvent | undefined): GatewayCallDetails {
+  const unreadable = (): GatewayCallDetails => Object.freeze({ status: 'unreadable', toolCallId: id })
+  if (!proposal || !sameCallContext(group.context, proposal) || group.conflict
+    || proposal.sequence >= group.firstSequence || (group.responses > 0 && group.requests === 0)) return unreadable()
+  const counts = Object.freeze({ policies: group.policies, requests: group.requests, responses: group.responses })
+  const ambiguous = (): GatewayCallDetails => Object.freeze({ status: 'ambiguous', toolCallId: id, counts })
+  if (group.policies > 1 || group.requests > 1 || group.responses > 1) return ambiguous()
+  if (group.response && group.request && group.response.sequence <= group.request.sequence) return unreadable()
+  if (!group.policy) return unreadable()
+  if ((group.request && group.request.sequence < group.policy.sequence)
+    || (group.response && group.response.sequence < group.policy.sequence)) return ambiguous()
+  return Object.freeze({ status: 'valid', toolCallId: id, proposal: callRef(proposal, 'TOOL_PROPOSED'),
+    request: group.request ? callRef(group.request, 'TOOL_REQUEST') : null,
+    response: group.response ? callRef(group.response, 'TOOL_RESPONSE') : null })
 }
 
 /** Read-only projection of stored evidence. It grants no execution or approval authority. */
@@ -176,7 +329,9 @@ export class GatewayEvidenceClient implements GatewayEvidenceApi {
     if (option.id !== id) fail()
     const run = Object.freeze({ ...option,
       contractVersionId: rawRun.contractVersionId === null ? null : uuid(rawRun.contractVersionId) })
-    const events: GatewayPolicyEvent[] = []
+    const policyEvents: StoredEvent[] = []
+    const proposals = new Map<string, StoredEvent>()
+    const groups = new Map<string, CallGroup>()
     const ids = new Set<string>()
     let after = 0
     let head: number | undefined
@@ -201,13 +356,30 @@ export class GatewayEvidenceClient implements GatewayEvidenceApi {
         ids.add(event.eventId)
         after = event.sequence
         previousHash = event.eventHash
-        if (event.eventType === 'POLICY_EVALUATED') {
-          const { eventType: _, ...projection } = event
-          events.push(Object.freeze(projection))
+        if (event.eventType === 'TOOL_PROPOSED') proposals.set(event.eventId, event)
+        if (event.eventType === 'POLICY_EVALUATED') policyEvents.push(event)
+        if (event.callLink.status === 'id'
+          && ['POLICY_EVALUATED', 'TOOL_REQUEST', 'TOOL_RESPONSE'].includes(event.eventType)) {
+          const group: CallGroup = groups.get(event.callLink.id) ?? { context: event, conflict: false,
+            firstSequence: event.sequence, policies: 0, requests: 0, responses: 0 }
+          group.conflict ||= !sameCallContext(group.context, event)
+          if (event.eventType === 'POLICY_EVALUATED') { group.policies++; group.policy ??= event }
+          if (event.eventType === 'TOOL_REQUEST') { group.requests++; group.request ??= event }
+          if (event.eventType === 'TOOL_RESPONSE') { group.responses++; group.response ??= event }
+          groups.set(event.callLink.id, group)
         }
       }
       if (after < head && (cursor === null || cursor !== after)) fail('INCOMPLETE_HISTORY')
     } while (after < head)
+    // Resolve each explicit call group once, after every captured page passed history checks.
+    const calls = new Map<string, GatewayCallDetails>()
+    for (const [callId, group] of groups) calls.set(callId, resolveCall(callId, group, proposals.get(callId)))
+    const events = policyEvents.map(({ eventType: _, callLink, ...projection }): GatewayPolicyEvent => {
+      const callDetails: GatewayCallDetails = callLink.status === 'id' ? calls.get(callLink.id)!
+        : callLink.status === 'absent' ? Object.freeze({ status: 'absent' })
+          : Object.freeze({ status: 'unreadable', toolCallId: null })
+      return Object.freeze({ ...projection, callDetails })
+    })
     checkAbort(signal)
     return Object.freeze({ run, headSequence: head, events: Object.freeze(events) })
   }

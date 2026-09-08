@@ -1,7 +1,7 @@
 # C Gateway 저장 판단 이력 연동
 
 LIVE `/#/live/gateway`는 저장된 정책 판단을 조회합니다. Release와 Run을 선택하고,
-CaseRun·Tool·판단 필터, 두 위치의 사유 코드, 이벤트 출처를 확인할 수 있습니다.
+CaseRun·Tool·판단 필터, 두 위치의 사유 코드, 평가 단계와 연결된 호출 출처를 확인할 수 있습니다.
 SIMULATED Gateway와 B의 LIVE Runs/Trace·실행·SSE 화면은 기존 경로를 유지합니다.
 
 ## C 진입점과 입출력
@@ -15,7 +15,8 @@ SIMULATED Gateway와 B의 LIVE Runs/Trace·실행·SSE 화면은 기존 경로�
   저장 Run의 ID·Release ID·mode·status를 반환합니다.
 - `loadRun(releaseId, runId, actorId, signal?)` → `Promise<GatewayRunEvidence>`.
   별도로 조회한 Run 정보와 `contractVersionId`, 최초 `headSequence`, 그 범위의
-  `GatewayPolicyEvent[]`를 반환합니다. 결과 객체와 배열은 동결된 별도 투영입니다.
+  `GatewayPolicyEvent[]`를 반환합니다. 각 이벤트의 `stageDetails`와 `callDetails`는 아래의
+  판독 상태를 갖습니다. 결과 객체·중첩 값·배열은 동결된 별도 투영입니다.
 - 실패는 `GatewayEvidenceError.code`로 전달합니다:
   `INVALID_REQUEST`, `INVALID_RESPONSE`, `INCOMPLETE_HISTORY`, `LIMIT_EXCEEDED`,
   `REQUEST_FAILED`, `REQUEST_ABORTED`. 부분 목록을 성공 결과로 반환하지 않습니다.
@@ -55,7 +56,9 @@ Tool 필터의 JSON 인코딩 값은 전체 선택·빈 문자열·`null`을 각
 필수 문자열과 UUID·hash·순서·페이지 완전성 검증은 그대로 유지합니다.
 
 전체 조회 범위를 검증하고 필터를 적용한 뒤 이벤트 카드와 접힌 상세 표를 페이지당 최대
-50개씩 생성합니다. 전체 일치 건수와 현재 표시 범위·페이지를 구분하며 이전·다음 페이지로
+50개씩 생성합니다. 단계는 카드당 최대 11행의 순서 목록, 호출 출처는 최대 3건의 설명 목록으로
+표시하여 기존 카드당 표 1개, Run 표를 포함한 총 51개 상한을 유지합니다.
+전체 일치 건수와 현재 표시 범위·페이지를 구분하며 이전·다음 페이지로
 이동할 수 있습니다. CaseRun·Tool·판단 필터를 바꾸면 첫 페이지로 돌아갑니다.
 페이지 이동과 필터링은 같은 조회 결과를 사용하므로 API 요청을 추가하지 않습니다.
 고유 Tool·CaseRun 선택지는 전체 조회 범위를 유지하므로 이 제한은 이벤트 카드·상세 표에
@@ -73,22 +76,59 @@ ERROR는 운영 오류로 별도 표시·필터링하고 DENY 필터에 포함�
 DENY·ERROR, 운영 오류 사유, 빈 이력, BASELINE/SEAL_REPLAY 모드 또는 `gateway: c`만으로
 ATTACK_BLOCKED·API 미호출·누출 없음·상태 변경 없음·격리 성공·차단율·controlled comparison을
 산출하지 않습니다. `successfulSecurityBlock` 값도 이 화면에서 방어 결과로 투영하지 않습니다.
-평가 단계와 호출 연결은 현재 화면의 투영·표시 범위에 포함하지 않습니다.
+
+## 단계와 호출 출처의 판독 계약
+
+`GatewayPolicyEvent.stageDetails`는 `absent`, `unreadable`, `valid` 상태입니다.
+primary 단계 필드가 없는 legacy는 `absent`이며, 불완전·모순·알 수 없는 단계 형식은
+`unreadable`입니다. 이 상세 판독 실패로 기존 전체 판단이나 두 사유를 덮어쓰지 않습니다.
+`valid`는 저장 형식을 판독했다는 뜻이며 정책 통과나 실제 집행의 증명이 아닙니다.
+
+- ENFORCE는 `evaluationMode`, `evaluatedStages`, 선택적 **`failedStage`**를 읽습니다.
+  PREFLIGHT부터 TOOL_TRUST까지 고정 11단계의 연속 prefix와 종료 위치를 확인합니다.
+  전체 ALLOW는 11단계를, DENY·ERROR는 마지막 평가 단계와 실패 위치의 일치를 요구합니다.
+  목록의 단계는 ‘평가됨’, 종료 단계는 기록된 DENY·ERROR, 그 이후만 ‘미평가’로 표시합니다.
+  OBJECT_SCOPE 거절 뒤 FIELD_SCOPE 미평가는 TC-GW-009의 FE 표시 부분에 해당합니다.
+  저장되지 않은 단계별 PASS나 사유를 만들지 않습니다.
+- BASELINE은 `stageOutcomes`의 ENFORCED·OBSERVED와 PASS·DENY·ERROR·SKIPPED를 읽습니다.
+  관측 DENY 뒤 OBSERVED 검사 생략과 계속 수행되는 ENFORCED 검사를 구분합니다.
+  `observedFailedStage`/`observedReasonCode`와 실제 `failedStage`가 함께 있는 경우도 유지합니다.
+  관측 위반만 있는 전체 ALLOW를 DENY로 바꾸지 않으며, SKIPPED를 PASS로 표시하지 않습니다.
+- optional 키의 부재와 명시적 null을 구분합니다. primary가 있는 경우 `failedCheck`와
+  `evaluatedChecks` alias는 primary와 일치해야 하며, alias만으로 상세를 보충하지 않습니다.
+  Run 모드로 `evaluationMode`를 추정하지 않습니다. reason enum에 의한 정책 재판정은 하지 않습니다.
+
+`GatewayPolicyEvent.callDetails`는 `absent`, `unreadable`, `ambiguous`, `valid` 상태입니다.
+같은 캡처 범위의 이력을 한 번 인덱싱하고, `metadata.toolCallId`가 지칭하는 실제
+TOOL_PROPOSED 이벤트 ID·유형과 Run·nonnull CaseRun·trace·nonnull/nonempty Tool을 대조합니다.
+동일 ID와 문맥의 TOOL_REQUEST/TOOL_RESPONSE만 최소 참조로 연결합니다. 각 참조는
+eventId·eventType·sequence·occurredAt·payloadDigest·eventHash·prevEventHash입니다.
+proposal 자체의 `metadata.toolCallId`는 필수가 아닙니다.
+
+같은 호출의 여러 policy/request/response 또는 과거 receipt와 현재 판단의 대응이 모호하면
+후보 하나를 고르지 않고 `ambiguous`의 `counts`만 반환합니다. 문맥 충돌은 `unreadable`이며,
+과거 요청이 현재 정책 판단보다 먼저 있다는 이유로 전체 이력을 실패시키지 않습니다.
+기록 건수는 실행 횟수가 아닙니다. `valid`의 request/response null은 캡처 범위에서 연결된
+기록이 없다는 뜻이며 실제 미호출·미전달을 뜻하지 않습니다. 원문 metadata·input·output과
+최종 전달/격리 상태는 투영하지 않습니다.
 
 ## 저장 계약과 남은 연동
 
 - C Gateway의 BE PR #53에는 `policyDecision.decisionType`, ENFORCE의 `evaluatedStages`와
   실패 단계, BASELINE의 `stageOutcomes`와 관찰 사유가 있습니다. `metadata.toolCallId`는
   대응 `TOOL_PROPOSED` 이벤트 ID를 가리키는 연결값입니다.
-  A의 이력 DTO는 `policyDecision`과 `metadata`를 제공합니다. 이 화면은 그중 판단과 두 사유만
-  투영하므로 단계별 집행이나 호출·응답 전달을 검증하는 상세 화면과 구분해야 합니다.
+  A의 이력 DTO는 `policyDecision`과 `metadata`를 제공합니다. 이 화면은 해당 저장 형식의
+  단계와 호출 출처를 읽습니다. 실제 호출·응답 전달의 운영 보장은 별도 검증이 필요합니다.
   PR #53은 기본 비활성이며 실제 인증·관측 공급자가 필요합니다. 저장 형식의 구현이 존재한다는
   사실만으로 모든 기존 이벤트에 새 필드가 있다고 가정하지 않습니다.
 - Replay: D의 BE PR #52는 저장된 `replay_links`의 비교 결과를 지표의 `replaySummary`와
   Decision snapshot·gate에서 소비합니다. 이 화면이 조회하는 Run과 정책 이력만으로는 같은
   case/trial·정상 control·두 정책의 비교 snapshot·실제 영향 비교를 완결할 수 없습니다.
-  전체 비교에는 A/B의 역사적 입력·대응 연결, 실제 C 비교 판정 및 대응 D 결과 연결이 필요합니다.
+  C의 저장 실행 비교 서비스(BE PR #56)는 추가됐지만 실제 `ReplayRecordedSource` 공급자는
+  별도입니다. 전체 비교에는 A/B의 역사적 입력·대응 연결과 비교 결과의 저장·D 소비 연결이 필요합니다.
 - 실제 관측·필드 분류·정상 Tool 연결과 FAILED Run의 저장 운영 오류 집계는 별도 연동 범위입니다.
+  TOOL_RESPONSE의 PENDING/deliveredToAgent=false는 최종 모델 전달 결과가 아니며,
+  저장되지 않은 `GatewayException.postCallCheck`를 이 화면에서 생성하지 않습니다.
   UI의 GET 요청·DOM 비노출 검사는 API 미호출, 모델 미전달, 상태 변화 없음이나 실제 지표 제외의
   실행 증거를 대신하지 않습니다.
 
@@ -108,3 +148,7 @@ ATTACK_BLOCKED·API 미호출·누출 없음·상태 변경 없음·격리 성�
 50·51·101건의 페이지 경계와 각 필터의 페이지 초기화를 회귀 검증합니다.
 브라우저의 101건 fixture에서는 카드·상세 표 50개 상한, 페이지별 출처와 캡처한 head,
 페이지 이동·필터링 중 추가 GET이 없음을 확인합니다.
+단계·호출 상세 추가 검증은 50·51·101건의 채워진 목록에서도 같은 표 상한을 유지하며,
+실제 client-to-page 합성 HTTP 사례로 페이지를 가로지르는 호출 연결과 단계 판독을 확인합니다.
+1440/390 브라우저에서는 ENFORCE 종료·BASELINE 관측/집행·legacy/손상 상세·호출 관계의
+누락/충돌/모호함, 51건 페이지 이동, native 키보드 조작과 원문 비노출을 확인합니다.

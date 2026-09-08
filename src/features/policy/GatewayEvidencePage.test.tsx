@@ -1,7 +1,7 @@
 import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import type { Release } from '../../api/contracts'
 import { GatewayEvidencePage } from './GatewayEvidencePage'
-import type { GatewayEvidenceApi, GatewayPolicyEvent, GatewayRunEvidence, GatewayRunOption } from './gatewayEvidence'
+import { GatewayEvidenceClient, gatewayStages, type BaselineStageOutcome, type CallEventRef, type GatewayEvidenceApi, type GatewayPolicyEvent, type GatewayRunEvidence, type GatewayRunOption, type GatewayStageDetails } from './gatewayEvidence'
 
 const releaseId = '019903ac-abcd-7000-8000-000000000001'
 const otherReleaseId = '019903ac-abcd-7000-8000-000000000002'
@@ -30,7 +30,8 @@ function event(sequence = 1, overrides: Partial<GatewayPolicyEvent> = {}): Gatew
     traceId: '019903ac-abcd-7000-8000-000000000090', runId, testCaseRunId: caseId,
     sequence, occurredAt: '2026-09-07T22:00:00Z', toolName: 'CUSTOMER_DATA_READ', decision: 'DENY',
     reasonCode: 'CUSTOMER_SCOPE_VIOLATION', decisionReasonCode: 'CUSTOMER_SCOPE_VIOLATION',
-    payloadDigest: hash, eventHash: hash, prevEventHash: hash, ...overrides }
+    payloadDigest: hash, eventHash: hash, prevEventHash: hash,
+    stageDetails: { status: 'absent' }, callDetails: { status: 'absent' }, ...overrides }
 }
 
 function evidence(overrides: Partial<GatewayRunEvidence> = {}): GatewayRunEvidence {
@@ -64,6 +65,37 @@ async function selectRun(id = runId) {
 
 function filter(label: string, value: string) {
   fireEvent.change(screen.getByLabelText(label), { target: { value } })
+}
+
+function enforce(failedStage: 'OBJECT_SCOPE' | 'PREFLIGHT' | null): GatewayStageDetails {
+  return { status: 'valid', mode: 'ENFORCE', failedStage,
+    evaluatedStages: failedStage === null ? gatewayStages : gatewayStages.slice(0, failedStage === 'PREFLIGHT' ? 1 : 5) }
+}
+
+function baseline(terminal = false): GatewayStageDetails {
+  const observed = new Set(['OBJECT_SCOPE', 'FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'HUMAN_BOUNDARY'])
+  const stageOutcomes: BaselineStageOutcome[] = gatewayStages.slice(0, terminal ? 9 : 11).map(stage => ({
+    stage, enforcement: observed.has(stage) ? 'OBSERVED' : 'ENFORCED',
+    outcomeType: stage === 'OBJECT_SCOPE' || (terminal && stage === 'WORKFLOW') ? 'DENY'
+      : observed.has(stage) ? 'SKIPPED' : 'PASS',
+    reasonCode: stage === 'OBJECT_SCOPE' ? 'CUSTOMER_SCOPE_VIOLATION'
+      : terminal && stage === 'WORKFLOW' ? 'INVALID_WORKFLOW_STAGE' : null,
+  }))
+  return { status: 'valid', mode: 'BASELINE', stageOutcomes,
+    failedStage: terminal ? 'WORKFLOW' : null,
+    observedFailure: { stage: 'OBJECT_SCOPE', reasonCode: 'CUSTOMER_SCOPE_VIOLATION' } }
+}
+
+function callRef(eventType: CallEventRef['eventType'], sequence: number): CallEventRef {
+  return { eventType, eventId: `019903ac-abcd-7000-8000-${String(900 + sequence).padStart(12, '0')}`,
+    sequence, occurredAt: '2026-09-07T22:00:00Z', payloadDigest: hash, eventHash: hash, prevEventHash: hash }
+}
+
+function populatedEvent(sequence: number): GatewayPolicyEvent {
+  const proposal = callRef('TOOL_PROPOSED', sequence - 1)
+  return event(sequence, { stageDetails: enforce(null), decision: 'ALLOW', reasonCode: 'ALLOW', decisionReasonCode: 'ALLOW',
+    callDetails: { status: 'valid', toolCallId: proposal.eventId, proposal,
+      request: callRef('TOOL_REQUEST', sequence + 1), response: callRef('TOOL_RESPONSE', sequence + 2) } })
 }
 
 async function settle(work: () => void) { await act(async () => { work(); await Promise.resolve() }) }
@@ -622,5 +654,205 @@ describe('Gateway stored policy evidence page', () => {
     expect(errorLog).not.toHaveBeenCalled()
     expect(warningLog).not.toHaveBeenCalled()
     expect(storage).not.toHaveBeenCalled()
+  })
+})
+
+describe('Gateway stage and call details', () => {
+  async function show(records: GatewayPolicyEvent[]) {
+    const api = client()
+    api.loadRun.mockResolvedValue(evidence({ events: records }))
+    const view = page(api)
+    await selectRun()
+    await screen.findByText(`정책 판단 ${records.length}건 중 ${records.length}건 표시`)
+    for (const summary of view.container.querySelectorAll('summary')) fireEvent.click(summary)
+    return view
+  }
+
+  function stages(sequence: number) {
+    return within(screen.getByRole('region', { name: `정책 이벤트 ${sequence} 평가 단계` }))
+  }
+
+  function stageRow(sequence: number, name: string) {
+    return stages(sequence).getByText(name, { exact: true, selector: 'li strong' }).closest('li')!
+  }
+
+  it('shows OBJECT_SCOPE as primary and FIELD_SCOPE not evaluated without inventing per-stage PASS', async () => {
+    await show([event(2, { stageDetails: enforce('OBJECT_SCOPE') })])
+    expect(stages(2).getAllByRole('listitem')).toHaveLength(11)
+    expect(stageRow(2, 'PREFLIGHT')).toHaveTextContent('평가됨')
+    expect(stageRow(2, 'OBJECT_SCOPE')).toHaveTextContent('기록된 DENY')
+    expect(stageRow(2, 'OBJECT_SCOPE')).toHaveTextContent('CUSTOMER_SCOPE_VIOLATION')
+    for (const name of ['FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'WORKFLOW', 'HUMAN_BOUNDARY', 'TOOL_TRUST']) {
+      expect(stageRow(2, name)).toHaveTextContent('미평가')
+      expect(stageRow(2, name)).not.toHaveTextContent('FIELD_SCOPE_VIOLATION')
+    }
+    expect(stages(2).queryByText('PASS', { exact: true })).not.toBeInTheDocument()
+    expect(stages(2).getByText('ENFORCE')).toBeVisible()
+    expect(screen.getByRole('table', { name: '조회한 Run 기록' })).toHaveTextContent('BASELINE')
+  })
+
+  it('distinguishes a full evaluated ALLOW from terminal operational ERROR', async () => {
+    await show([populatedEvent(2), event(8, { decision: 'ERROR', reasonCode: 'INVALID_REQUEST_SCHEMA',
+      decisionReasonCode: 'INVALID_REQUEST_SCHEMA', stageDetails: enforce('PREFLIGHT') })])
+    expect(stages(2).getAllByText('평가됨')).toHaveLength(11)
+    expect(stages(2).queryByText('미평가', { exact: true })).not.toBeInTheDocument()
+    expect(stageRow(8, 'PREFLIGHT')).toHaveTextContent('기록된 ERROR')
+    expect(stageRow(8, 'PREFLIGHT')).toHaveTextContent('INVALID_REQUEST_SCHEMA')
+    expect(stageRow(8, 'TOOL')).toHaveTextContent('미평가')
+    expect(screen.getByText('ERROR · 운영 오류', { exact: true, selector: 'summary span' })).toBeVisible()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('keeps observed DENY and SKIPPED distinct from enforced PASS and a later enforced DENY', async () => {
+    await show([event(2, { decision: 'ALLOW', reasonCode: 'BASELINE_ALLOW', decisionReasonCode: 'BASELINE_ALLOW', stageDetails: baseline() }),
+      event(8, { reasonCode: 'INVALID_WORKFLOW_STAGE', decisionReasonCode: 'INVALID_WORKFLOW_STAGE', stageDetails: baseline(true) })])
+    expect(screen.getByText('기록된 ALLOW', { exact: true })).toBeVisible()
+    expect(stageRow(2, 'OBJECT_SCOPE')).toHaveTextContent('OBSERVED')
+    expect(stageRow(2, 'OBJECT_SCOPE')).toHaveTextContent('DENY · 관측 위반')
+    for (const name of ['FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'HUMAN_BOUNDARY']) {
+      expect(stageRow(2, name)).toHaveTextContent('SKIPPED · 관측 검사 생략')
+      expect(stageRow(2, name)).not.toHaveTextContent('PASS')
+    }
+    expect(stageRow(2, 'WORKFLOW')).toHaveTextContent('ENFORCED')
+    expect(stageRow(2, 'WORKFLOW')).toHaveTextContent('PASS')
+    expect(stageRow(8, 'WORKFLOW')).toHaveTextContent('ENFORCED')
+    expect(stageRow(8, 'WORKFLOW')).toHaveTextContent('DENY · 집행 거절')
+    expect(stageRow(8, 'WORKFLOW')).toHaveTextContent('INVALID_WORKFLOW_STAGE')
+    expect(stageRow(8, 'HUMAN_BOUNDARY')).toHaveTextContent('미평가')
+    expect(stages(8).getByText('관측 위반 기록')).toBeVisible()
+    expect(stageRow(8, 'OBJECT_SCOPE')).toHaveTextContent('CUSTOMER_SCOPE_VIOLATION')
+  })
+
+  it('does not invent stage rows for absent or unreadable details or replace raw reason distinctions', async () => {
+    await show([event(1, { reasonCode: '', decisionReasonCode: null }), event(2, { decision: 'ALLOW',
+      reasonCode: 'TOP_REASON', decisionReasonCode: 'NESTED_REASON', stageDetails: { status: 'unreadable' } })])
+    expect(stages(1).getByText('단계 상세 기록 없음')).toBeVisible()
+    expect(stages(2).getByText('단계 상세 판독 불가')).toBeVisible()
+    expect(stages(1).queryAllByRole('listitem')).toHaveLength(0)
+    expect(stages(2).queryAllByRole('listitem')).toHaveLength(0)
+    const first = screen.getByRole('table', { name: '정책 이벤트 1 기록' })
+    expect(first).toHaveTextContent('빈 문자열')
+    expect(first).toHaveTextContent('없음 또는 문자열이 아님')
+    const second = screen.getByRole('table', { name: '정책 이벤트 2 기록' })
+    expect(second).toHaveTextContent('TOP_REASON')
+    expect(second).toHaveTextContent('NESTED_REASON')
+    expect(screen.getByText('기록된 ALLOW', { exact: true })).toBeVisible()
+  })
+
+  it('shows recorded BASELINE all-PASS and terminal ERROR without labelling the error as an observed denial', async () => {
+    const detail = baseline()
+    if (detail.status !== 'valid' || detail.mode !== 'BASELINE') throw new Error('Invalid test fixture')
+    await show([event(2, { decision: 'ALLOW', reasonCode: 'BASELINE_ALLOW', decisionReasonCode: 'BASELINE_ALLOW',
+      stageDetails: { ...detail, observedFailure: null,
+        stageOutcomes: detail.stageOutcomes.map(row => ({ ...row, outcomeType: 'PASS', reasonCode: null })) } }),
+    event(5, { decision: 'ERROR', reasonCode: 'INVALID_REQUEST_SCHEMA', decisionReasonCode: 'INVALID_REQUEST_SCHEMA',
+      stageDetails: { status: 'valid', mode: 'BASELINE', failedStage: 'PREFLIGHT', observedFailure: null,
+        stageOutcomes: [{ stage: 'PREFLIGHT', enforcement: 'ENFORCED', outcomeType: 'ERROR', reasonCode: 'INVALID_REQUEST_SCHEMA' }] } })])
+    expect(stages(2).getAllByText('PASS', { exact: true })).toHaveLength(11)
+    expect(stageRow(5, 'PREFLIGHT')).toHaveTextContent('ERROR · 운영 오류')
+    expect(stageRow(5, 'PREFLIGHT')).toHaveTextContent('INVALID_REQUEST_SCHEMA')
+    expect(stageRow(5, 'TOOL')).toHaveTextContent('미평가')
+    expect(stages(5).queryByText('관측 위반 기록')).not.toBeInTheDocument()
+    expect(stageRow(5, 'PREFLIGHT')).not.toHaveTextContent('DENY')
+  })
+
+  it('renders at most three call references and makes missing or ambiguous relationships explicit', async () => {
+    const linked = populatedEvent(2)
+    const proposal = callRef('TOOL_PROPOSED', 4)
+    const { container } = await show([linked,
+      event(5, { callDetails: { status: 'valid', toolCallId: proposal.eventId, proposal, request: null, response: null } }),
+      event(9), event(10, { callDetails: { status: 'unreadable', toolCallId: null } }),
+      event(11, { callDetails: { status: 'ambiguous', toolCallId: proposal.eventId, counts: { policies: 2, requests: 3, responses: 1 } } })])
+    const calls = (sequence: number) => within(screen.getByRole('region', { name: `정책 이벤트 ${sequence} 호출 출처` }))
+    expect(calls(2).getAllByRole('definition')).toHaveLength(3)
+    for (const type of ['TOOL_PROPOSED', 'TOOL_REQUEST', 'TOOL_RESPONSE']) expect(calls(2).getByText(type, { exact: true })).toBeVisible()
+    expect(calls(5).getAllByRole('definition')).toHaveLength(1)
+    expect(calls(5).getByText('캡처 범위에서 연결된 TOOL_REQUEST 기록 없음')).toBeVisible()
+    expect(calls(5).getByText('캡처 범위에서 연결된 TOOL_RESPONSE 기록 없음')).toBeVisible()
+    expect(calls(9).getByText('호출 출처 기록 없음')).toBeVisible()
+    expect(calls(10).getByText('호출 출처 확인 불가')).toBeVisible()
+    expect(calls(11).getByText('호출 출처 연결 모호함')).toBeVisible()
+    expect(calls(11).getByText('동일 ID의 기록: 정책 2건 · 요청 3건 · 응답 1건')).toBeVisible()
+    for (const sequence of [9, 10, 11]) expect(calls(sequence).queryAllByRole('definition')).toHaveLength(0)
+    expect(container.innerHTML).not.toMatch(/ATTACK_BLOCKED|NORMAL_SUCCESS|no-call|no-leak|no-state-delta|격리 성공/)
+  })
+
+  it.each([50, 51, 101])('retains one table per card and bounded populated detail lists across %i records', async count => {
+    const api = client()
+    const records = Array.from({ length: count }, (_, i) => populatedEvent(2 + i * 4))
+    api.loadRun.mockResolvedValue(evidence({ events: records, headSequence: count * 4 }))
+    const { container } = page(api)
+    await selectRun()
+    await screen.findByText(`캡처한 이력 범위 · head ${count * 4}`)
+    function check(size: number, start: number) {
+      const cards = container.querySelectorAll('.event-list details')
+      expect(cards).toHaveLength(size)
+      expect(container.querySelectorAll('table')).toHaveLength(size + 1)
+      for (const card of cards) {
+        expect(card.querySelectorAll('table')).toHaveLength(1)
+        expect(card.querySelectorAll('li')).toHaveLength(11)
+        expect(card.querySelectorAll('dd')).toHaveLength(3)
+      }
+      expect(cards[0]).toHaveTextContent(records[start]!.eventId)
+      expect(cards[size - 1]).toHaveTextContent(records[start + size - 1]!.eventId)
+    }
+    check(50, 0)
+    for (let start = 50; start < count; start += 50) {
+      fireEvent.click(screen.getByRole('button', { name: '다음 정책 판단 페이지' }))
+      check(Math.min(50, count - start), start)
+    }
+    expect(api.loadRun).toHaveBeenCalledTimes(1)
+    filter('판단 필터', 'ALLOW')
+    check(50, 0)
+    expect(api.loadRun).toHaveBeenCalledTimes(1)
+  })
+
+  it('projects real client HTTP history into stage and cross-page call details while discarding hostile unused fields', async () => {
+    const id = (n: number) => `019903ac-abcd-7000-8000-${String(800 + n).padStart(12, '0')}`
+    const digest = (n: number) => `sha256:${String(n).padStart(64, '0')}`
+    const prefix = ['PREFLIGHT', 'TOOL', 'OPERATION', 'BUSINESS_CONTEXT', 'OBJECT_SCOPE']
+    const rawEvent = (sequence: number, eventType: string, policyDecision: unknown = null) => ({
+      schemaVersion: '1.0', eventId: id(sequence), traceId: id(30), runId, testCaseRunId: caseId,
+      sequence, occurredAt: '2026-09-08T01:02:03Z', eventType, toolName: 'CUSTOMER_DATA_READ',
+      reasonCode: null, policyDecision, input: { private: canary }, output: { private: canary },
+      metadata: eventType === 'TOOL_PROPOSED' ? { private: canary } : { toolCallId: id(1), private: canary,
+        deliveryState: 'PENDING', deliveredToAgent: false, successfulSecurityBlock: true },
+      payloadDigest: digest(100 + sequence), eventHash: digest(sequence), prevEventHash: sequence === 1 ? null : digest(sequence - 1),
+    })
+    const events = [rawEvent(1, 'TOOL_PROPOSED'), rawEvent(2, 'POLICY_EVALUATED', {
+      decisionType: 'ALLOW', allowed: true, reasonCode: 'ALLOW', evaluationMode: 'ENFORCE', evaluatedStages: [...gatewayStages], unused: canary }),
+    rawEvent(3, 'TOOL_REQUEST'), rawEvent(4, 'TOOL_RESPONSE'),
+    { ...rawEvent(5, 'POLICY_EVALUATED', { decisionType: 'DENY', allowed: false, reasonCode: 'CUSTOMER_SCOPE_VIOLATION',
+      evaluationMode: 'ENFORCE', evaluatedStages: prefix, failedStage: 'OBJECT_SCOPE' }), metadata: { private: canary } },
+    { ...rawEvent(6, 'POLICY_EVALUATED', { decisionType: 'ERROR', allowed: false, reasonCode: 'INVALID_REQUEST_SCHEMA',
+      evaluationMode: 'ENFORCE', evaluatedStages: [canary], failedStage: canary }), metadata: { private: canary } }]
+    const response = (data: unknown) => new Response(JSON.stringify({ data }))
+    const fetch = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response({ items: [run()], nextCursor: null }))
+      .mockResolvedValueOnce(response({ ...run(), contractVersionId: versionId }))
+      .mockResolvedValueOnce(response({ items: events.slice(0, 2), headSequence: 6, nextCursor: 2 }))
+      .mockResolvedValueOnce(response({ items: events.slice(2), headSequence: 6, nextCursor: null }))
+    const { container } = render(<GatewayEvidencePage releases={[release()]} actorId={actorId} preferredReleaseId={releaseId}
+      client={new GatewayEvidenceClient('http://localhost:8080')} />)
+    await selectRun()
+    await screen.findByText('정책 판단 3건 중 3건 표시')
+    for (const summary of container.querySelectorAll('summary')) fireEvent.click(summary)
+    expect(stageRow(5, 'OBJECT_SCOPE')).toHaveTextContent('CUSTOMER_SCOPE_VIOLATION')
+    expect(stageRow(5, 'FIELD_SCOPE')).toHaveTextContent('미평가')
+    expect(stages(6).getByText('단계 상세 판독 불가')).toBeVisible()
+    expect(screen.getByText('ERROR · 운영 오류', { exact: true, selector: 'summary span' })).toBeVisible()
+    const calls = within(screen.getByRole('region', { name: '정책 이벤트 2 호출 출처' }))
+    expect(calls.getAllByRole('definition')).toHaveLength(3)
+    for (const sequence of [1, 3, 4]) expect(calls.getAllByText(id(sequence), { exact: true }).length).toBeGreaterThan(0)
+    expect(container.innerHTML).not.toMatch(new RegExp(`${canary}|deliveryState|deliveredToAgent|successfulSecurityBlock|ATTACK_BLOCKED`))
+    expect(fetch).toHaveBeenCalledTimes(4)
+    filter('판단 필터', 'ERROR')
+    expect(screen.getByText('정책 판단 3건 중 1건 표시')).toBeVisible()
+    expect(fetch).toHaveBeenCalledTimes(4)
+    for (const [, init] of fetch.mock.calls) {
+      expect(init?.method).toBe('GET')
+      expect(init?.body).toBeUndefined()
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe(actorId)
+    }
   })
 })

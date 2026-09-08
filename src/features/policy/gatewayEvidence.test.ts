@@ -1,4 +1,5 @@
-import { GatewayEvidenceClient, GatewayEvidenceError } from './gatewayEvidence'
+import { GatewayEvidenceClient, GatewayEvidenceError, gatewayStages } from './gatewayEvidence'
+import type { GatewayStage } from './gatewayEvidence'
 
 const id = (n: number) => `00000000-0000-4000-8000-${String(n).padStart(12, '0')}`
 const digest = (n: number) => `sha256:${String(n).padStart(64, '0')}`
@@ -21,6 +22,40 @@ const event = (sequence: number, extra: Record<string, unknown> = {}) => ({
 const envelope = (data: unknown) => new Response(JSON.stringify({ data, traceId: id(601), timestamp: '2026-09-08T00:00:00Z' }))
 const history = (items: unknown[], headSequence = items.length, nextCursor: number | null = null) => ({ items, headSequence, nextCursor })
 const client = () => new GatewayEvidenceClient('http://localhost:8080')
+const storedStages: GatewayStage[] = ['PREFLIGHT', 'TOOL', 'OPERATION', 'BUSINESS_CONTEXT', 'OBJECT_SCOPE',
+  'FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'WORKFLOW', 'HUMAN_BOUNDARY', 'TOOL_TRUST']
+const observed = new Set<GatewayStage>(['OBJECT_SCOPE', 'FIELD_SCOPE', 'CARDINALITY', 'EGRESS', 'HUMAN_BOUNDARY'])
+function enforce(extra: Record<string, unknown> = {}): Record<string, unknown> {
+  return { evaluationMode: 'ENFORCE', decisionType: 'ALLOW', allowed: true, reasonCode: 'ALLOW',
+    evaluatedStages: [...storedStages], ...extra }
+}
+function baseline(observedStage?: GatewayStage, terminal?: GatewayStage,
+  terminalType: 'DENY' | 'ERROR' = 'ERROR'): Record<string, unknown> {
+  let skipped = false
+  const rows = storedStages.slice(0, terminal ? storedStages.indexOf(terminal) + 1 : undefined).map(stage => {
+    const enforcement = observed.has(stage) ? 'OBSERVED' : 'ENFORCED'
+    if (stage === terminal) return { stage, enforcement, outcomeType: terminalType, reasonCode: 'stored terminal reason' }
+    if (stage === observedStage) { skipped = true; return { stage, enforcement, outcomeType: 'DENY', reasonCode: 'observed reason' } }
+    return { stage, enforcement, outcomeType: skipped && observed.has(stage) ? 'SKIPPED' : 'PASS' }
+  })
+  return { evaluationMode: 'BASELINE', decisionType: terminal ? terminalType : 'ALLOW', allowed: !terminal,
+    reasonCode: terminal ? 'stored terminal reason' : 'BASELINE_ALLOW', stageOutcomes: rows,
+    ...(terminal ? { failedStage: terminal, failedCheck: terminal } : {}),
+    ...(observedStage ? { observedFailedStage: observedStage, observedReasonCode: 'observed reason' } : {}) }
+}
+async function policyProjection(policyDecision: unknown) {
+  responses(run(), history([event(1, { policyDecision, reasonCode: '' })]))
+  return (await client().loadRun(releaseId, runId, actor)).events[0]!
+}
+function linked(sequence: number, eventType: string, extra: Record<string, unknown> = {}):
+  Record<string, unknown> & { occurredAt: string; eventHash: string } {
+  return event(sequence, { eventType, policyDecision: enforce(),
+    metadata: { toolCallId: id(1001), input: canary, deliveryState: canary, successfulSecurityBlock: true }, ...extra })
+}
+function callHistory() {
+  return [linked(1, 'TOOL_PROPOSED', { metadata: null }), linked(2, 'POLICY_EVALUATED'),
+    linked(3, 'TOOL_REQUEST'), linked(4, 'TOOL_RESPONSE')]
+}
 function responses(...data: unknown[]) {
   const mock = vi.spyOn(globalThis, 'fetch')
   for (const page of data) mock.mockResolvedValueOnce(envelope(page))
@@ -265,7 +300,7 @@ describe('Gateway stored-evidence client', () => {
     expect(JSON.stringify(result)).not.toMatch(/successfulSecurityBlock|metadata|gateway/)
   })
 
-  it('projects ERROR as immutable source-linked evidence without raw payloads, stages, calls or block credit', async () => {
+  it('projects ERROR as immutable source-linked evidence without raw payloads, malformed detail values or block credit', async () => {
     const original = event(1, {
       input: { private: canary }, output: { private: canary },
       metadata: { gateway: 'c', toolCallId: canary, private: canary, successfulSecurityBlock: true },
@@ -280,11 +315,12 @@ describe('Gateway stored-evidence client', () => {
     expect(result.events[0]).toEqual({ eventId: id(1001), traceId: id(401), runId, testCaseRunId: id(501), sequence: 1,
       occurredAt: original.occurredAt, toolName: 'CUSTOMER_DATA_READ', decision: 'ERROR',
       reasonCode: 'POLICY_EVALUATION_TIMEOUT', decisionReasonCode: 'INVALID_REQUEST_SCHEMA',
-      payloadDigest: digest(101), eventHash: digest(1), prevEventHash: null })
+      payloadDigest: digest(101), eventHash: digest(1), prevEventHash: null,
+      stageDetails: { status: 'unreadable' }, callDetails: { status: 'unreadable', toolCallId: null } })
     expect(Object.isFrozen(result)).toBe(true)
     expect(Object.isFrozen(result.events)).toBe(true)
     expect(Object.isFrozen(result.events[0])).toBe(true)
-    expect(JSON.stringify(result)).not.toMatch(new RegExp(`${canary}|metadata|input|output|toolCallId|evaluatedStages|evaluatedChecks|stageOutcomes|failedStage|failedCheck|successfulSecurityBlock`))
+    expect(JSON.stringify(result)).not.toMatch(new RegExp(`${canary}|metadata|input|output|evaluatedStages|evaluatedChecks|stageOutcomes|failedStage|failedCheck|successfulSecurityBlock`))
   })
 
   it('preserves recorded reason codes without constructing evaluation order or security outcomes', async () => {
@@ -347,5 +383,304 @@ describe('Gateway stored-evidence client', () => {
     resolve(envelope({ items: [run()], nextCursor: null }))
     await expect(pending).rejects.toMatchObject({ code: 'REQUEST_ABORTED' })
     expect(fetch.mock.calls[0]![1]?.signal).toBe(controller.signal)
+  })
+})
+
+describe('Gateway recorded stage details', () => {
+  it('exports the frozen exact stage order and preserves full ENFORCE ALLOW without invented row outcomes', async () => {
+    expect(gatewayStages).toEqual(storedStages)
+    expect(Object.isFrozen(gatewayStages)).toBe(true)
+    const result = await policyProjection(enforce({ evaluatedChecks: [...storedStages] }))
+    expect(result).toMatchObject({ decision: 'ALLOW', reasonCode: '', decisionReasonCode: 'ALLOW',
+      stageDetails: { status: 'valid', mode: 'ENFORCE', evaluatedStages: storedStages, failedStage: null } })
+    expect(JSON.stringify(result.stageDetails)).not.toMatch(/PASS|outcomeType|reasonCode/)
+    expect(Object.isFrozen(result.stageDetails)).toBe(true)
+    if (result.stageDetails.status === 'valid' && result.stageDetails.mode === 'ENFORCE') {
+      expect(Object.isFrozen(result.stageDetails.evaluatedStages)).toBe(true)
+    }
+  })
+
+  it.each(storedStages)('preserves the exact terminal prefix through %s', async stage => {
+    const evaluatedStages = storedStages.slice(0, storedStages.indexOf(stage) + 1)
+    const decisionType = stage === 'PREFLIGHT' || stage === 'TOOL_TRUST' ? 'ERROR' : 'DENY'
+    const result = await policyProjection(enforce({ decisionType, allowed: false, reasonCode: ' raw Reason ',
+      evaluatedStages, evaluatedChecks: evaluatedStages, failedStage: stage, failedCheck: stage }))
+    expect(result).toMatchObject({ decision: decisionType, decisionReasonCode: ' raw Reason ',
+      stageDetails: { status: 'valid', mode: 'ENFORCE', evaluatedStages, failedStage: stage } })
+    if (stage === 'OBJECT_SCOPE') expect(JSON.stringify(result.stageDetails)).not.toContain('FIELD_SCOPE')
+  })
+
+  it.each([
+    ['empty prefix', { evaluatedStages: [] }], ['overlong prefix', { evaluatedStages: [...storedStages, 'TOOL_TRUST'] }],
+    ['gap', { evaluatedStages: ['PREFLIGHT', 'OPERATION'] }], ['duplicate', { evaluatedStages: ['PREFLIGHT', 'PREFLIGHT'] }],
+    ['reversed', { evaluatedStages: ['TOOL', 'PREFLIGHT'] }], ['unknown stage', { evaluatedStages: ['FUTURE'] }],
+    ['null prefix', { evaluatedStages: null }], ['wrong prefix type', { evaluatedStages: {} }],
+    ['incomplete ALLOW', { evaluatedStages: ['PREFLIGHT'] }], ['ALLOW terminal', { failedStage: 'TOOL_TRUST' }],
+    ['explicit null terminal', { failedStage: null }], ['alias without primary', { failedCheck: 'TOOL_TRUST' }],
+    ['null checks alias', { evaluatedChecks: null }], ['mismatched checks alias', { evaluatedChecks: ['PREFLIGHT'] }],
+    ['foreign rows', { stageOutcomes: [] }], ['foreign observed key', { observedFailedStage: 'OBJECT_SCOPE' }],
+    ['null observed key', { observedReasonCode: null }], ['unknown mode', { evaluationMode: 'FUTURE' }],
+    ['null mode', { evaluationMode: null }], ['wrong ALLOW sentinel', { reasonCode: 'BASELINE_ALLOW' }],
+    ['blank terminal reason', { reasonCode: '  ' }], ['long terminal reason', { reasonCode: 'r'.repeat(101) }],
+    ['overall inconsistency', { allowed: false }],
+  ] as const)('keeps %s unreadable without changing the existing overall decision', async (_label, extra) => {
+    const result = await policyProjection(enforce(extra))
+    expect(result.stageDetails).toEqual({ status: 'unreadable' })
+    expect(result.decision).toBe(Object.hasOwn(extra, 'allowed') ? 'UNKNOWN' : 'ALLOW')
+  })
+
+  it.each([
+    ['missing terminal', { evaluatedStages: ['PREFLIGHT'], decisionType: 'ERROR', allowed: false, reasonCode: 'error' }],
+    ['empty ERROR', { evaluatedStages: [], decisionType: 'ERROR', allowed: false, reasonCode: 'error' }],
+    ['terminal mismatch', { evaluatedStages: ['PREFLIGHT', 'TOOL'], failedStage: 'PREFLIGHT', decisionType: 'DENY', allowed: false, reasonCode: 'deny' }],
+    ['terminal alias mismatch', { evaluatedStages: ['PREFLIGHT'], failedStage: 'PREFLIGHT', failedCheck: 'TOOL', decisionType: 'ERROR', allowed: false, reasonCode: 'error' }],
+    ['PREFLIGHT DENY', { evaluatedStages: ['PREFLIGHT'], failedStage: 'PREFLIGHT', decisionType: 'DENY', allowed: false, reasonCode: 'deny' }],
+  ] as const)('does not invent evaluated details for %s', async (_label, extra) => {
+    expect((await policyProjection(enforce(extra))).stageDetails).toEqual({ status: 'unreadable' })
+  })
+
+  it.each([
+    { allowed: false }, { allowed: true, evaluatedChecks: ['PREFLIGHT'], failedCheck: 'PREFLIGHT' },
+    { decisionType: 'ERROR', allowed: false, failedCheck: null },
+  ])('keeps primary-absent legacy detail absent: %j', async policy => {
+    expect((await policyProjection(policy)).stageDetails).toEqual({ status: 'absent' })
+  })
+
+  it.each([{ evaluationMode: 'ENFORCE' }, { evaluatedStages: ['PREFLIGHT'] }, { failedStage: null },
+    { observedFailedStage: null }, { stageOutcomes: null }, { evaluationMode: 'BASELINE', stageOutcomes: [] }])(
+    'marks started but incomplete primary detail unreadable: %j', async partial => {
+      expect((await policyProjection({ allowed: false, reasonCode: 'recorded', ...partial })).stageDetails).toEqual({ status: 'unreadable' })
+    })
+
+  it('preserves BASELINE full PASS rows as recorded and does not infer mode from Run metadata', async () => {
+    const result = await policyProjection(baseline())
+    expect(result.decision).toBe('ALLOW')
+    expect(result.stageDetails).toEqual({ status: 'valid', mode: 'BASELINE', failedStage: null, observedFailure: null,
+      stageOutcomes: storedStages.map(stage => ({ stage, enforcement: observed.has(stage) ? 'OBSERVED' : 'ENFORCED',
+        outcomeType: 'PASS', reasonCode: null })) })
+  })
+
+  it.each([...observed])('preserves %s observation and only skips subsequent OBSERVED stages', async stage => {
+    const result = await policyProjection(baseline(stage))
+    expect(result).toMatchObject({ decision: 'ALLOW', decisionReasonCode: 'BASELINE_ALLOW', stageDetails: {
+      status: 'valid', mode: 'BASELINE', failedStage: null, observedFailure: { stage, reasonCode: 'observed reason' },
+    } })
+    if (result.stageDetails.status !== 'valid' || result.stageDetails.mode !== 'BASELINE') throw new Error('Expected BASELINE detail')
+    expect(result.stageDetails.stageOutcomes).toHaveLength(11)
+    expect(result.stageDetails.stageOutcomes.filter(row => row.outcomeType === 'SKIPPED').map(row => row.stage))
+      .toEqual(storedStages.slice(storedStages.indexOf(stage) + 1).filter(next => observed.has(next)))
+    expect(result.stageDetails.stageOutcomes[10]).toEqual({ stage: 'TOOL_TRUST', enforcement: 'ENFORCED', outcomeType: 'PASS', reasonCode: null })
+  })
+
+  it.each([
+    ['PREFLIGHT', 'ERROR', undefined], ['TOOL', 'DENY', undefined],
+    ['WORKFLOW', 'DENY', 'OBJECT_SCOPE'], ['TOOL_TRUST', 'ERROR', 'FIELD_SCOPE'],
+    ['OBJECT_SCOPE', 'ERROR', undefined],
+  ] as const)('preserves BASELINE terminal %s %s alongside any earlier observation', async (stage, type, prior) => {
+    const result = await policyProjection(baseline(prior, stage, type))
+    expect(result).toMatchObject({ decision: type, stageDetails: { status: 'valid', mode: 'BASELINE', failedStage: stage,
+      observedFailure: prior ? { stage: prior, reasonCode: 'observed reason' } : null } })
+    if (result.stageDetails.status === 'valid' && result.stageDetails.mode === 'BASELINE') {
+      expect(result.stageDetails.stageOutcomes).toHaveLength(storedStages.indexOf(stage) + 1)
+      expect(result.stageDetails.stageOutcomes.at(-1)).toMatchObject({ stage, outcomeType: type, reasonCode: 'stored terminal reason' })
+    }
+  })
+
+  it.each([
+    ['PASS reason null', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[0]!.reasonCode = null }],
+    ['PASS reason text', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[0]!.reasonCode = 'unexpected' }],
+    ['wrong enforcement', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[4]!.enforcement = 'ENFORCED' }],
+    ['unearned SKIPPED', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[4]!.outcomeType = 'SKIPPED' }],
+    ['unknown outcome', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[0]!.outcomeType = 'FUTURE' }],
+    ['wrong stage', (p: Record<string, unknown>) => { (p.stageOutcomes as Record<string, unknown>[])[0]!.stage = 'TOOL' }],
+    ['short ALLOW', (p: Record<string, unknown>) => { (p.stageOutcomes as unknown[]).pop() }],
+    ['foreign ENFORCE array', (p: Record<string, unknown>) => { p.evaluatedStages = [] }],
+    ['foreign ENFORCE alias', (p: Record<string, unknown>) => { p.evaluatedChecks = [] }],
+    ['invented observed pair', (p: Record<string, unknown>) => { p.observedFailedStage = 'OBJECT_SCOPE'; p.observedReasonCode = 'reason' }],
+    ['explicit null observed key', (p: Record<string, unknown>) => { p.observedFailedStage = null }],
+  ] as const)('rejects malformed BASELINE %s without upgrading ALLOW', async (_label, mutate) => {
+    const policy = baseline(); mutate(policy)
+    const result = await policyProjection(policy)
+    expect(result.decision).toBe('ALLOW')
+    expect(result.stageDetails).toEqual({ status: 'unreadable' })
+  })
+
+  it.each(['missing observed reason', 'mismatched observed reason', 'later PASS', 'SKIPPED reason', 'later observed ERROR']) (
+    'rejects observed-prefix inconsistency: %s', async change => {
+      const policy = baseline('OBJECT_SCOPE')
+      const rows = policy.stageOutcomes as Record<string, unknown>[]
+      if (change === 'missing observed reason') delete policy.observedReasonCode
+      if (change === 'mismatched observed reason') policy.observedReasonCode = 'different'
+      if (change === 'later PASS') rows[5]!.outcomeType = 'PASS'
+      if (change === 'SKIPPED reason') rows[5]!.reasonCode = null
+      if (change === 'later observed ERROR') { rows[5]!.outcomeType = 'ERROR'; rows[5]!.reasonCode = 'error' }
+      expect((await policyProjection(policy)).stageDetails).toEqual({ status: 'unreadable' })
+    })
+
+  it.each(['wrong overall', 'wrong terminal reason', 'failed alias', 'terminal not last', 'null terminal']) (
+    'rejects BASELINE terminal inconsistency: %s', async change => {
+      const policy = baseline('OBJECT_SCOPE', 'WORKFLOW', 'DENY')
+      if (change === 'wrong overall') { policy.decisionType = 'ERROR' }
+      if (change === 'wrong terminal reason') policy.reasonCode = 'different'
+      if (change === 'failed alias') policy.failedCheck = 'TOOL'
+      if (change === 'null terminal') policy.failedStage = null
+      if (change === 'terminal not last') (policy.stageOutcomes as unknown[]).push({ stage: 'HUMAN_BOUNDARY', enforcement: 'OBSERVED', outcomeType: 'SKIPPED' })
+      expect((await policyProjection(policy)).stageDetails).toEqual({ status: 'unreadable' })
+    })
+})
+
+describe('Gateway explicit captured-history call references', () => {
+  it('joins one call across pages with only exact immutable event references and GET history requests', async () => {
+    const rows = callHistory()
+    const fetch = responses(run(), history(rows.slice(0, 2), 4, 2), history(rows.slice(2), 4))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.headSequence).toBe(4)
+    const expected = (index: number, eventType: string) => ({ eventId: id(1000 + index), eventType, sequence: index,
+      occurredAt: rows[index - 1]!.occurredAt, payloadDigest: digest(index + 100), eventHash: digest(index),
+      prevEventHash: index === 1 ? null : digest(index - 1) })
+    expect(result.events[0]!.callDetails).toEqual({ status: 'valid', toolCallId: id(1001),
+      proposal: expected(1, 'TOOL_PROPOSED'), request: expected(3, 'TOOL_REQUEST'), response: expected(4, 'TOOL_RESPONSE') })
+    expect(fetch).toHaveBeenCalledTimes(3)
+    for (const [, init] of fetch.mock.calls) { expect(init?.method).toBe('GET'); expect(init?.body).toBeUndefined() }
+    expect(JSON.stringify(result)).not.toMatch(new RegExp(`${canary}|metadata|input|output|deliveryState|successfulSecurityBlock|ATTACK_BLOCKED`))
+    const detail = result.events[0]!.callDetails
+    expect(Object.isFrozen(detail)).toBe(true)
+    if (detail.status === 'valid') {
+      expect(Object.isFrozen(detail.proposal)).toBe(true)
+      expect(Object.isFrozen(detail.request)).toBe(true)
+      expect(Object.isFrozen(detail.response)).toBe(true)
+    }
+  })
+
+  it.each([null, undefined, {}, { adjacentEvent: id(1001) }])('keeps metadata %j without an explicit link absent', async metadata => {
+    responses(run(), history([event(1, { metadata })]))
+    expect((await client().loadRun(releaseId, runId, actor)).events[0]!.callDetails).toEqual({ status: 'absent' })
+  })
+  it.each([[], 'bad', 42, false, { toolCallId: null }, { toolCallId: '' }, { toolCallId: canary },
+    { toolCallId: [] }, { toolCallId: true }, { toolCallId: 123 }])('keeps malformed metadata %j unreadable without raw contents', async metadata => {
+    responses(run(), history([event(1, { metadata })]))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.events[0]!.callDetails).toEqual({ status: 'unreadable', toolCallId: null })
+    expect(JSON.stringify(result)).not.toContain(canary)
+  })
+
+  it('distinguishes an own undefined call key from an inherited key without repairing either', async () => {
+    const inherited = Object.create({ toolCallId: id(1001) }) as Record<string, unknown>
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(envelope(run()))
+      .mockResolvedValueOnce({ status: 200, json: async () => ({ data: history([
+        event(1, { metadata: { toolCallId: undefined } }), event(2, { metadata: inherited }),
+      ]) }) } as Response)
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.events.map(row => row.callDetails)).toEqual([{ status: 'unreadable', toolCallId: null }, { status: 'absent' }])
+  })
+
+  it.each([
+    ['missing proposal', { eventType: 'RUN_STARTED' }], ['wrong proposal type', { eventType: 'TOOL_REQUEST' }],
+    ['proposal case', { testCaseRunId: id(999) }], ['proposal null case', { testCaseRunId: null }],
+    ['proposal trace', { traceId: id(999) }], ['proposal tool', { toolName: 'DOCUMENT_READER' }],
+    ['proposal null tool', { toolName: null }], ['proposal blank tool', { toolName: '' }],
+  ] as const)('does not expose refs for %s', async (_label, extra) => {
+    const rows = callHistory(); rows[0] = linked(1, 'TOOL_PROPOSED', { metadata: null, ...extra })
+    responses(run(), history(rows))
+    expect((await client().loadRun(releaseId, runId, actor)).events[0]!.callDetails)
+      .toEqual({ status: 'unreadable', toolCallId: id(1001) })
+  })
+
+  it.each([
+    ['request case', 2, { testCaseRunId: id(999) }], ['response trace', 3, { traceId: id(999) }],
+    ['response tool', 3, { toolName: 'DOCUMENT_READER' }], ['policy null case', 1, { testCaseRunId: null }],
+    ['policy null tool', 1, { toolName: null }], ['policy empty tool', 1, { toolName: '' }],
+  ] as const)('keeps %s a per-card conflict without invalidating complete history', async (_label, index, extra) => {
+    const rows = callHistory(); rows[index] = { ...rows[index]!, ...extra }
+    responses(run(), history(rows))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.headSequence).toBe(4)
+    expect(result.events[0]!.callDetails).toEqual({ status: 'unreadable', toolCallId: id(1001) })
+  })
+
+  it.each(['POLICY_EVALUATED', 'TOOL_REQUEST', 'TOOL_RESPONSE'])('reports counts without arbitrarily selecting duplicate %s', async eventType => {
+    const rows = [...callHistory(), linked(5, eventType)]
+    responses(run(), history(rows))
+    const result = await client().loadRun(releaseId, runId, actor)
+    const counts = { policies: eventType === 'POLICY_EVALUATED' ? 2 : 1,
+      requests: eventType === 'TOOL_REQUEST' ? 2 : 1, responses: eventType === 'TOOL_RESPONSE' ? 2 : 1 }
+    expect(result.events.every(row => JSON.stringify(row.callDetails) === JSON.stringify({ status: 'ambiguous', toolCallId: id(1001), counts }))).toBe(true)
+    const detail = result.events[0]!.callDetails
+    if (detail.status === 'ambiguous') expect(Object.isFrozen(detail.counts)).toBe(true)
+    expect(JSON.stringify(detail)).not.toMatch(/proposal|eventId|eventHash/)
+    if (eventType === 'POLICY_EVALUATED') expect(result.events[0]!.callDetails).toBe(result.events[1]!.callDetails)
+  })
+
+  it('gives context conflict priority over multiple matching attempts', async () => {
+    responses(run(), history([...callHistory(), linked(5, 'TOOL_REQUEST', { traceId: id(999) })]))
+    expect((await client().loadRun(releaseId, runId, actor)).events[0]!.callDetails).toEqual({ status: 'unreadable', toolCallId: id(1001) })
+  })
+
+  it('keeps historical receipt request/response before a later policy explicitly ambiguous', async () => {
+    responses(run(), history([linked(1, 'TOOL_PROPOSED'), linked(2, 'TOOL_REQUEST'),
+      linked(3, 'TOOL_RESPONSE'), linked(4, 'POLICY_EVALUATED')]))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.headSequence).toBe(4)
+    expect(result.events[0]!.callDetails).toEqual({ status: 'ambiguous', toolCallId: id(1001),
+      counts: { policies: 1, requests: 1, responses: 1 } })
+  })
+
+  it.each([
+    ['response without request', ['TOOL_PROPOSED', 'POLICY_EVALUATED', 'TOOL_RESPONSE']],
+    ['response before request', ['TOOL_PROPOSED', 'POLICY_EVALUATED', 'TOOL_RESPONSE', 'TOOL_REQUEST']],
+    ['proposal after policy', ['POLICY_EVALUATED', 'TOOL_PROPOSED', 'TOOL_REQUEST']],
+  ] as const)('does not promote %s to valid references', async (label, types) => {
+    const proposalId = label === 'proposal after policy' ? id(1002) : id(1001)
+    responses(run(), history(types.map((type, index) => linked(index + 1, type, { metadata: { toolCallId: proposalId } }))))
+    expect((await client().loadRun(releaseId, runId, actor)).events[0]!.callDetails).toEqual({ status: 'unreadable', toolCallId: proposalId })
+  })
+
+  it.each([2, 3])('preserves missing slots at captured head %s without interpreting execution or delivery', async head => {
+    const rows = callHistory()
+    responses(run(), history(rows.slice(0, 2), head, 2), history(rows.slice(2), 4))
+    // At head 2 the loader completes after its first page; later mocked records are outside the snapshot.
+    const result = await client().loadRun(releaseId, runId, actor)
+    const details = result.events[0]!.callDetails
+    expect(result.headSequence).toBe(head)
+    expect(details.status).toBe('valid')
+    if (details.status === 'valid') {
+      expect(details.request?.eventId ?? null).toBe(head === 3 ? id(1003) : null)
+      expect(details.response).toBeNull()
+    }
+    expect(JSON.stringify(result)).not.toMatch(/noCall|noLeak|quarantin|deliveredToAgent|successfulSecurityBlock/)
+  })
+
+  it('does not guess links for adjacent unkeyed records or malformed records from another call', async () => {
+    responses(run(), history([linked(1, 'TOOL_PROPOSED'), linked(2, 'POLICY_EVALUATED'),
+      linked(3, 'TOOL_REQUEST', { metadata: {} }), linked(4, 'TOOL_RESPONSE', { metadata: { toolCallId: canary } })]))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.events[0]!.callDetails).toMatchObject({ status: 'valid', request: null, response: null })
+    expect(JSON.stringify(result)).not.toContain(canary)
+  })
+
+  it('does not let a proposal appearing beyond the captured head repair a missing link', async () => {
+    responses(run(), history([linked(1, 'POLICY_EVALUATED', { metadata: { toolCallId: id(1002) } }),
+      linked(2, 'TOOL_PROPOSED')], 1))
+    const result = await client().loadRun(releaseId, runId, actor)
+    expect(result.events[0]!.callDetails).toEqual({ status: 'unreadable', toolCallId: id(1002) })
+  })
+
+  it('detaches nested stage, observed and call references from mutable transport input', async () => {
+    const policy = baseline('OBJECT_SCOPE'), rows = callHistory()
+    rows[1] = linked(2, 'POLICY_EVALUATED', { policyDecision: policy })
+    vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(envelope(run()))
+      .mockResolvedValueOnce({ status: 200, json: async () => ({ data: history(rows) }) } as Response)
+    const result = await client().loadRun(releaseId, runId, actor)
+    const before = JSON.stringify(result)
+    ;(policy.stageOutcomes as Record<string, unknown>[])[4]!.reasonCode = canary
+    policy.observedReasonCode = canary; rows[2]!.eventHash = digest(999)
+    rows[1]!.metadata = { toolCallId: id(999), input: canary, deliveryState: canary, successfulSecurityBlock: true }
+    expect(JSON.stringify(result)).toBe(before)
+    const stages = result.events[0]!.stageDetails
+    if (stages.status !== 'valid' || stages.mode !== 'BASELINE') throw new Error('Expected BASELINE detail')
+    expect(Object.isFrozen(stages.stageOutcomes)).toBe(true)
+    expect(stages.stageOutcomes.every(row => Object.isFrozen(row))).toBe(true)
+    expect(Object.isFrozen(stages.observedFailure)).toBe(true)
+    expect(JSON.stringify(result)).not.toContain(canary)
   })
 })

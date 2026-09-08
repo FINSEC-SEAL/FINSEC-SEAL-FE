@@ -2,7 +2,7 @@ import { useEffect, useRef, useState } from 'react'
 import type { Release } from '../../api/contracts'
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader } from '../../components/Primitives'
 import { Badge, DataTable, Notice, Panel } from '../../components/Product'
-import { GatewayEvidenceClient, type GatewayEvidenceApi, type GatewayPolicyEvent, type GatewayRunEvidence, type GatewayRunOption } from './gatewayEvidence'
+import { GatewayEvidenceClient, gatewayStages, type CallEventRef, type GatewayCallDetails, type GatewayEvidenceApi, type GatewayPolicyEvent, type GatewayRunEvidence, type GatewayRunOption } from './gatewayEvidence'
 
 const defaultClient = new GatewayEvidenceClient()
 const missingReason = '없음 또는 문자열이 아님'
@@ -182,6 +182,81 @@ function GatewayEvent({ event }: { event: GatewayPolicyEvent }) {
       ['Previous event hash', <code>{event.prevEventHash ?? '기록 없음'}</code>],
     ]} />
     {reasonsDiffer && <Notice title="사유 두 값이 다르게 기록되어 있습니다." tone="amber">각 위치의 원문을 표시하며 어느 값에도 우선순위를 부여하지 않습니다.</Notice>}
-    <p className="muted">사유는 의미를 재해석하지 않은 기록값입니다. 이 화면은 평가 단계와 호출·응답의 연결 정보를 표시하지 않습니다.</p>
+    <GatewayStages event={event} />
+    <GatewayCalls sequence={event.sequence} details={event.callDetails} />
+    <p className="muted">사유는 의미를 재해석하지 않은 기록값입니다. 저장된 단계와 호출 출처는 실제 실행·전달 결과를 확정하지 않습니다.</p>
   </details>
+}
+
+function GatewayStages({ event }: { event: GatewayPolicyEvent }) {
+  const details = event.stageDetails
+  return <section aria-label={`정책 이벤트 ${event.sequence} 평가 단계`} style={{ minWidth: 0, overflowWrap: 'anywhere', padding: 12 }}>
+    <h3>평가 단계</h3>
+    {details.status === 'absent' ? <p className="muted">단계 상세 기록 없음</p>
+      : details.status === 'unreadable' ? <Notice title="단계 상세 판독 불가" tone="amber">단계 기록이 불완전하거나 서로 맞지 않습니다. 전체 판단과 사유는 기록된 값을 유지합니다.</Notice>
+        : <>
+          <p>저장된 평가 방식: <strong>{details.mode}</strong></p>
+          {details.mode === 'BASELINE' && details.observedFailure && <Notice title="관측 위반 기록" tone="amber">
+            <code>{details.observedFailure.stage}</code> · <code>{details.observedFailure.reasonCode}</code>
+            <p>OBSERVED는 관측 검사입니다. 이 위반만으로 전체 판단이 DENY가 되는 것은 아닙니다.</p>
+          </Notice>}
+          <ol style={{ paddingInlineStart: 24 }}>
+            {gatewayStages.map((stage, index) => {
+              const baselineRow = details.mode === 'BASELINE' ? details.stageOutcomes[index] : undefined
+              const evaluated = details.mode === 'ENFORCE' ? index < details.evaluatedStages.length : baselineRow !== undefined
+              const terminal = details.failedStage === stage
+              let outcome = '미평가'
+              if (evaluated && details.mode === 'ENFORCE') outcome = terminal ? `기록된 ${event.decision}` : '평가됨'
+              if (baselineRow) {
+                switch (baselineRow.outcomeType) {
+                  case 'PASS': outcome = 'PASS'; break
+                  case 'SKIPPED': outcome = 'SKIPPED · 관측 검사 생략'; break
+                  case 'ERROR': outcome = 'ERROR · 운영 오류'; break
+                  case 'DENY': outcome = baselineRow.enforcement === 'OBSERVED' ? 'DENY · 관측 위반' : 'DENY · 집행 거절'; break
+                }
+              }
+              const reason = baselineRow?.reasonCode ?? (details.mode === 'ENFORCE' && terminal ? event.decisionReasonCode : null)
+              return <li key={stage} style={{ paddingBlock: 8 }}>
+                <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                  <strong>{stage}</strong>
+                  {baselineRow && <span>{baselineRow.enforcement}</span>}
+                  <Badge tone={terminal || baselineRow?.outcomeType === 'DENY' ? 'amber' : 'muted'}>{outcome}</Badge>
+                </div>
+                {reason !== null && <p>기록된 사유: <code>{reason}</code></p>}
+              </li>
+            })}
+          </ol>
+          {details.mode === 'ENFORCE' && <p className="muted">‘평가됨’은 저장된 평가 목록에 포함된 단계입니다. 각 단계의 개별 결과와 사유는 별도로 기록되지 않았습니다.</p>}
+          <p className="muted">‘미평가’는 확인된 평가 종료 뒤의 후속 단계입니다. 상세가 없는 기록에서 미평가를 추정하지 않습니다.</p>
+        </>}
+  </section>
+}
+
+function GatewayCalls({ sequence, details }: { sequence: number; details: GatewayCallDetails }) {
+  return <section aria-label={`정책 이벤트 ${sequence} 호출 출처`} style={{ minWidth: 0, overflowWrap: 'anywhere', padding: 12 }}>
+    <h3>호출 출처</h3>
+    {details.status === 'absent' ? <p className="muted">호출 출처 기록 없음</p>
+      : details.status === 'unreadable' ? <Notice title="호출 출처 확인 불가" tone="amber">호출 식별자나 연결된 기록의 문맥을 확인할 수 없습니다.</Notice>
+        : details.status === 'ambiguous' ? <Notice title="호출 출처 연결 모호함" tone="amber">
+          <p>Tool Call ID: <code>{details.toolCallId}</code></p>
+          <p>동일 ID의 기록: 정책 {details.counts.policies}건 · 요청 {details.counts.requests}건 · 응답 {details.counts.responses}건</p>
+          <p>이 정책 판단에 대응하는 시도를 구분할 수 없습니다. 기록 건수는 실제 실행·전달 횟수가 아닙니다.</p>
+        </Notice>
+          : <>
+            <p>Tool Call ID: <code>{details.toolCallId}</code></p>
+            <dl>{[details.proposal, details.request, details.response].filter((ref): ref is CallEventRef => ref !== null).map(ref => <div key={ref.eventId} style={{ paddingBlock: 8 }}>
+              <dt><strong>{ref.eventType}</strong></dt>
+              <dd style={{ marginInlineStart: 0 }}>
+                <p>Event ID: <code>{ref.eventId}</code></p>
+                <p>순서 #{ref.sequence} · <time dateTime={ref.occurredAt}>{ref.occurredAt}</time></p>
+                <p>Payload digest: <code>{ref.payloadDigest}</code></p>
+                <p>Event hash: <code>{ref.eventHash}</code></p>
+                <p>Previous event hash: <code>{ref.prevEventHash ?? '기록 없음'}</code></p>
+              </dd>
+            </div>)}</dl>
+            {details.request === null && <p className="muted">캡처 범위에서 연결된 TOOL_REQUEST 기록 없음</p>}
+            {details.response === null && <p className="muted">캡처 범위에서 연결된 TOOL_RESPONSE 기록 없음</p>}
+          </>}
+    <p className="muted">같은 조회 범위에서 명시적으로 연결된 기록만 표시합니다. 기록 부재는 실제 미호출이나 미전달을 뜻하지 않습니다.</p>
+  </section>
 }
