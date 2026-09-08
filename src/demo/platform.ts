@@ -77,5 +77,10 @@ export function createDemoPlatform(): PlatformClient & { setReportReady: (ready:
       audits.unshift({ ...audits[0]!, id: id(), actorId: actor, action: `DEMO_RECOVERY_${input.resolution}`, resourceType: 'IDEMPOTENCY_RECOVERY', resourceId: recoveryId, metadata: { simulated: true } })
       return { id: recoveryId, idempotencyRecordId: request.idempotencyRecordId, resolution: input.resolution, stateAfterRecovery: input.resolution === 'RELEASE' ? 'RELEASED' : 'COMPLETED', responseDigest: null, recoveredBy: actor, recoveredAt: date }
     },
+    async listTestSuites() { return [] },
+    async listTestRuns() { return [] },
+    async listReplayComparisons() { return [] },
+    async startTestRun() { throw new Error('체험 모드에서는 실제 Test Run을 시작할 수 없습니다.') },
+    async testRun() { throw new Error('체험 모드에는 조회할 실제 Test Run이 없습니다.') },
   }
 }
