@@ -64,7 +64,7 @@ describe('FINAgent SEAL product shell', () => {
   })
 
   it('marks unconnected runtime pages explicitly in LIVE_API', async () => {
-    window.history.replaceState(null, '', '/#/live/gateway')
+    window.history.replaceState(null, '', '/#/live/replay')
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
     render(<App />)
     expect(await screen.findByText('실제 데이터와 합성 결과를 섞지 않습니다.')).toBeInTheDocument()
@@ -308,5 +308,169 @@ describe('merged live console navigation', () => {
     expect(await screen.findByRole('heading', { name: heading })).toBeInTheDocument()
     expect(screen.getByText('LIVE_API · API 모드')).toBeInTheDocument()
     expect(screen.queryByText('SIMULATED · 합성 체험')).not.toBeInTheDocument()
+  })
+})
+
+const gatewayRunId = '019903ac-abcd-7000-8000-000000000091'
+const gatewayEventId = '019903ac-abcd-7000-8000-000000000092'
+function liveGatewayApi() {
+  const backend = livePolicyApi()
+  const inventory = backend.fetch.getMockImplementation()!
+  let releaseId = selectedReleaseId
+  const history = () => envelope({ headSequence: 1, nextCursor: null, items: [{
+    schemaVersion: '1.0', eventId: gatewayEventId, traceId: liveAgentId, runId: gatewayRunId,
+    testCaseRunId: liveVersionId, sequence: 1, occurredAt: '2026-09-08T00:00:00Z',
+    eventType: 'POLICY_EVALUATED', toolName: 'CUSTOMER_DATA_READ',
+    policyDecision: { allowed: false, reasonCode: 'POLICY_EVALUATION_TIMEOUT' }, reasonCode: 'POLICY_EVALUATION_TIMEOUT',
+    payloadDigest: policyHash, eventHash: resourceHash, prevEventHash: null,
+    input: { private: reviewerKey }, output: reviewerKey, metadata: { private: reviewerKey, gateway: 'c' },
+  }] })
+  const handlers = { history: async () => history() }
+  backend.fetch.mockImplementation(async (input, init) => {
+    const url = new URL(String(input), window.location.origin)
+    const match = url.pathname.match(/^\/api\/v1\/releases\/([^/]+)\/test-runs$/)
+    if (match) {
+      releaseId = match[1]!
+      return envelope({ items: [{ id: gatewayRunId, releaseId, mode: 'SEAL_REPLAY', status: 'FAILED' }], nextCursor: null })
+    }
+    if (url.pathname === `/api/v1/test-runs/${gatewayRunId}`) return envelope({
+      id: gatewayRunId, releaseId, mode: 'SEAL_REPLAY', status: 'FAILED', contractVersionId: liveVersionId,
+    })
+    if (url.pathname === `/api/v1/test-runs/${gatewayRunId}/event-history`) return handlers.history()
+    return inventory(input, init)
+  })
+  const reads = () => backend.fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.includes('/test-runs'))
+  return { ...backend, handlers, history, reads }
+}
+
+async function selectGatewayRun(user: ReturnType<typeof userEvent.setup>) {
+  await screen.findByRole('heading', { name: 'Gateway 정책 판단 이력' })
+  await user.selectOptions(screen.getByLabelText('Gateway Release'), selectedReleaseId)
+  await user.selectOptions(await screen.findByLabelText('Gateway Run'), gatewayRunId)
+}
+
+describe('LIVE Gateway stored evidence routing', () => {
+  it('keeps an HTTP policy ERROR distinct from DENY through the real shell and C client', async () => {
+    window.history.replaceState(null, '', '/#/live/gateway')
+    const backend = liveGatewayApi()
+    const errorEventId = '019903ac-abcd-7000-8000-000000000093'
+    const errorPayloadDigest = `sha256:${'c'.repeat(64)}`
+    const errorEventHash = `sha256:${'d'.repeat(64)}`
+    // Synthetic HTTP evidence retains the original legacy DENY and adds the actual ERROR/false wire shape.
+    backend.handlers.history = async () => {
+      const original = await backend.history().json() as { data: { items: Record<string, unknown>[] } }
+      const first = original.data.items[0]!
+      return envelope({ headSequence: 2, nextCursor: null, items: [first, {
+        ...first, eventId: errorEventId, sequence: 2,
+        policyDecision: { allowed: false, decisionType: 'ERROR', reasonCode: 'INVALID_REQUEST_SCHEMA', successfulSecurityBlock: false },
+        reasonCode: 'INVALID_REQUEST_SCHEMA', payloadDigest: errorPayloadDigest,
+        eventHash: errorEventHash, prevEventHash: first.eventHash,
+      }] })
+    }
+    const user = userEvent.setup()
+    render(<App />)
+    await selectGatewayRun(user)
+    expect(await screen.findByText('정책 판단 2건 중 2건 표시')).toBeInTheDocument()
+    expect(screen.getByText('기록된 DENY')).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('판단 필터'), 'ERROR')
+    expect(screen.getByLabelText('판단 필터')).toHaveValue('ERROR')
+    expect(screen.getByText('정책 판단 2건 중 1건 표시')).toBeInTheDocument()
+    expect(screen.queryByText('#1 · CUSTOMER_DATA_READ')).not.toBeInTheDocument()
+    expect(screen.queryByText('기록된 DENY')).not.toBeInTheDocument()
+    const errorSummary = screen.getByText('#2 · CUSTOMER_DATA_READ')
+    expect(within(errorSummary.closest('details')!).getByText('ERROR · 운영 오류')).toBeInTheDocument()
+    await user.click(errorSummary)
+    const source = screen.getByRole('table', { name: '정책 이벤트 2 기록' })
+    for (const value of [errorEventId, gatewayRunId, liveAgentId, liveVersionId, errorPayloadDigest, errorEventHash, resourceHash]) {
+      expect(source).toHaveTextContent(value)
+    }
+    expect(within(source).getAllByText('INVALID_REQUEST_SCHEMA')).toHaveLength(2)
+    expect(screen.getByRole('table', { name: '조회한 Run 기록' })).toHaveTextContent(selectedReleaseId)
+    expect(screen.getByText('캡처한 이력 범위 · head 2')).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(new RegExp(`${reviewerKey}|ATTACK_BLOCKED|successfulSecurityBlock|공격 차단 성공|SIMULATED · 합성 체험`))
+    expect(screen.getByText('정의된 합성 시험 범위의 내부 평가입니다. 공식 인증 또는 모든 취약점의 부재를 보장하지 않습니다.')).toBeInTheDocument()
+    expect(screen.getByText('Internal assessment. Not official certification.')).toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('판단 필터'), 'DENY')
+    expect(screen.getByText('정책 판단 2건 중 1건 표시')).toBeInTheDocument()
+    expect(screen.getByText('#1 · CUSTOMER_DATA_READ')).toBeInTheDocument()
+    expect(screen.getByText('기록된 DENY')).toBeInTheDocument()
+    expect(screen.queryByText('#2 · CUSTOMER_DATA_READ')).not.toBeInTheDocument()
+    expect(backend.reads()).toHaveLength(3)
+    for (const [, init] of backend.fetch.mock.calls) {
+      expect(init?.method ?? 'GET').toBe('GET')
+      expect(init?.body).toBeUndefined()
+    }
+    for (const [, init] of backend.reads()) {
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('role-a-console')
+    }
+  })
+
+  it('uses the real shell and C client with selected Release and actor, preserving recorded meaning', async () => {
+    window.history.replaceState(null, '', '/#/live/gateway')
+    const backend = liveGatewayApi()
+    const user = userEvent.setup()
+    render(<App />)
+    await selectGatewayRun(user)
+    await user.click(await screen.findByText('#1 · CUSTOMER_DATA_READ'))
+    expect(screen.getByRole('table', { name: '정책 이벤트 1 기록' })).toHaveTextContent(gatewayEventId)
+    expect(screen.getByRole('table', { name: '조회한 Run 기록' })).toHaveTextContent(selectedReleaseId)
+    expect(screen.getByText('캡처한 이력 범위 · head 1')).toBeInTheDocument()
+    expect(screen.getByText('기록된 DENY')).toBeInTheDocument()
+    expect(document.body.textContent).not.toMatch(new RegExp(`${reviewerKey}|ATTACK_BLOCKED|SIMULATED · 합성 체험`))
+    expect(screen.getByText('Internal assessment. Not official certification.')).toBeInTheDocument()
+    expect(backend.reads()).toHaveLength(3)
+    for (const [, init] of backend.reads()) {
+      expect(init?.method).toBe('GET'); expect(init?.body).toBeUndefined()
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('role-a-console')
+    }
+    await user.click(screen.getByRole('button', { name: '환경 설정' }))
+    const dialog = screen.getByRole('dialog')
+    await user.clear(within(dialog).getByLabelText('API actor ID'))
+    await user.type(within(dialog).getByLabelText('API actor ID'), 'gateway-reader-2')
+    await user.click(within(dialog).getByRole('button', { name: 'Actor 적용' }))
+    await waitFor(() => expect(new Headers(backend.reads().at(-1)?.[1]?.headers).get('X-Actor-Id')).toBe('gateway-reader-2'))
+    expect(screen.getByLabelText('Gateway Release')).toHaveValue(selectedReleaseId)
+    expect(screen.queryByText('기록된 DENY')).not.toBeInTheDocument()
+    act(() => { window.location.hash = '/live/policy'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    await screen.findByRole('heading', { name: '안전 정책 검토' })
+    expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+  })
+
+  it('aborts a pending Gateway read when leaving the page and ignores its late response', async () => {
+    window.history.replaceState(null, '', '/#/live/gateway')
+    const backend = liveGatewayApi()
+    let resolve!: (response: Response) => void
+    backend.handlers.history = () => new Promise(done => { resolve = done })
+    const user = userEvent.setup()
+    render(<App />)
+    await selectGatewayRun(user)
+    await screen.findByText('정책 판단 이력을 불러오는 중')
+    await waitFor(() => expect(backend.reads()).toHaveLength(3))
+    const signal = backend.reads().at(-1)?.[1]?.signal
+    act(() => { window.location.hash = '/live/overview'; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    await screen.findByRole('heading', { name: '검증 워크스페이스' })
+    expect(signal?.aborted).toBe(true)
+    await act(async () => { resolve(backend.history()) })
+    expect(screen.queryByText('기록된 DENY')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('keeps demo Gateway independent of every API request', async () => {
+    window.history.replaceState(null, '', '/#/demo/gateway')
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    render(<App />)
+    await screen.findByRole('heading', { name: '어떤 요청이 차단되고 허용됐나요?' })
+    expect(screen.getByText('SIMULATED · 합성 체험')).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Gateway 정책 판단 이력' })).not.toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+
+  it.each(['runs', 'trace'])('keeps LIVE %s on the existing B Execution page', async route => {
+    window.history.replaceState(null, '', `/#/live/${route}`)
+    vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: 'Runs & Trace' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Gateway 정책 판단 이력' })).not.toBeInTheDocument()
   })
 })

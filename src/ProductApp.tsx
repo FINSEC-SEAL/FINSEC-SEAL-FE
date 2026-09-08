@@ -11,6 +11,7 @@ import { FindingsPage as LiveFindingsPage } from './features/Findings'
 import { AssurancePage } from './features/Assurance'
 import { RecoveryPage } from './features/Recovery'
 import { StoredContractReviewPage } from './features/policy/StoredContractReviewPage'
+import { GatewayEvidencePage } from './features/policy/GatewayEvidencePage'
 import { createDemoPlatform, DEMO_RELEASE_ID, demoManifest } from './demo/platform'
 import { ReleaseInventory, StartPage, WorkspacePage } from './product/EntryPages'
 import { ChangedPage, FindingDetail, FindingsPage, GatewayPage, PoliciesPage, PolicyDetail, ReleaseContext, ReleaseOverview, ReplayPage, ReportPage, ReportsPage, RunsPage, StatesPage, TracePage, VerificationPage } from './product/VerificationPages'
@@ -23,7 +24,7 @@ export default function App() {
   return <ProductApp key={route.mode} mode={route.mode} page={route.page} go={go} />
 }
 const detailPages: Page[] = ['release','trace','finding','policy','gateway','replay','verification','report']
-const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy']
+const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway']
 const detailTitles: Partial<Record<Page, [string,string]>> = {
   release: ['이 에이전트는 어디까지 허용되나요?','대출서류 검토의 업무 경계와 검증 구성을 먼저 확인하세요.'],
   trace: ['공격은 어디서 실제 행동이 됐나요?','도구 제안, 정책 판단, API 응답, 실제 영향을 순서대로 확인합니다.'],
@@ -71,8 +72,9 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
   useEffect(() => { if (!menuOpen) return; const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }; window.addEventListener('keydown', close); return () => window.removeEventListener('keydown', close) }, [menuOpen])
   function start() { if (!simulated) { go('demo','start'); return } workflow.start(); navigate('trace') }
   function body() {
-    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 실행·위험·판정과 저장 정책의 검토·검증·승인·거절은 각 메뉴에서 사용할 수 있습니다. Gateway·Replay 화면은 아직 연결되지 않았습니다.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
+    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 실행·위험·판정과 저장 정책의 검토·검증·승인·거절, 저장된 Gateway 판단 이력은 각 메뉴에서 사용할 수 있습니다. Replay 화면은 아직 연결되지 않았습니다.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
     if (!simulated && (page === 'policies' || page === 'policy')) return <StoredContractReviewPage releases={releases} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
+    if (!simulated && page === 'gateway') return <GatewayEvidencePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (!simulated && (page === 'runs' || page === 'trace')) return <ExecutionPage releases={releases} actorId={actorId} />
     if (!simulated && page === 'findings') return <LiveFindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (!simulated && ['reports','report','verification'].includes(page)) return <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
