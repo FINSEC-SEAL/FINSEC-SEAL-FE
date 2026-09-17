@@ -64,7 +64,7 @@ describe('FINAgent SEAL product shell', () => {
   })
 
   it('marks unconnected runtime pages explicitly in LIVE_API', async () => {
-    window.history.replaceState(null, '', '/#/live/replay')
+    window.history.replaceState(null, '', '/#/live/changed')
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
     render(<App />)
     expect(await screen.findByText('실제 데이터와 합성 결과를 섞지 않습니다.')).toBeInTheDocument()
@@ -472,5 +472,131 @@ describe('LIVE Gateway stored evidence routing', () => {
     render(<App />)
     expect(await screen.findByRole('heading', { name: 'Runs & Trace' })).toBeInTheDocument()
     expect(screen.queryByRole('heading', { name: 'Gateway 정책 판단 이력' })).not.toBeInTheDocument()
+  })
+})
+
+// Actual C transport + ProductApp routing, served by synthetic D61 HTTP fixtures.
+function liveStoredReplayApi() {
+  const backend = livePolicyApi(), inventory = backend.fetch.getMockImplementation()!
+  const event = (value: unknown, id = gatewayEventId) => ({ eventId: id, eventType: 'POLICY_EVALUATED', toolName: 'CUSTOMER_DATA_READ',
+    value, payloadDigest: policyHash, reasonCode: 'RECORDED_EVENT_REASON', occurredAt: '2026-09-17T00:00:00Z' })
+  const side = (runId: string, mode: string) => ({ runId, caseRunId: liveVersionId, mode, runStatus: 'COMPLETED', caseStatus: 'PASSED',
+    policyDecisions: [event({ allowed: true, reasonCode: 'BASELINE_ALLOW', private: reviewerKey })],
+    securityOutcome: reviewerKey, functionalOutcome: reviewerKey, apiResponses: [{ value: reviewerKey }], stateChanges: [{ value: reviewerKey }], oracleResults: [{ outcome: reviewerKey }] })
+  const comparison = () => envelope({ releaseId: selectedReleaseId, replayRunId: gatewayRunId, replayLinkId: liveAgentId, findingId: liveVersionId,
+    category: reviewerKey, severity: reviewerKey, comparable: false, mismatchReasons: ['MODEL_CONFIG_MISMATCH'],
+    baseline: side(liveVersionId, 'BASELINE'), replay: { ...side(gatewayRunId, 'SEAL_REPLAY'), policyDecisions: [
+      event({ decisionType: 'ERROR', allowed: false, reasonCode: 'POLICY_EVALUATION_TIMEOUT', evaluationMode: 'ENFORCE', private: reviewerKey }),
+      event({ decisionType: 'ERROR', allowed: true, reasonCode: 'CONFLICT', private: reviewerKey }, liveAgentId),
+    ] }, difference: { attackMitigated: true, private: reviewerKey } })
+  const handlers = { comparison: async () => comparison() }
+  backend.fetch.mockImplementation(async (input, init) => {
+    const url = new URL(String(input), window.location.origin)
+    if (url.pathname === `/api/v1/releases/${selectedReleaseId}/test-runs`) return envelope({ items: [
+      { id: liveVersionId, releaseId: selectedReleaseId, mode: 'BASELINE', status: 'COMPLETED' },
+      { id: gatewayRunId, releaseId: selectedReleaseId, mode: 'SEAL_REPLAY', status: 'COMPLETED' },
+    ], nextCursor: null })
+    if (url.pathname === `/api/v1/replays/${gatewayRunId}/comparison`) return handlers.comparison()
+    return inventory(input, init)
+  })
+  return { ...backend, handlers, comparison, comparisons: () => backend.fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.includes('/comparison')) }
+}
+
+async function selectStoredReplay(user: ReturnType<typeof userEvent.setup>) {
+  await screen.findByRole('heading', { name: '저장된 Replay 정책 비교' })
+  await user.selectOptions(screen.getByLabelText('Replay Release'), selectedReleaseId)
+  await user.selectOptions(await screen.findByLabelText('Replay Run'), gatewayRunId)
+}
+
+describe('LIVE stored Replay policy routing', () => {
+  it('uses the real read-only C client and exact D61 projection after explicit selection', async () => {
+    window.history.replaceState(null, '', '/#/live/replay')
+    const backend = liveStoredReplayApi(), user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: '저장된 Replay 정책 비교' })
+    expect(screen.getByLabelText('Replay Release')).toHaveValue(''); expect(backend.comparisons()).toHaveLength(0)
+    await user.selectOptions(screen.getByLabelText('Replay Release'), selectedReleaseId)
+    const run = await screen.findByLabelText('Replay Run')
+    expect(run).toHaveValue(''); expect(within(run).getAllByRole('option')).toHaveLength(2); expect(backend.comparisons()).toHaveLength(0)
+    await user.selectOptions(run, gatewayRunId)
+    expect(await screen.findByText('서버 기록: 비교 불가')).toBeVisible()
+    expect(screen.getByText('MODEL_CONFIG_MISMATCH')).toBeVisible()
+    expect(screen.getByText('기록된 ALLOW')).toBeVisible()
+    expect(screen.getByText('ERROR · 운영 오류')).toBeVisible(); expect(screen.getByText('UNKNOWN · 판독 불가')).toBeVisible()
+    const replay = within(screen.getByRole('region', { name: 'Replay 정책 기록' }))
+    await user.click(replay.getByText('표시 1 · CUSTOMER_DATA_READ'))
+    expect(replay.getByText('POLICY_EVALUATION_TIMEOUT')).toBeVisible()
+    expect(replay.getByText(gatewayEventId)).toBeVisible()
+    expect(replay.getAllByText('RECORDED_EVENT_REASON')[0]).toBeVisible()
+    expect(document.body.textContent).not.toContain(reviewerKey)
+    expect(screen.queryByText('ATTACK_BLOCKED')).not.toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: '승인 범위 확인 · 재검증' })).not.toBeInTheDocument()
+    for (const [, init] of backend.fetch.mock.calls) { expect(init?.method ?? 'GET').toBe('GET'); expect(init?.body).toBeUndefined() }
+    const [, init] = backend.comparisons()[0]!
+    expect(new Headers(init?.headers).get('X-Actor-Id')).toBeNull()
+    expect(new Headers(init?.headers).get('X-Contract-Reviewer-Key')).toBeNull()
+    expect(init?.credentials).toBe('omit'); expect(init?.cache).toBe('no-store')
+  })
+  it('opens C Replay through the existing Safety Policy menu and keeps C Release selection across navigation', async () => {
+    window.history.replaceState(null, '', '/#/live/overview')
+    const backend = liveStoredReplayApi(), user = userEvent.setup()
+    render(<App />); await screen.findByRole('heading', { name: '검증 워크스페이스' })
+    expect(screen.queryByRole('navigation', { name: '정책 화면 이동' })).not.toBeInTheDocument()
+    await user.click(within(screen.getByRole('navigation', { name: '주요 메뉴' })).getByRole('button', { name: '안전 정책' }))
+    await screen.findByRole('heading', { name: '안전 정책 검토' })
+    await user.selectOptions(screen.getByLabelText('정책 Release'), selectedReleaseId)
+    const nav = () => within(screen.getByRole('navigation', { name: '정책 화면 이동' }))
+    await user.click(nav().getByRole('button', { name: 'Gateway 판단 이력' }))
+    await screen.findByRole('heading', { name: 'Gateway 정책 판단 이력' })
+    expect(screen.getByLabelText('Gateway Release')).toHaveValue(selectedReleaseId)
+    await user.click(nav().getByRole('button', { name: 'Replay 정책 비교' }))
+    expect(window.location.hash).toBe('#/live/replay')
+    expect(screen.getByLabelText('Replay Release')).toHaveValue(selectedReleaseId)
+    expect(await screen.findByLabelText('Replay Run')).toHaveValue(''); expect(backend.comparisons()).toHaveLength(0)
+    expect(nav().getByRole('button', { name: 'Replay 정책 비교' })).toHaveAttribute('aria-current', 'page')
+    await user.selectOptions(screen.getByLabelText('Replay Run'), gatewayRunId)
+    await screen.findByText('서버 기록: 비교 불가')
+    await user.click(nav().getByRole('button', { name: '정책 검토' }))
+    expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+    expect(screen.queryByText('서버 기록: 비교 불가')).not.toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(0)
+  })
+  it('keeps D comparison errors safe without rendering a sample or stale result', async () => {
+    window.history.replaceState(null, '', '/#/live/replay')
+    const backend = liveStoredReplayApi(), user = userEvent.setup()
+    backend.handlers.comparison = async () => new Response(JSON.stringify({ detail: reviewerKey }), { status: 409 })
+    render(<App />); await selectStoredReplay(user)
+    expect(await screen.findByRole('alert')).toHaveTextContent('저장된 비교를 조회하지 못했습니다.')
+    expect(screen.queryByText('서버 기록: 비교 가능')).not.toBeInTheDocument()
+    expect(screen.queryByText('서버 기록: 비교 불가')).not.toBeInTheDocument()
+    expect(document.body.textContent).not.toContain(reviewerKey)
+    expect(screen.queryByText('ATTACK_BLOCKED')).not.toBeInTheDocument()
+    backend.handlers.comparison = async () => backend.comparison()
+    await user.click(screen.getByRole('button', { name: '비교 기록 새로고침' }))
+    expect(await screen.findByText('서버 기록: 비교 불가')).toBeVisible()
+  })
+  it('aborts a pending actual comparison read when navigating to another owner page', async () => {
+    window.history.replaceState(null, '', '/#/live/replay')
+    const backend = liveStoredReplayApi(), user = userEvent.setup()
+    let resolve!: (response: Response) => void
+    backend.handlers.comparison = () => new Promise<Response>(yes => { resolve = yes })
+    render(<App />); await selectStoredReplay(user)
+    const signal = backend.comparisons()[0]![1]!.signal!
+    await user.click(within(screen.getByRole('navigation', { name: '주요 메뉴' })).getByRole('button', { name: '워크스페이스' }))
+    expect(await screen.findByRole('heading', { name: '검증 워크스페이스' })).toBeVisible()
+    expect(screen.queryByRole('navigation', { name: '정책 화면 이동' })).not.toBeInTheDocument()
+    expect(signal.aborted).toBe(true)
+    await act(async () => { resolve(backend.comparison()) })
+    expect(screen.queryByText('서버 기록: 비교 불가')).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+  it('keeps demo Replay independent with no C live navigation or fetch', async () => {
+    window.history.replaceState(null, '', '/#/demo/replay')
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '정책 적용 전후, 무엇이 달라졌나요?' })).toBeVisible()
+    expect(screen.queryByRole('heading', { name: '저장된 Replay 정책 비교' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('navigation', { name: '정책 화면 이동' })).not.toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalled()
   })
 })

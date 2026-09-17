@@ -12,6 +12,7 @@ import { AssurancePage } from './features/Assurance'
 import { RecoveryPage } from './features/Recovery'
 import { StoredContractReviewPage } from './features/policy/StoredContractReviewPage'
 import { GatewayEvidencePage } from './features/policy/GatewayEvidencePage'
+import { StoredReplayPolicyPage } from './features/policy/StoredReplayPolicyPage'
 import { createDemoPlatform, DEMO_RELEASE_ID, demoManifest } from './demo/platform'
 import { ReleaseInventory, StartPage, WorkspacePage } from './product/EntryPages'
 import { ChangedPage, FindingDetail, FindingsPage, GatewayPage, PoliciesPage, PolicyDetail, ReleaseContext, ReleaseOverview, ReplayPage, ReportPage, ReportsPage, RunsPage, StatesPage, TracePage, VerificationPage } from './product/VerificationPages'
@@ -24,7 +25,7 @@ export default function App() {
   return <ProductApp key={route.mode} mode={route.mode} page={route.page} go={go} />
 }
 const detailPages: Page[] = ['release','trace','finding','policy','gateway','replay','verification','report']
-const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway']
+const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway','replay']
 const detailTitles: Partial<Record<Page, [string,string]>> = {
   release: ['이 에이전트는 어디까지 허용되나요?','대출서류 검토의 업무 경계와 검증 구성을 먼저 확인하세요.'],
   trace: ['공격은 어디서 실제 행동이 됐나요?','도구 제안, 정책 판단, API 응답, 실제 영향을 순서대로 확인합니다.'],
@@ -72,9 +73,10 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
   useEffect(() => { if (!menuOpen) return; const close = (event: KeyboardEvent) => { if (event.key === 'Escape') setMenuOpen(false) }; window.addEventListener('keydown', close); return () => window.removeEventListener('keydown', close) }, [menuOpen])
   function start() { if (!simulated) { go('demo','start'); return } workflow.start(); navigate('trace') }
   function body() {
-    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 실행·위험·판정과 저장 정책의 검토·검증·승인·거절, 저장된 Gateway 판단 이력은 각 메뉴에서 사용할 수 있습니다. Replay 화면은 아직 연결되지 않았습니다.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
+    if (!simulated && !livePages.includes(page)) return <><PageHeader eyebrow="INTEGRATION STATUS" title={pageLabels[page]} description="현재 프론트에 이 기능의 실행 API는 연결되지 않았습니다." /><Notice title="실제 데이터와 합성 결과를 섞지 않습니다.">등록·Manifest·Fingerprint·증적·감사·복구 API는 사용 가능합니다. 실행·위험·판정과 저장 정책의 검토·검증·승인·거절, 저장된 Gateway 판단 이력과 Replay 정책 비교는 각 메뉴에서 사용할 수 있습니다.<div className="button-row section-gap"><button className="primary-button" onClick={() => go('demo',page)}>이 화면을 샘플 모드로 보기</button><button className="secondary-button" onClick={() => navigate('releases')}>실제 릴리스 관리</button></div></Notice></>
     if (!simulated && (page === 'policies' || page === 'policy')) return <StoredContractReviewPage releases={releases} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (!simulated && page === 'gateway') return <GatewayEvidencePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
+    if (!simulated && page === 'replay') return <StoredReplayPolicyPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (!simulated && (page === 'runs' || page === 'trace')) return <ExecutionPage releases={releases} actorId={actorId} />
     if (!simulated && page === 'findings') return <LiveFindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
     if (!simulated && ['reports','report','verification'].includes(page)) return <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={setSelectedReleaseId} />
@@ -103,7 +105,14 @@ function ProductApp({ mode, page, go }: { mode: Mode; page: Page; go: (mode: Mod
         {loading && !loaded ? <LoadingBlock label="워크스페이스 정보를 불러오는 중" /> : !loaded && !simulated && !['start','audit','recovery'].includes(page) ? <Notice title="API 연결을 확인해 주세요." tone="amber">서버에 연결되지 않아 실제 inventory를 표시할 수 없습니다.<button className="text-button" onClick={() => go('demo','start')}>샘플 모드로 보기 →</button></Notice> : <>
           {loading && loaded && <div className="refresh-status" role="status">기존 정보를 유지하며 갱신 중…</div>}
           {simulated && detailPages.includes(page) && <><PageHeader eyebrow="RELEASE VERIFICATION" title={detailTitles[page]![0]} description={detailTitles[page]![1]} /><ReleaseContext page={page} navigate={navigate} workflow={workflow} reset={() => setResetOpen(true)} /></>}
-          <div key={page}>{body()}</div>
+          <div key={page}>
+            {!simulated && ['policies','policy','gateway','replay'].includes(page) && <nav aria-label="정책 화면 이동" className="button-row section-gap">
+              {([['policies','정책 검토'],['gateway','Gateway 판단 이력'],['replay','Replay 정책 비교']] as const).map(([target, label]) => <button key={target}
+                className="secondary-button" aria-current={page === target || target === 'policies' && page === 'policy' ? 'page' : undefined}
+                onClick={() => navigate(target)}>{label}</button>)}
+            </nav>}
+            {body()}
+          </div>
         </>}
         <footer className="page-footer"><span>정의된 합성 시험 범위의 내부 평가입니다. 공식 인증 또는 모든 취약점의 부재를 보장하지 않습니다.</span><span>Internal assessment. Not official certification.</span></footer>
       </main>
