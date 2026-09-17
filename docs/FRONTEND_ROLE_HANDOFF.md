@@ -100,7 +100,7 @@ VITE_FINSEC_ACTOR_ID=role-a-console
 | `#/demo/trace` | `TracePage` / `VerificationPages.tsx` | B 실행 표시, A 이벤트 조회, D Oracle 근거 | 샘플 |
 | `#/demo/findings`, `#/demo/finding` | `FindingsPage`, `FindingDetail` / `VerificationPages.tsx` | D, 정책 후보 링크는 C 협업 | 샘플 |
 | `#/demo/policies`, `#/demo/policy` | `PoliciesPage`, `PolicyDetail` / `VerificationPages.tsx` | C | 샘플 |
-| `#/live/policies`, `#/live/policy` | `StoredContractReviewPage` / `features/policy/` | C, 저장·승인 기반은 A | 실제 저장 목록·검토·검증·승인·거절. [연결 계약과 제약](C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md) |
+| `#/live/policies`, `#/live/policy` | `StoredContractReviewPage` / `features/policy/` | C, 저장·승인 기반은 A | 실제 저장 목록·검토·검증·승인·거절. |
 | `#/demo/gateway` | `GatewayPage` / `VerificationPages.tsx` | C 판단, B 호출 사실, D 결과 | 샘플 |
 | `#/demo/replay` | `ReplayPage`, `ComparisonEvidence` / `VerificationPages.tsx` | B 실행 + C 적용/비교 조건 + D 평가 | 샘플 |
 | `#/demo/verification` | `VerificationPage` / `VerificationPages.tsx` | D 결과, B 실행, C 집행 | 샘플 |
@@ -197,7 +197,7 @@ LIVE 저장 정책 검토는 `src/features/policy/StoredContractReviewPage.tsx`�
 2. **A 저장 API와 기존 C core를 사용합니다.** 실제 A 경로는 `GET /api/v1/platform/contracts?releaseId=...` 및 `POST /api/v1/platform/contracts/{versionId}:validate|approve|reject`입니다. C의 `GET /api/v1/platform/contracts/{versionId}/review`가 정확한 JSON 문자열, 기록된 승인 기준, 재귀 diff, 저장 validation과 공개 검토 기록을 제공합니다. 이 C 조회는 [BE PR36](https://github.com/FINSEC-SEAL/FINSEC-SEAL-BE/pull/36)이 필요합니다. 원 명세 경로와 reviewer-session 연결은 별도 통합 대상입니다.
 3. **정책 규칙을 저장값 그대로 표시합니다.** 허용 Tool, 고객·객체·필드·건수, 외부 전송, workflow, 사람 전용 행동, 도구 신뢰와 결과 규칙을 읽습니다. 브라우저에서 정책 의미·hash·diff를 다시 계산하지 않습니다. 수치 원문을 보존할 수 없거나 지원하지 않는 구조이면 정확한 저장 JSON을 표시합니다.
 4. **실제 버전과 서버 판단을 분리합니다.** `CANDIDATE`만 검증하고, `VALIDATED`의 저장 결과가 VALID/WARN일 때 승인 검토를 열 수 있습니다. 서버가 현재 권한·Release·proof·hash 조건을 최종 검사합니다. APPROVED/REJECTED/SUPERSEDED는 읽기 전용입니다. 없는 정상업무 영향이나 승인 시각은 만들지 않습니다.
-5. **승인 충돌과 처리 미확정을 구분합니다.** body의 `resourceHash`로 quoted `If-Match`를 고정합니다. 일반 409는 의견 보존 → 최신 조회 → 재동의가 필요합니다. 응답 유실·5xx·잘못된 성공 응답은 미확정으로 남기고 자동 재전송하지 않습니다. 명시적 재전송도 동일 key/body/Content-Type/If-Match를 유지합니다. 페이지·별칭·모드 이동 후 메모리 상태의 한계는 [C 인수인계](C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md)를 확인합니다.
+5. **승인 충돌과 처리 미확정을 구분합니다.** body의 `resourceHash`로 quoted `If-Match`를 고정합니다. 일반 409는 의견 보존 → 최신 조회 → 재동의가 필요합니다. 응답 유실·5xx·잘못된 성공 응답은 미확정으로 남기고 자동 재전송하지 않습니다. 명시적 재전송도 동일 key/body/Content-Type/If-Match를 유지합니다.
 6. **Gateway의 실제 집행 연결은 남아 있습니다.** C의 ALLOW/DENY·reason, B의 실제 API 호출/응답, D의 Oracle 결과를 구분해야 합니다. 평가 오류는 공격 차단 성공이 아닙니다. 실제 호출 전 DENY와 응답 전달 전 격리를 검증하는 작업을 승인 UI 완료로 대체하지 않습니다.
 7. **Replay의 통제 조건을 서버에서 확인해야 합니다.** artifact, resolved model/parameters, attack case, variant, trial, fixture digest, runtime/tool/RAG 조건의 C 검증 결과가 있어야 동일 조건 비교가 가능합니다. Contract만 바뀌었다면 releaseFingerprint가 다른 것은 정상일 수 있습니다. FA-01/02/03의 C 역할은 정해진 순서의 집행·검증 단계에서 진행합니다.
 
