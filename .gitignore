@@ -28,4 +28,5 @@ output/playwright/
 !.env.example
 
 # Local Role C handoff documentation
+/docs/C_REPLAY_POLICY_UI_HANDOFF.md
 /docs/C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md
