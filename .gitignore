@@ -9,3 +9,24 @@ vite.config.js
 vite.config.d.ts
 .playwright-cli/
 output/playwright/
+
+# Local agent work and private submission files
+/AGENTS.md
+/AGENTS.local.md
+/.codex/
+/.codex-parallel/
+/.worktrees/
+/dev_harness/
+/MONITOR_STATUS.json
+/ORCHESTRATION_STATE.json
+/DELIVERY_SUMMARY.md
+/제출서류/
+/제출서류/
+
+# Private environment variants; keep the public template
+.env.*
+!.env.example
+
+# Local Role C handoff documentation
+/docs/C_REPLAY_POLICY_UI_HANDOFF.md
+/docs/C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md
