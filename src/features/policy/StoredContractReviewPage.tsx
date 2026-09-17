@@ -425,6 +425,7 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
   return <div className="stack">
     <section aria-label="후보 생성 작업">
       <Panel title="후보 생성 작업" description="생성 접수와 저장 후보 검토는 별도 단계입니다. 검증·승인 요청은 직접 확인한 뒤 전송합니다.">
+        <Notice title="AI가 제안하는 정책 후보">AI(LLM)가 생성한 내용은 정책 후보입니다. 결정적 검증과 검토자의 명시적 승인 후에만 Sandbox 정책에 사용할 수 있습니다.</Notice>
         <div className="button-row"><button className="secondary-button" disabled={busy || mutationPending || versions === null || generationBlocked(generationRecord)} onClick={event => { if (event.detail < 2) generate('CONTRACT') }}>초기 계약 후보 생성</button></div>
         <label>패치 출처 Finding ID<input aria-label="패치 출처 Finding ID" value={findingId} onChange={event => setFindingId(event.target.value)} autoComplete="off" spellCheck={false} /></label>
         <p className="muted">패치 기준은 현재 선택해 조회한 계약입니다. Finding의 적격성과 최신 기준본은 서버가 확인합니다.</p>
@@ -492,6 +493,10 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
       </Panel>}
     </>}
     {confirmation && <Modal title={confirmation.kind === 'retry' ? '동일 요청 재전송 확인' : `계약 ${actionNames[confirmation.action]} 확인`} onClose={() => { setConfirmation(null); setConsent(false) }}>
+      {(confirmation.kind === 'new' ? confirmation.action : confirmation.operation.action) === 'approve' && <Notice title="승인 적용 범위" tone="amber">
+        <p>이 승인은 해당 Release의 Sandbox Safety Contract에만 적용됩니다. 운영 정책은 변경되지 않습니다.</p>
+        <p lang="en">Production policy is not modified</p>
+      </Notice>}
       <DataTable caption="변경 요청 확인" headings={['검토 대상', '값']} rows={[
         ['계약 버전', `${confirmation.snapshot.identity.contractKey} v${confirmation.snapshot.identity.version}`],
         ['Version ID', <code>{confirmation.snapshot.identity.versionId}</code>],
