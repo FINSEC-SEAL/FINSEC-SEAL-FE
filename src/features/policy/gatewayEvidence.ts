@@ -134,7 +134,7 @@ function readRun(value: unknown, releaseId: string): GatewayRunOption {
   if (!modes.includes(mode) || uuid(row.releaseId) !== releaseId) fail()
   return Object.freeze({ id: uuid(row.id), releaseId, mode, status: string(row.status) })
 }
-function readDecision(policy: Record<string, unknown>): GatewayPolicyEvent['decision'] {
+export function readDecision(policy: Record<string, unknown>): GatewayPolicyEvent['decision'] {
   if (!Object.hasOwn(policy, 'decisionType')) {
     return policy.allowed === true ? 'ALLOW' : policy.allowed === false ? 'DENY' : 'UNKNOWN'
   }
