@@ -4,13 +4,17 @@ import {
   readContractListResponse,
   readContractProblem,
   readContractUuid,
+  readContractValidationResponse,
   readContractVersionResponse,
   readStoredContractReviewResponse,
   type ContractProblem,
+  type ContractValidationReceipt,
   type ContractVersionIdentity,
   type ContractVersionSummary,
   type StoredContractReview,
 } from './wire'
+import { readReviewerSessionCredential, readReviewerSessionResponse,
+  type ContractReviewCredential, type ReviewerSession } from './reviewerSession'
 
 const defaultBaseUrl = import.meta.env.VITE_FINSEC_API_BASE_URL ?? 'http://localhost:8080'
 const prefix = '/api/v1/platform/contracts'
@@ -203,7 +207,11 @@ function readGenerationOperation(value: unknown, expected: Pick<GenerationOperat
 const messages: Readonly<Record<string, string>> = {
   CONTRACT_REQUEST_INVALID: '계약 대상과 입력 내용을 확인해 주세요.',
   CONTRACT_RESPONSE_INVALID: '서버의 계약 응답을 확인할 수 없습니다. 최신 상태를 다시 조회해 주세요.',
-  CONTRACT_AUTH_REQUIRED: '검토자 키를 확인해 주세요.',
+  CONTRACT_AUTH_REQUIRED: '검토자 인증을 확인해 주세요.',
+  CONTRACT_SESSION_HTTPS_REQUIRED: '브라우저 세션은 HTTPS API 연결이 필요합니다. 로컬 개발에서는 키 방식을 선택해 주세요.',
+  CONTRACT_SESSION_CONNECTION_PENDING: '이전 세션 연결 응답을 기다린 뒤 다시 연결해 주세요.',
+  CONTRACT_SESSION_INVALID: '현재 API 연결에서 확인한 검토자 세션이 필요합니다.',
+  CONTRACT_SESSION_EXPIRED: '검토자 세션이 만료되었습니다. 다시 연결해 주세요.',
   OPERATOR_AUTH_REQUIRED: '이 계약을 검토할 권한이 없습니다.',
   RESOURCE_NOT_FOUND: '저장된 계약을 찾을 수 없습니다.',
   RESOURCE_CONFLICT: '계약 또는 릴리스가 변경되었습니다. 최신 내용을 다시 검토해 주세요.',
@@ -236,6 +244,10 @@ export class ContractRequestError extends Error {
 
 function invalidRequest(): ContractRequestError {
   return new ContractRequestError(null, { code: 'CONTRACT_REQUEST_INVALID', retryable: false }, 'not_sent')
+}
+
+function sessionError(code: string): ContractRequestError {
+  return new ContractRequestError(null, { code, retryable: false }, 'not_sent')
 }
 
 function checkedInput<T>(read: () => T): T {
@@ -304,67 +316,123 @@ function httpOutcome(status: number, code: string): RequestOutcome {
 
 export class ContractReviewClient {
   private readonly baseUrl: string
+  private readonly sessionHttps: boolean
+  private readonly confirmedSessions = new WeakSet<ReviewerSession>()
+  private sessionConnectionPending = false
 
   constructor(baseUrl = defaultBaseUrl) {
-    this.baseUrl = checkedInput(() => {
+    const target = checkedInput(() => {
       const url = new URL(baseUrl || '/', globalThis.location?.origin)
       if (!['http:', 'https:'].includes(url.protocol) || url.username || url.password
         || url.search || url.hash) throw invalidRequest()
-      return baseUrl.replace(/\/+$/, '')
+      return { baseUrl: baseUrl.replace(/\/+$/, ''), sessionHttps: url.protocol === 'https:' }
     })
+    this.baseUrl = target.baseUrl
+    this.sessionHttps = target.sessionHttps
   }
 
-  listVersions(releaseId: string, reviewerKey: string, signal?: AbortSignal): Promise<readonly ContractVersionSummary[]> {
+  /** Cookie issuance is not cancelled by navigation; serialize through both response bodies. */
+  async connectReviewerSession(reviewerKey?: string): Promise<ReviewerSession> {
+    if (!this.sessionHttps) throw sessionError('CONTRACT_SESSION_HTTPS_REQUIRED')
+    if (this.sessionConnectionPending) throw sessionError('CONTRACT_SESSION_CONNECTION_PENDING')
+    const headers = checkedInput(() => {
+      const result = new Headers({ Accept: 'application/json' })
+      if (reviewerKey !== undefined) {
+        if (typeof reviewerKey !== 'string' || !reviewerKey.length) throw invalidRequest()
+        result.set('X-Contract-Reviewer-Key', reviewerKey)
+      }
+      return result
+    })
+    this.sessionConnectionPending = true
+    try {
+      const first = await this.send('/api/v1/reviewer-session', headers, 'include', payload => readReviewerSessionResponse(payload))
+      const confirmed = reviewerKey === undefined ? first
+        : await this.send('/api/v1/reviewer-session', new Headers({ Accept: 'application/json' }), 'include',
+          payload => {
+            const current = readReviewerSessionResponse(payload)
+            if (current.csrfToken !== first.csrfToken || current.expiresAt !== first.expiresAt
+              || current.actorId !== first.actorId || current.workspaceId !== first.workspaceId || current.role !== first.role) {
+              throw invalidRequest()
+            }
+            return current
+          })
+      // This is local provenance, not server authority, cookie ownership or revocation.
+      this.confirmedSessions.add(confirmed)
+      return confirmed
+    } finally { this.sessionConnectionPending = false }
+  }
+
+  listVersions(releaseId: string, credential: ContractReviewCredential, signal?: AbortSignal): Promise<readonly ContractVersionSummary[]> {
     const id = checkedInput(() => readContractUuid(releaseId))
-    return this.request(`${prefix}?releaseId=${encodeURIComponent(id)}`, reviewerKey,
-      payload => readContractListResponse(payload, id), undefined, signal)
-  }
-
-  review(identity: ContractVersionIdentity, reviewerKey: string, signal?: AbortSignal): Promise<StoredContractReview> {
-    const target = checkedInput(() => readContractIdentity(identity))
-    return this.request(`${prefix}/${encodeURIComponent(target.versionId)}/review`, reviewerKey,
-      payload => readStoredContractReviewResponse(payload, target), undefined, signal)
-  }
-
-  executeMutation(operation: PreparedContractMutation, reviewerKey: string, signal?: AbortSignal): Promise<ContractVersionSummary> {
-    if (!(operation instanceof PreparedMutation)) throw invalidRequest()
-    return this.request(`${prefix}/${encodeURIComponent(operation.identity.versionId)}:${operation.action}`, reviewerKey,
+    return this.request(`${prefix}?releaseId=${encodeURIComponent(id)}`, credential,
       payload => {
+        const versions = readContractListResponse(payload, id)
+        if (typeof credential !== 'string' && versions.some(version => version.identity.workspaceId !== credential.workspaceId)) throw invalidRequest()
+        return versions
+      }, undefined, signal)
+  }
+
+  review(identity: ContractVersionIdentity, credential: ContractReviewCredential, signal?: AbortSignal): Promise<StoredContractReview> {
+    const target = checkedInput(() => readContractIdentity(identity))
+    return this.request(`${prefix}/${encodeURIComponent(target.versionId)}/review`, credential,
+      payload => readStoredContractReviewResponse(payload, target), undefined, signal, target.workspaceId)
+  }
+
+  executeMutation(operation: PreparedContractMutation, credential: ContractReviewCredential, signal?: AbortSignal): Promise<ContractValidationReceipt | ContractVersionSummary> {
+    if (!(operation instanceof PreparedMutation)) throw invalidRequest()
+    return this.request(`/api/v1/contract-versions/${encodeURIComponent(operation.identity.versionId)}:${operation.action}`, credential,
+      payload => {
+        if (operation.action === 'validate') return readContractValidationResponse(payload, operation.identity.versionId)
         const version = readContractVersionResponse(payload, operation.identity)
-        const expected = operation.action === 'validate' ? ['CANDIDATE', 'VALIDATED']
-          : operation.action === 'approve' ? ['APPROVED'] : ['REJECTED']
-        if (!expected.includes(version.state)) throw invalidRequest()
+        if (version.state !== (operation.action === 'approve' ? 'APPROVED' : 'REJECTED')) throw invalidRequest()
         return version
       }, operation, signal)
   }
 
-  submitGeneration(operation: PreparedGeneration, reviewerKey: string, signal?: AbortSignal): Promise<GenerationOperation> {
+  submitGeneration(operation: PreparedGeneration, credential: ContractReviewCredential, signal?: AbortSignal): Promise<GenerationOperation> {
     if (!preparedGenerations.has(operation)) throw invalidRequest()
     const path = operation.kind === 'CONTRACT' ? `/api/v1/releases/${operation.releaseId}/contracts:generate`
       : `/api/v1/findings/${operation.findingId}/patch-proposals`
-    return this.request(path, reviewerKey, (payload, response) => {
+    return this.request(path, credential, (payload, response) => {
       const result = readGenerationOperation(payload, operation)
       if (response.headers.get('Location') !== result.statusUrl || result.status !== 'QUEUED') throw invalidRequest()
       return result
     }, operation, signal)
   }
 
-  generationOperation(reference: GenerationOperationReference, reviewerKey: string, signal?: AbortSignal): Promise<GenerationOperation> {
+  generationOperation(reference: GenerationOperationReference, credential: ContractReviewCredential, signal?: AbortSignal): Promise<GenerationOperation> {
     const expected = checkedInput(() => operationReference(reference))
-    return this.request(`/api/v1/operations/${expected.operationId}`, reviewerKey,
+    return this.request(`/api/v1/operations/${expected.operationId}`, credential,
       payload => readGenerationOperation(payload, expected), undefined, signal)
   }
 
   private async request<T>(
     path: string,
-    reviewerKey: string,
+    credential: ContractReviewCredential,
     read: (payload: unknown, response: Response) => T,
     operation?: PreparedContractMutation | PreparedGeneration,
     signal?: AbortSignal,
+    workspaceId?: string,
   ): Promise<T> {
+    let session: ReviewerSession | null = null
+    if (typeof credential !== 'string') {
+      // Check the original argument before decoding, which returns a new frozen projection.
+      if (!this.confirmedSessions.has(credential)) throw sessionError('CONTRACT_SESSION_INVALID')
+      if (!this.sessionHttps) throw sessionError('CONTRACT_SESSION_HTTPS_REQUIRED')
+      try { session = readReviewerSessionCredential(credential) }
+      catch { throw sessionError('CONTRACT_SESSION_EXPIRED') }
+      const targetWorkspace = workspaceId ?? (operation instanceof PreparedMutation ? operation.identity.workspaceId
+        : operation?.kind === 'PATCH' ? operation.baseIdentity.workspaceId : undefined)
+      if (targetWorkspace !== undefined && targetWorkspace !== session.workspaceId) throw invalidRequest()
+    }
     const headers = checkedInput(() => {
-      if (typeof reviewerKey !== 'string' || reviewerKey.length === 0) throw invalidRequest()
-      const result = new Headers({ Accept: 'application/json', 'X-Contract-Reviewer-Key': reviewerKey })
+      const result = new Headers({ Accept: 'application/json' })
+      if (session) {
+        if (operation) result.set('X-CSRF-Token', session.csrfToken)
+      } else {
+        if (typeof credential !== 'string' || credential.length === 0) throw invalidRequest()
+        result.set('X-Contract-Reviewer-Key', credential)
+      }
       if (operation) {
         result.set('Content-Type', operation.contentType)
         if (operation instanceof PreparedMutation) result.set('If-Match', operation.ifMatch)
@@ -373,11 +441,27 @@ export class ContractReviewClient {
       return result
     })
 
+    return this.send(path, headers, session ? 'include' : 'omit', (payload, response) => {
+      // A late GET must not revive expired UI. A sent POST receipt may still settle its old ledger.
+      if (session && !operation) readReviewerSessionCredential(session)
+      return read(payload, response)
+    }, operation, signal)
+  }
+
+  private async send<T>(
+    path: string,
+    headers: Headers,
+    credentials: RequestCredentials,
+    read: (payload: unknown, response: Response) => T,
+    operation?: PreparedContractMutation | PreparedGeneration,
+    signal?: AbortSignal,
+  ): Promise<T> {
+
     let response: Response
     try {
       response = await fetch(`${this.baseUrl}${path}`, {
         method: operation ? 'POST' : 'GET', headers, body: operation?.body,
-        credentials: 'omit', redirect: 'error', cache: 'no-store', signal,
+        credentials, redirect: 'error', cache: 'no-store', signal,
       })
     } catch {
       throw new ContractRequestError(null, {

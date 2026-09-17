@@ -64,6 +64,12 @@ function platformVersion(view: StoredContractReview, overrides: Record<string, u
     validation: {}, review: { sessionId: key }, ...overrides }
 }
 
+function validationResult(view: StoredContractReview) {
+  if (!view.validation) throw new Error('Synthetic canonical validation requires stored evidence')
+  return { versionId: view.identity.versionId, state: view.state, policyHash: view.policyHash,
+    resourceHash: view.resourceHash, ...view.validation, validationProof: { private: key } }
+}
+
 function response(data: unknown, status = 200): Response {
   return new Response(JSON.stringify({ data, traceId, timestamp: '2026-09-07T06:00:00Z' }), {
     status, headers: { 'Content-Type': 'application/json' },
@@ -89,11 +95,13 @@ type Reply = Response | Promise<Response>
 function api(initial: StoredContractReview[] = [snapshot()]) {
   const views = new Map(initial.map(view => [view.identity.versionId, view]))
   const handlers: {
+    session: (init: RequestInit) => Reply
     list: (release: string) => Reply
     detail: (id: string) => Reply
     post: (path: string, init: RequestInit) => Reply
     operation: (id: string, init: RequestInit) => Reply
   } = {
+    session: () => problem(403, 'CONTRACT_AUTH_REQUIRED'),
     list: selected => response([...views.values()].filter(view => view.identity.releaseId === selected).map(view => platformVersion(view))),
     detail: id => response(views.get(id)),
     post: () => problem(409, 'INVALID_STATE_TRANSITION'),
@@ -101,7 +109,14 @@ function api(initial: StoredContractReview[] = [snapshot()]) {
   }
   const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
     const url = new URL(String(input))
-    if (init.method === 'POST') return handlers.post(url.pathname, init)
+    if (url.pathname === '/api/v1/reviewer-session' && init.method === 'GET') return handlers.session(init)
+    if (init.method === 'POST') {
+      if (!/^\/api\/v1\/contract-versions\/[0-9a-f-]+:(validate|approve|reject)$/.test(url.pathname)
+        && !/^\/api\/v1\/(releases\/[0-9a-f-]+\/contracts:generate|findings\/[0-9a-f-]+\/patch-proposals)$/.test(url.pathname)) {
+        throw new Error('Unexpected synthetic mutation route')
+      }
+      return handlers.post(url.pathname, init)
+    }
     if (url.pathname.startsWith('/api/v1/operations/')) return handlers.operation(url.pathname.split('/').at(-1)!, init)
     if (url.pathname.endsWith('/review')) return handlers.detail(url.pathname.split('/').at(-2)!)
     if (url.pathname === '/api/v1/platform/contracts') return handlers.list(url.searchParams.get('releaseId')!)
@@ -117,6 +132,9 @@ function page(releases = [release(), release(secondReleaseId)], preferredRelease
 type User = ReturnType<typeof userEvent.setup>
 
 async function loadList(user: User, reviewerKey = key) {
+  if ((screen.getByLabelText('인증 방식') as HTMLSelectElement).value !== 'local') {
+    await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
+  }
   const input = screen.getByLabelText('검토자 키') as HTMLInputElement
   if (input.value !== reviewerKey) { await user.clear(input); await user.type(input, reviewerKey) }
   await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
@@ -152,6 +170,7 @@ describe('stored contract page selection and authority', () => {
     expect(screen.getByRole('heading', { name: '안전 정책 검토' })).toBeInTheDocument()
     expect(screen.getByLabelText('정책 Release')).toHaveValue('')
     expect(screen.getByLabelText('검토자 키')).toHaveAttribute('type', 'password')
+    await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
     unavailable('계약 목록 조회')
     await user.type(screen.getByLabelText('검토자 키'), key)
     expect(backend.fetchMock).not.toHaveBeenCalled()
@@ -185,7 +204,7 @@ describe('stored contract page selection and authority', () => {
     expect(await screen.findByRole('heading', { name: '저장된 계약이 없습니다' })).toBeInTheDocument()
     backend.handlers.list = () => problem(403, 'CONTRACT_AUTH_REQUIRED')
     await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
-    expect(await screen.findByText('검토자 키를 확인해 주세요.')).toBeInTheDocument()
+    expect(await screen.findByText('검토자 인증을 확인해 주세요.')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: /계약 .* 선택/ })).not.toBeInTheDocument()
     expect(document.body.textContent).not.toContain(key)
     expect(backend.posts()).toHaveLength(0)
@@ -193,16 +212,25 @@ describe('stored contract page selection and authority', () => {
 
   it('validates a candidate, reloads WARN evidence, and requires a separate explicit approval', async () => {
     const backend = api()
+    const inspected = deferred<Response>()
     const warn = validated({ resourceHash: changedHash, validation: { status: 'WARN', issues: [
       { jsonPointer: '/purpose', code: 'STORED_WARNING', severity: 'WARNING', message: '저장된 검토 경고' },
     ] } })
     backend.handlers.post = path => {
-      expect(path.endsWith(':validate')).toBe(true)
+      expect(path).toBe(`/api/v1/contract-versions/${versionId}:validate`)
       backend.views.set(versionId, warn)
-      return response(platformVersion(warn))
+      backend.handlers.detail = () => inspected.promise
+      return response(validationResult(warn))
     }
     const user = userEvent.setup(); page(); await load(user)
     await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText('계약 검증 요청이 처리되었습니다.')).toBeInTheDocument()
+    unavailable('승인 검토')
+    expect(screen.queryByText('저장된 검토 경고')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('table', { name: '저장 버전 이력' })).getByText('CANDIDATE')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    await act(async () => inspected.resolve(response(warn)))
+    backend.handlers.detail = id => response(backend.views.get(id))
     expect(await screen.findByText('저장된 검토 경고')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled()
     unavailable('계약 검증')
@@ -222,7 +250,7 @@ describe('stored contract page selection and authority', () => {
     const invalid = snapshot({ resourceHash: changedHash, validation: { status: 'INVALID', issues: [
       { jsonPointer: '/allowedTools', code: 'MINIMUM_AVAILABILITY', severity: 'ERROR', message: '필수 업무 도구 누락' },
     ] } })
-    backend.handlers.post = () => { backend.views.set(versionId, invalid); return response(platformVersion(invalid)) }
+    backend.handlers.post = () => { backend.views.set(versionId, invalid); return response(validationResult(invalid)) }
     const user = userEvent.setup(); page(); await load(user)
     await user.click(screen.getByRole('button', { name: '계약 검증' }))
     expect(await screen.findByText('필수 업무 도구 누락')).toBeInTheDocument()
@@ -260,6 +288,8 @@ describe('explicit review consent and conflicts', () => {
     backend.handlers.post = () => pending.promise
     const user = userEvent.setup(); page(); await load(user, validated())
     let dialog = await confirm(user, '승인', '첫 검토 의견')
+    expect(within(dialog).getByText('이 승인은 해당 Release의 Sandbox Safety Contract에만 적용됩니다. 운영 정책은 변경되지 않습니다.')).toBeVisible()
+    expect(within(dialog).getByText('Production policy is not modified')).toBeVisible()
     for (const hash of [baseHash, policyHash, resourceHash]) expect(dialog.textContent).toContain(hash)
     await user.type(within(dialog).getByLabelText('검토 의견'), ' 수정')
     expect(within(dialog).getByRole('checkbox', { name: consent })).not.toBeChecked()
@@ -289,7 +319,7 @@ describe('explicit review consent and conflicts', () => {
     await user.click(within(dialog).getByRole('button', { name: '거절 요청 전송' }))
     await waitFor(() => expect(screen.getByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument())
     expect(backend.posts()).toHaveLength(1)
-    expect(backend.posts()[0]![0]).toBe(`https://api.test/api/v1/platform/contracts/${versionId}:reject`)
+    expect(backend.posts()[0]![0]).toBe(`https://api.test/api/v1/contract-versions/${versionId}:reject`)
     expect(backend.posts()[0]![1]?.body).toBe(JSON.stringify({ comment: '검토\n"범위" 거절' }))
   })
 
@@ -322,24 +352,29 @@ describe('explicit review consent and conflicts', () => {
     expect(document.body.textContent).not.toContain(key)
   })
 
-  it('keeps a confirmed mutation success separate from a failed subsequent GET and offers only reinspection', async () => {
-    const backend = api([validated()])
+  it.each(['validate', 'approve'] as const)('keeps a confirmed %s success separate from a failed subsequent GET and offers only reinspection', async action => {
+    const initial = action === 'approve' ? validated() : snapshot()
+    const result = validated({ state: action === 'approve' ? 'APPROVED' : 'VALIDATED', resourceHash: changedHash })
+    const backend = api([initial])
     backend.handlers.post = () => {
       backend.handlers.detail = () => problem(503, 'CONTRACT_REVIEW_UNAVAILABLE')
-      return response(platformVersion(validated({ state: 'APPROVED', resourceHash: changedHash })))
+      return response(action === 'validate' ? validationResult(result) : platformVersion(result))
     }
-    const user = userEvent.setup(); page(); await load(user, validated())
-    const dialog = await confirm(user, '승인')
-    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
-    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    const user = userEvent.setup(); page(); await load(user, initial)
+    if (action === 'approve') {
+      const dialog = await confirm(user, '승인')
+      await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    } else await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText(`계약 ${action === 'approve' ? '승인' : '검증'} 요청이 처리되었습니다.`)).toBeInTheDocument()
     expect(await screen.findByText('변경 요청은 처리됐지만 최신 검토 내용을 불러오지 못했습니다.')).toBeInTheDocument()
     expect(screen.queryByText('요청 처리 여부가 미확정입니다.')).not.toBeInTheDocument()
     unavailable('동일 요청 재전송 검토'); unavailable('승인 검토')
     expect(screen.getByRole('button', { name: '최신 계약 다시 조회' })).toBeEnabled()
     expect(backend.posts()).toHaveLength(1)
-    backend.handlers.detail = () => response(validated({ state: 'APPROVED', resourceHash: changedHash }))
+    backend.handlers.detail = () => response(result)
     await user.click(screen.getByRole('button', { name: '최신 계약 다시 조회' }))
-    expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    if (action === 'approve') expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    else expect(await screen.findByRole('button', { name: '승인 검토' })).toBeEnabled()
     expect(backend.posts()).toHaveLength(1)
   })
 })
@@ -511,19 +546,37 @@ describe('selection races and uncertain operations', () => {
     expect(backend.posts()).toHaveLength(1)
   })
 
-  it('requires fresh explicit retry consent, sends the identical operation, and retains unknown after retry 403', async () => {
-    const backend = api()
+  it.each(['validate', 'approve'] as const)('requires fresh explicit %s retry consent, sends the identical operation, and retains unknown after retry 403', async action => {
+    const initial = action === 'approve' ? validated() : snapshot()
+    const backend = api([initial])
     backend.handlers.post = () => Promise.reject(new TypeError(key))
-    const user = userEvent.setup(); page(); await load(user)
-    await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    const user = userEvent.setup(); page(); await load(user, initial)
+    if (action === 'approve') {
+      const approval = await confirm(user, '승인')
+      await user.click(within(approval).getByRole('button', { name: '승인 요청 전송' }))
+    } else await user.click(screen.getByRole('button', { name: '계약 검증' }))
     expect(await screen.findByText('요청 처리 여부가 미확정입니다.')).toBeInTheDocument()
     unavailable('동일 요청 재전송 검토')
     await user.click(screen.getByRole('button', { name: '처리 상태 다시 조회' }))
     await waitFor(() => expect(screen.getByRole('button', { name: '동일 요청 재전송 검토' })).toBeEnabled())
     await user.click(screen.getByRole('button', { name: '동일 요청 재전송 검토' }))
-    const dialog = await screen.findByRole('dialog', { name: '동일 요청 재전송 확인' })
+    let dialog = await screen.findByRole('dialog', { name: '동일 요청 재전송 확인' })
     expect(within(dialog).queryByLabelText('검토 의견')).not.toBeInTheDocument()
-    expect(dialog.textContent).toContain('{}')
+    expect(within(dialog).getByLabelText('이전 요청 본문')).toHaveTextContent(backend.posts()[0]![1]!.body as string)
+    expect(backend.posts()).toHaveLength(1)
+    if (action === 'approve') {
+      expect(within(dialog).getByText('이 승인은 해당 Release의 Sandbox Safety Contract에만 적용됩니다. 운영 정책은 변경되지 않습니다.')).toBeVisible()
+      expect(within(dialog).getByText('Production policy is not modified')).toBeVisible()
+      for (const hash of [baseHash, policyHash, resourceHash]) expect(dialog.textContent).toContain(hash)
+    }
+    expect(within(dialog).getByRole('checkbox', { name: retryConsent })).not.toBeChecked()
+    expect(within(dialog).getByRole('button', { name: '동일 요청 재전송' })).toBeDisabled()
+    await user.click(within(dialog).getByRole('checkbox', { name: retryConsent }))
+    await user.click(within(dialog).getByRole('button', { name: '취소' }))
+    expect(backend.posts()).toHaveLength(1)
+    await user.click(screen.getByRole('button', { name: '동일 요청 재전송 검토' }))
+    dialog = await screen.findByRole('dialog', { name: '동일 요청 재전송 확인' })
+    expect(within(dialog).getByRole('checkbox', { name: retryConsent })).not.toBeChecked()
     expect(within(dialog).getByRole('button', { name: '동일 요청 재전송' })).toBeDisabled()
     await user.click(within(dialog).getByRole('checkbox', { name: retryConsent }))
     backend.handlers.post = () => problem(403, 'CONTRACT_AUTH_REQUIRED')
@@ -541,12 +594,13 @@ describe('selection races and uncertain operations', () => {
     await user.click(screen.getByRole('button', { name: '동일 요청 재전송 검토' }))
     const retryDialog = await screen.findByRole('dialog', { name: '동일 요청 재전송 확인' })
     await user.click(within(retryDialog).getByRole('checkbox', { name: retryConsent }))
-    const result = validated({ resourceHash: changedHash })
-    backend.handlers.post = () => { backend.views.set(versionId, result); return response(platformVersion(result)) }
+    const result = validated({ state: action === 'approve' ? 'APPROVED' : 'VALIDATED', resourceHash: changedHash })
+    backend.handlers.post = () => { backend.views.set(versionId, result); return response(action === 'validate' ? validationResult(result) : platformVersion(result)) }
     await user.click(within(retryDialog).getByRole('button', { name: '동일 요청 재전송' }))
-    expect(await screen.findByText('계약 검증 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(await screen.findByText(`계약 ${action === 'approve' ? '승인' : '검증'} 요청이 처리되었습니다.`)).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByText('요청 처리 여부가 미확정입니다.')).not.toBeInTheDocument())
-    await waitFor(() => expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled())
+    if (action === 'approve') expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    else await waitFor(() => expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled())
     expect(backend.posts()).toHaveLength(3)
     expect(backend.posts()[2]![1]?.body).toBe(original![1]?.body)
     expect(Object.fromEntries(new Headers(backend.posts()[2]![1]?.headers))).toEqual(Object.fromEntries(new Headers(original![1]?.headers)))
@@ -630,7 +684,7 @@ function mutationLifecycle(backend: ReturnType<typeof api>, generationKind: 'CON
       : { ...previous, state: path.endsWith(':approve') ? 'APPROVED' as const : 'REJECTED' as const, resourceHash: baseHash }
     expect(init.credentials).toBe('omit')
     backend.views.set(id, next)
-    return response(platformVersion(next))
+    return response(path.endsWith(':validate') ? validationResult(next) : platformVersion(next))
   }
 }
 
@@ -640,6 +694,7 @@ describe('generation admission and explicit stored candidate review', () => {
     backend.handlers.operation = () => { backend.views.set(versionId, snapshot()); return response(generationView('CONTRACT', 'SUCCEEDED', outcome)) }
     const user = userEvent.setup(); page(); await loadList(user)
     expect(await screen.findByText('저장된 계약이 없습니다')).toBeInTheDocument()
+    expect(generationRegion().getByText('AI(LLM)가 생성한 내용은 정책 후보입니다. 결정적 검증과 검토자의 명시적 승인 후에만 Sandbox 정책에 사용할 수 있습니다.')).toBeVisible()
     await user.dblClick(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
     expect(await generationRegion().findByText(outcome, { exact: true })).toBeInTheDocument()
     expect(generationPosts(backend)).toHaveLength(1)
@@ -817,7 +872,7 @@ describe('generation unknown admission and Operation polling', () => {
     const backend = api(); backend.handlers.post = () => problem(403, 'CONTRACT_AUTH_REQUIRED')
     const user = userEvent.setup(); page(); await load(user)
     await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
-    expect(await generationRegion().findByText('검토자 키를 확인해 주세요.')).toBeInTheDocument()
+    expect(await generationRegion().findByText('검토자 인증을 확인해 주세요.')).toBeInTheDocument()
     expect(screen.queryByText('생성 접수 여부 미확정')).not.toBeInTheDocument()
     await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
     expect(generationPosts(backend)).toHaveLength(2)
@@ -864,8 +919,16 @@ describe('generation unknown admission and Operation polling', () => {
     expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
     expect(screen.queryByRole('button', { name: '생성된 후보 검토' })).not.toBeInTheDocument()
     backend.handlers.operation = () => { outstanding++; maximum = Math.max(maximum, outstanding); outstanding--; return response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID')) }
-    await user.click(screen.getByRole('button', { name: '생성 상태 다시 조회' }))
-    expect(await generationRegion().findByText('INVALID')).toBeInTheDocument()
+    if (scope === 'key' || scope === 'client') {
+      unavailable('생성 상태 다시 조회')
+      unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성')
+      expect(operationGets(backend)).toHaveLength(1)
+      expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    } else {
+      await user.click(screen.getByRole('button', { name: '생성 상태 다시 조회' }))
+      expect(await generationRegion().findByText('INVALID')).toBeInTheDocument()
+      expect(operationGets(backend)).toHaveLength(2)
+    }
     expect(maximum).toBe(1); expect(outstanding).toBe(0)
     expect(backend.posts()).toHaveLength(1)
   })
@@ -876,6 +939,7 @@ describe('generation unknown admission and Operation polling', () => {
       const backend = api(); backend.handlers.post = () => admitted()
       const slow = deferred<Response>(); backend.handlers.operation = () => slow.promise
       const rendered = page()
+      fireEvent.change(screen.getByLabelText('인증 방식'), { target: { value: 'local' } })
       fireEvent.change(screen.getByLabelText('검토자 키'), { target: { value: key } })
       await act(async () => { fireEvent.click(screen.getByRole('button', { name: '계약 목록 조회' })) })
       await act(async () => { fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' })) })
@@ -1015,5 +1079,497 @@ describe('generation handoff scope and current approval consent', () => {
     await user.type(screen.getByLabelText('패치 출처 Finding ID'), findingId)
     unavailable('패치 후보 생성')
     expect(generationPosts(backend)).toHaveLength(0)
+  })
+})
+
+const sessionActor = 'synthetic-policy-reviewer'
+const sessionCsrf = 'SYNTHETIC_PAGE_CSRF_CANARY_0123456789'
+const expiredSessionMessage = '검토자 세션이 만료되었습니다. 다시 연결해 주세요.'
+
+function sessionData(overrides: Record<string, unknown> = {}) {
+  return { actorId: sessionActor, workspaceId, role: 'AI_SECURITY_REVIEWER',
+    expiresAt: Math.floor(Date.now() / 1000) + 3600, csrfToken: sessionCsrf, ...overrides }
+}
+
+function sessionGets(backend: ReturnType<typeof api>) {
+  return backend.fetchMock.mock.calls.filter(([input]) => String(input).endsWith('/reviewer-session'))
+}
+
+function contractGets(backend: ReturnType<typeof api>) {
+  return backend.fetchMock.mock.calls.filter(([input, init]) => init?.method === 'GET'
+    && String(input).includes('/platform/contracts'))
+}
+
+function sessionPage(backend: ReturnType<typeof api>, session = sessionData(), connectedClient = new ContractReviewClient('https://api.test')) {
+  backend.handlers.session = () => response(session)
+  const rendered = render(<StoredContractReviewPage releases={[release(), release(secondReleaseId)]}
+    preferredReleaseId={releaseId} client={connectedClient} />)
+  return { ...rendered, connectedClient }
+}
+
+async function restoreSession(user: User) {
+  await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+  await screen.findByRole('button', { name: '계약 loan-review v7 선택' })
+}
+
+describe('explicit browser reviewer session connection', () => {
+  it('defaults to session without requests and confirms cookie-only identity before clearing the key and loading the selected release', async () => {
+    const backend = api(); const user = userEvent.setup()
+    const storageWrite = vi.spyOn(Storage.prototype, 'setItem')
+    const confirmation = deferred<Response>(); const projected = sessionData()
+    sessionPage(backend, projected)
+    let connectionReads = 0
+    backend.handlers.session = () => ++connectionReads === 1 ? response(projected) : confirmation.promise
+    expect(screen.getByLabelText('인증 방식')).toHaveValue('session')
+    expect(backend.fetchMock).not.toHaveBeenCalled()
+    unavailable('계약 목록 조회')
+    await user.type(screen.getByLabelText('검토자 키'), key)
+    expect(backend.fetchMock).not.toHaveBeenCalled()
+    await user.dblClick(screen.getByRole('button', { name: '키로 세션 연결' }))
+    expect(sessionGets(backend)).toHaveLength(2)
+    expect(contractGets(backend)).toHaveLength(0)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue(key)
+    unavailable('키로 세션 연결'); unavailable('기존 세션 복원')
+    const [exchange, confirmCookie] = sessionGets(backend)
+    expect(new Headers(exchange![1]?.headers).get('X-Contract-Reviewer-Key')).toBe(key)
+    expect(new Headers(confirmCookie![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    for (const [, init] of sessionGets(backend)) {
+      expect(init?.credentials).toBe('include'); expect(init?.signal).toBeUndefined()
+      expect(init?.redirect).toBe('error'); expect(init?.cache).toBe('no-store')
+    }
+    await act(async () => confirmation.resolve(response(projected)))
+    expect(await screen.findByRole('button', { name: '계약 loan-review v7 선택' })).toBeInTheDocument()
+    expect(screen.getByLabelText('검토자 키')).toHaveValue('')
+    expect(document.body.textContent).toContain(sessionActor)
+    expect(document.body.textContent).toContain(workspaceId)
+    expect(screen.getByRole('table', { name: '확인된 검토자 세션' })).toHaveTextContent(new Date(projected.expiresAt * 1000).toLocaleString('ko-KR'))
+    expect(contractGets(backend)).toHaveLength(1)
+    expect(String(contractGets(backend)[0]![0])).toContain(`releaseId=${releaseId}`)
+    await selectVersion(user)
+    await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
+    await screen.findByRole('button', { name: '계약 loan-review v7 선택' })
+    expect(sessionGets(backend)).toHaveLength(2)
+    for (const [input, init] of contractGets(backend)) {
+      expect(init?.credentials).toBe('include')
+      expect(new Headers(init?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+      expect(new Headers(init?.headers).has('X-CSRF-Token')).toBe(false)
+      expect(String(input)).not.toContain(key); expect(String(input)).not.toContain(sessionCsrf)
+    }
+    expect(document.body.textContent).not.toContain(key)
+    expect(document.body.textContent).not.toContain(sessionCsrf)
+    expect(storageWrite).not.toHaveBeenCalled()
+    expect(backend.posts()).toHaveLength(0)
+  })
+
+  it('restores explicitly without a key and sends the existing mutation bytes with session CSRF', async () => {
+    const backend = api(); const user = userEvent.setup(); sessionPage(backend)
+    await user.type(screen.getByLabelText('검토자 키'), key)
+    await restoreSession(user)
+    expect(sessionGets(backend)).toHaveLength(1)
+    expect(new Headers(sessionGets(backend)[0]![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue('')
+    await selectVersion(user)
+    const result = validated({ resourceHash: changedHash })
+    backend.handlers.post = () => { backend.views.set(versionId, result); return response(validationResult(result)) }
+    await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText('계약 검증 요청이 처리되었습니다.')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    const [url, init] = backend.posts()[0]!
+    expect(String(url)).toBe(`https://api.test/api/v1/contract-versions/${versionId}:validate`)
+    expect(init?.body).toBe('{}'); expect(init?.credentials).toBe('include')
+    expect(new Headers(init?.headers).get('X-CSRF-Token')).toBe(sessionCsrf)
+    expect(new Headers(init?.headers).get('If-Match')).toBe(`"${resourceHash}"`)
+    expect(new Headers(init?.headers).get('Idempotency-Key')).toMatch(/^contract-validate-/)
+    expect(new Headers(init?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    expect(document.body.textContent).not.toContain(sessionCsrf)
+    expect(document.body.textContent).not.toContain(key)
+  })
+
+  it.each(['403', 'network', 'mismatch'] as const)('does not clear the key, load contracts or fall back after %s cookie confirmation failure', async failure => {
+    const backend = api(); const user = userEvent.setup(); const projected = sessionData()
+    sessionPage(backend, projected); let reads = 0
+    backend.handlers.session = () => {
+      if (++reads === 1) return response(projected)
+      if (failure === 'network') return Promise.reject(new TypeError(sessionCsrf))
+      return failure === '403' ? problem(403, 'CONTRACT_AUTH_REQUIRED') : response({ ...projected, actorId: 'different-reviewer' })
+    }
+    await user.type(screen.getByLabelText('검토자 키'), key)
+    await user.click(screen.getByRole('button', { name: '키로 세션 연결' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '키로 세션 연결' })).toBeEnabled())
+    expect(sessionGets(backend)).toHaveLength(2)
+    expect(contractGets(backend)).toHaveLength(0)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue(key)
+    expect(screen.getByLabelText('인증 방식')).toHaveValue('session')
+    unavailable('계약 목록 조회')
+    expect(document.body.textContent).not.toContain(sessionCsrf)
+    expect(backend.posts()).toHaveLength(0)
+  })
+
+  it.each(['input', 'release', 'client', 'mode'] as const)('discards a late connection after %s changes and holds the flight until settlement', async scope => {
+    const backend = api(); const user = userEvent.setup(); const pending = deferred<Response>()
+    const projected = sessionData(); const rendered = sessionPage(backend, projected)
+    backend.handlers.session = () => pending.promise
+    await user.type(screen.getByLabelText('검토자 키'), key)
+    await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+    expect(sessionGets(backend)).toHaveLength(1)
+    if (scope === 'input') await user.type(screen.getByLabelText('검토자 키'), '-new')
+    if (scope === 'release') await user.selectOptions(screen.getByLabelText('정책 Release'), secondReleaseId)
+    if (scope === 'client') rendered.rerender(<StoredContractReviewPage releases={[release(), release(secondReleaseId)]}
+      preferredReleaseId={releaseId} client={new ContractReviewClient('https://second.test')} />)
+    if (scope === 'mode') {
+      await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
+      await user.selectOptions(screen.getByLabelText('인증 방식'), 'session')
+    }
+    unavailable('기존 세션 복원'); unavailable('키로 세션 연결')
+    expect(sessionGets(backend)).toHaveLength(1)
+    expect(sessionGets(backend)[0]![1]?.signal).toBeUndefined()
+    await act(async () => pending.resolve(response(projected)))
+    expect(contractGets(backend)).toHaveLength(0)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue(scope === 'input' ? `${key}-new` : key)
+    expect(screen.queryByRole('button', { name: '계약 loan-review v7 선택' })).not.toBeInTheDocument()
+    unavailable('계약 목록 조회')
+    expect(backend.posts()).toHaveLength(0)
+  })
+
+  it('does not display an obsolete connection failure over a newer key', async () => {
+    const backend = api(); const user = userEvent.setup(); const pending = deferred<Response>()
+    sessionPage(backend); backend.handlers.session = () => pending.promise
+    await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+    await user.type(screen.getByLabelText('검토자 키'), `${key}-new`)
+    await act(async () => pending.reject(new TypeError(sessionCsrf)))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expect(screen.getByLabelText('검토자 키')).toHaveValue(`${key}-new`)
+    expect(contractGets(backend)).toHaveLength(0)
+  })
+
+  it('keeps the same client handshake lock across unmount and requires a new explicit restore after settlement', async () => {
+    const backend = api(); const user = userEvent.setup(); const pending = deferred<Response>()
+    const projected = sessionData(); const first = sessionPage(backend, projected)
+    backend.handlers.session = () => pending.promise
+    await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+    first.unmount()
+    sessionPage(backend, projected, first.connectedClient)
+    await user.type(screen.getByLabelText('검토자 키'), `${key}-new`)
+    await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+    expect(await screen.findByText('이전 세션 연결 응답을 기다린 뒤 다시 연결해 주세요.')).toBeInTheDocument()
+    expect(sessionGets(backend)).toHaveLength(1)
+    await act(async () => pending.resolve(response(projected)))
+    expect(screen.getByLabelText('검토자 키')).toHaveValue(`${key}-new`)
+    expect(contractGets(backend)).toHaveLength(0)
+    backend.handlers.session = () => response(projected)
+    await restoreSession(user)
+    expect(sessionGets(backend)).toHaveLength(2)
+    expect(contractGets(backend)).toHaveLength(1)
+    expect(screen.getByLabelText('검토자 키')).toHaveValue('')
+  })
+
+  it('invalidates consent on explicit local selection and omits cookies even after a confirmed session', async () => {
+    const backend = api([validated()]); const user = userEvent.setup(); sessionPage(backend)
+    await restoreSession(user); await selectVersion(user, validated()); await confirm(user, '승인')
+    await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    await load(user, validated())
+    for (const [, init] of contractGets(backend).slice(2)) {
+      expect(init?.credentials).toBe('omit')
+      expect(new Headers(init?.headers).get('X-Contract-Reviewer-Key')).toBe(key)
+      expect(new Headers(init?.headers).has('X-CSRF-Token')).toBe(false)
+    }
+    await user.click(screen.getByRole('button', { name: '승인 검토' }))
+    const dialog = screen.getByRole('dialog', { name: '계약 승인 확인' })
+    expect(within(dialog).getByRole('checkbox', { name: consent })).not.toBeChecked()
+    expect(within(dialog).getByLabelText('검토 의견')).toHaveValue('')
+    expect(sessionGets(backend)).toHaveLength(1)
+    expect(backend.posts()).toHaveLength(0)
+  })
+})
+
+describe('reviewer session expiry and preserved request outcomes', () => {
+  it('expires an open consent dialog and rejects new dispatch without automatically reconnecting', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api([validated()]); sessionPage(backend, sessionData({ expiresAt: Date.now() / 1000 + 5 }))
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '계약 loan-review v7 선택' })) })
+      fireEvent.click(screen.getByRole('button', { name: '승인 검토' }))
+      const dialog = screen.getByRole('dialog', { name: '계약 승인 확인' })
+      fireEvent.change(within(dialog).getByLabelText('검토 의견'), { target: { value: '만료 전 명시적 검토 의견' } })
+      fireEvent.click(within(dialog).getByRole('checkbox', { name: consent }))
+      expect(within(dialog).getByRole('button', { name: '승인 요청 전송' })).toBeEnabled()
+      const count = backend.fetchMock.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByText(expiredSessionMessage)).toBeInTheDocument()
+      expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+      expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+      unavailable('계약 목록 조회'); unavailable('계약 검증'); unavailable('승인 검토')
+      await act(async () => { await vi.advanceTimersByTimeAsync(60000) })
+      expect(backend.fetchMock).toHaveBeenCalledTimes(count)
+      expect(backend.posts()).toHaveLength(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('does not overflow a representable long session expiry into immediate disconnection', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api(); sessionPage(backend, sessionData({ expiresAt: Date.now() / 1000 + 3_000_000 }))
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+      expect(screen.getByRole('button', { name: '계약 loan-review v7 선택' })).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(1000) })
+      expect(screen.queryByText(expiredSessionMessage)).not.toBeInTheDocument()
+      expect(screen.getByRole('button', { name: '계약 목록 조회' })).toBeEnabled()
+      expect(sessionGets(backend)).toHaveLength(1)
+      expect(contractGets(backend)).toHaveLength(1)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['list', 'review'] as const)('does not apply a late %s after expiry while the expiry timer has not run', async stage => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api([validated()]); const user = userEvent.setup(); const pending = deferred<Response>()
+      const expiresAt = Date.now() / 1000 + 3600
+      sessionPage(backend, sessionData({ expiresAt }))
+      if (stage === 'list') backend.handlers.list = () => pending.promise
+      else backend.handlers.detail = () => pending.promise
+      await user.click(screen.getByRole('button', { name: '기존 세션 복원' }))
+      if (stage === 'review') await user.click(await screen.findByRole('button', { name: '계약 loan-review v7 선택' }))
+      const count = backend.fetchMock.mock.calls.length
+      vi.setSystemTime(expiresAt * 1000 + 1)
+      await act(async () => pending.resolve(response(stage === 'list' ? [platformVersion(validated())] : validated())))
+      expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+      if (stage === 'list') expect(screen.queryByRole('button', { name: '계약 loan-review v7 선택' })).not.toBeInTheDocument()
+      unavailable('승인 검토'); unavailable('계약 검증')
+      expect(backend.fetchMock).toHaveBeenCalledTimes(count)
+      expect(backend.posts()).toHaveLength(0)
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['mutation', 'generation'] as const)('records a valid sent %s receipt after expiry without reviving the UI or issuing a follow-up GET', async kind => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api(); const pending = deferred<Response>()
+      sessionPage(backend, sessionData({ expiresAt: Date.now() / 1000 + 5 }))
+      backend.handlers.post = () => pending.promise
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '계약 loan-review v7 선택' })) })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: kind === 'mutation' ? '계약 검증' : '초기 계약 후보 생성' })) })
+      expect(backend.posts()).toHaveLength(1)
+      expect(screen.getByText(kind === 'mutation' ? '확인할 이전 요청 1건' : '생성 접수 응답 대기 중')).toBeInTheDocument()
+      const count = backend.fetchMock.mock.calls.length
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByText(expiredSessionMessage)).toBeInTheDocument()
+      expect(backend.posts()[0]![1]?.signal?.aborted).toBe(true)
+      await act(async () => pending.resolve(kind === 'mutation' ? response(validationResult(validated())) : admitted()))
+      expect(screen.queryByText(kind === 'mutation' ? '확인할 이전 요청 1건' : '생성 접수 응답 대기 중')).not.toBeInTheDocument()
+      expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+      expect(screen.queryByText('계약 검증 요청이 처리되었습니다.')).not.toBeInTheDocument()
+      expect(backend.fetchMock).toHaveBeenCalledTimes(count)
+      expect(operationGets(backend)).toHaveLength(0)
+      if (kind === 'generation') {
+        backend.handlers.session = () => response(sessionData())
+        await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+        expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+        unavailable('초기 계약 후보 생성')
+        expect(operationGets(backend)).toHaveLength(0)
+      }
+    } finally { vi.useRealTimers() }
+  })
+
+  it.each(['expired', '403', 'network'] as const)('preserves an earlier unknown mutation after a %s retry and never grants old retry authority to a renewed session', async failure => {
+    vi.useFakeTimers({ toFake: ['Date'] })
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api(); const user = userEvent.setup(); const expiresAt = Date.now() / 1000 + 3600
+      sessionPage(backend, sessionData({ expiresAt }))
+      backend.handlers.post = () => Promise.reject(new TypeError(key))
+      await restoreSession(user); await selectVersion(user)
+      await user.click(screen.getByRole('button', { name: '계약 검증' }))
+      expect(await screen.findByText('요청 처리 여부가 미확정입니다.')).toBeInTheDocument()
+      await user.click(screen.getByRole('button', { name: '처리 상태 다시 조회' }))
+      await waitFor(() => expect(screen.getByRole('button', { name: '동일 요청 재전송 검토' })).toBeEnabled())
+      await user.click(screen.getByRole('button', { name: '동일 요청 재전송 검토' }))
+      const dialog = screen.getByRole('dialog', { name: '동일 요청 재전송 확인' })
+      await user.click(within(dialog).getByRole('checkbox', { name: retryConsent }))
+      if (failure === 'expired') vi.setSystemTime(expiresAt * 1000 + 1)
+      backend.handlers.post = () => failure === '403' ? problem(403, 'CONTRACT_AUTH_REQUIRED') : Promise.reject(new TypeError(sessionCsrf))
+      await user.click(within(dialog).getByRole('button', { name: '동일 요청 재전송' }))
+      expect(backend.posts()).toHaveLength(failure === 'expired' ? 1 : 2)
+      expect(screen.getByText('확인할 이전 요청 1건')).toBeInTheDocument()
+      if (failure !== 'expired') {
+        const [original, retried] = backend.posts()
+        expect(retried![0]).toBe(original![0]); expect(retried![1]?.body).toBe(original![1]?.body)
+        expect(Object.fromEntries(new Headers(retried![1]?.headers))).toEqual(Object.fromEntries(new Headers(original![1]?.headers)))
+      }
+      backend.handlers.session = () => response(sessionData({ csrfToken: `${sessionCsrf}-renewed` }))
+      await restoreSession(user); await selectVersion(user)
+      await user.click(screen.getByRole('button', { name: '처리 상태 다시 조회' }))
+      await screen.findByLabelText('계약 JSON')
+      expect(screen.getByText('요청 처리 여부가 미확정입니다.')).toBeInTheDocument()
+      unavailable('동일 요청 재전송 검토'); unavailable('계약 검증'); unavailable('거절 검토')
+      expect(backend.posts()).toHaveLength(failure === 'expired' ? 1 : 2)
+      expect(document.body.textContent).not.toContain(sessionCsrf)
+    } finally { vi.useRealTimers() }
+  })
+
+  it('retains unknown generation across session expiry and renewal without inventing an Operation ID or resubmitting', async () => {
+    vi.useFakeTimers()
+    try {
+      vi.setSystemTime(new Date('2026-09-17T13:00:00Z'))
+      const backend = api(); sessionPage(backend, sessionData({ expiresAt: Date.now() / 1000 + 5 }))
+      backend.handlers.post = () => Promise.reject(new TypeError(generationCanary))
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '초기 계약 후보 생성' })) })
+      expect(screen.getByText('생성 접수 여부 미확정')).toBeInTheDocument()
+      await act(async () => { await vi.advanceTimersByTimeAsync(5000) })
+      expect(screen.getByText(expiredSessionMessage)).toBeInTheDocument()
+      expect(screen.getByText('생성 접수 여부 미확정')).toBeInTheDocument()
+      backend.handlers.session = () => response(sessionData())
+      await act(async () => { fireEvent.click(screen.getByRole('button', { name: '기존 세션 복원' })) })
+      unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성'); unavailable('생성 상태 다시 조회')
+      expect(screen.getByText('생성 접수 여부 미확정')).toBeInTheDocument()
+      expect(operationGets(backend)).toHaveLength(0)
+      expect(backend.posts()).toHaveLength(1)
+    } finally { vi.useRealTimers() }
+  })
+})
+
+describe('known generation Operation session principal boundaries', () => {
+  it.each(['same-principal', 'actor', 'client'] as const)('keeps a single pending Operation read across %s reconnection and discards the old terminal response', async scope => {
+    const backend = api(); const user = userEvent.setup(); const projected = sessionData()
+    const rendered = sessionPage(backend, projected); const pending = deferred<Response>()
+    let outstanding = 0; let maximum = 0
+    backend.handlers.post = () => admitted()
+    backend.handlers.operation = () => {
+      outstanding++; maximum = Math.max(maximum, outstanding)
+      return pending.promise.finally(() => { outstanding-- })
+    }
+    await restoreSession(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    await waitFor(() => expect(operationGets(backend)).toHaveLength(1))
+    const oldSignal = operationGets(backend)[0]![1]?.signal
+    backend.handlers.session = () => response({ ...projected, csrfToken: `${sessionCsrf}-renewed`,
+      actorId: scope === 'actor' ? 'other-policy-reviewer' : sessionActor })
+    if (scope === 'client') rendered.rerender(<StoredContractReviewPage releases={[release(), release(secondReleaseId)]}
+      preferredReleaseId={releaseId} client={new ContractReviewClient('https://api.test')} />)
+    await restoreSession(user)
+    expect(oldSignal?.aborted).toBe(true)
+    unavailable('생성 상태 다시 조회')
+    expect(operationGets(backend)).toHaveLength(1)
+    await act(async () => pending.resolve(response(generationView('CONTRACT', 'SUCCEEDED', 'VALID'))))
+    expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    unavailable('생성된 후보 검토')
+    backend.handlers.operation = () => {
+      outstanding++; maximum = Math.max(maximum, outstanding); outstanding--
+      return response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID'))
+    }
+    if (scope === 'same-principal') {
+      await user.click(screen.getByRole('button', { name: '생성 상태 다시 조회' }))
+      expect(await generationRegion().findByText('INVALID')).toBeInTheDocument()
+      expect(operationGets(backend)).toHaveLength(2)
+    } else {
+      unavailable('생성 상태 다시 조회'); unavailable('초기 계약 후보 생성')
+      expect(operationGets(backend)).toHaveLength(1)
+      expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    }
+    expect(maximum).toBe(1); expect(outstanding).toBe(0)
+    expect(backend.posts()).toHaveLength(1)
+  })
+
+  it.each(['actor', 'workspace', 'client', 'local-origin'] as const)('keeps a QUEUED operation locked without an old-ID GET after %s changes', async scope => {
+    const backend = api(); const user = userEvent.setup(); const projected = sessionData()
+    const rendered = sessionPage(backend, projected)
+    backend.handlers.post = () => admitted()
+    backend.handlers.operation = () => problem(503, generationCanary)
+    if (scope === 'local-origin') await loadList(user)
+    else await restoreSession(user)
+    await user.click(screen.getByRole('button', { name: '초기 계약 후보 생성' }))
+    expect(await screen.findByText('생성 상태 조회 실패')).toBeInTheDocument()
+    expect(operationGets(backend)).toHaveLength(1)
+    expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    if (scope === 'actor') backend.handlers.session = () => response({ ...projected, actorId: 'another-policy-reviewer' })
+    if (scope === 'workspace') {
+      const otherWorkspace = '019903ac-abcd-7000-8000-000000000099'
+      backend.handlers.session = () => response({ ...projected, workspaceId: otherWorkspace })
+      backend.views.set(versionId, snapshot({ identity: { ...snapshot().identity, workspaceId: otherWorkspace } }))
+    }
+    if (scope === 'client') rendered.rerender(<StoredContractReviewPage releases={[release(), release(secondReleaseId)]}
+      preferredReleaseId={releaseId} client={new ContractReviewClient('https://api.test')} />)
+    if (scope === 'local-origin') await user.selectOptions(screen.getByLabelText('인증 방식'), 'session')
+    await restoreSession(user)
+    backend.handlers.operation = () => response(generationView('CONTRACT', 'SUCCEEDED', 'INVALID'))
+    unavailable('생성 상태 다시 조회'); unavailable('초기 계약 후보 생성'); unavailable('패치 후보 생성')
+    unavailable('생성된 후보 검토')
+    expect(generationRegion().getByText('QUEUED')).toBeInTheDocument()
+    expect(operationGets(backend)).toHaveLength(1)
+    expect(backend.posts()).toHaveLength(1)
+    expect(document.body.textContent).not.toContain(sessionCsrf)
+  })
+
+  it('allows an explicit known-ID read for the same client and public principal without adopting a prior epoch candidate or proposal', async () => {
+    const candidate = validated({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 }, resourceHash: changedHash })
+    const backend = api(); const user = userEvent.setup(); const projected = sessionData()
+    sessionPage(backend, projected)
+    backend.handlers.post = () => admitted('PATCH')
+    backend.handlers.operation = () => problem(503, generationCanary)
+    await restoreSession(user); await selectVersion(user); await startPatch(user)
+    expect(await screen.findByText('생성 상태 조회 실패')).toBeInTheDocument()
+    expect(operationGets(backend)).toHaveLength(1)
+    backend.handlers.session = () => response({ ...projected, csrfToken: `${sessionCsrf}-renewed`, expiresAt: projected.expiresAt + 300 })
+    await restoreSession(user)
+    expect(operationGets(backend)).toHaveLength(1)
+    backend.handlers.operation = () => {
+      backend.views.set(secondVersionId, candidate)
+      return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate))
+    }
+    await user.click(screen.getByRole('button', { name: '생성 상태 다시 조회' }))
+    expect(await generationRegion().findByText('PROPOSED')).toBeInTheDocument()
+    expect(operationGets(backend)).toHaveLength(2)
+    expect(String(operationGets(backend)[1]![0])).toBe(`https://api.test/api/v1/operations/${generationId}`)
+    expect(operationGets(backend)[1]![1]?.credentials).toBe('include')
+    expect(new Headers(operationGets(backend)[1]![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    unavailable('생성된 후보 검토')
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    // A known status read never rebases the old record's epoch or authorizes proposal adoption.
+    await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
+    await selectVersion(user, candidate)
+    unavailable('생성된 후보 검토')
+    backend.handlers.post = () => problem(409, 'RESOURCE_CONFLICT')
+    const dialog = await confirm(user, '승인')
+    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    expect(await screen.findByText('이전 동의를 해제했습니다. 최신 내용을 확인하고 다시 검토해 주세요.')).toBeInTheDocument()
+    expect(JSON.parse(String(backend.posts()[1]![1]?.body))).toEqual({ comment: '변경 범위와 검증 결과 확인' })
+    expect(new Headers(backend.posts()[1]![1]?.headers).get('X-CSRF-Token')).toBe(`${sessionCsrf}-renewed`)
+    expect(generationPosts(backend)).toHaveLength(1)
+  })
+
+  it('invalidates already adopted proposal consent on same-principal reconnection', async () => {
+    const candidate = validated({ identity: { ...snapshot().identity, versionId: secondVersionId, version: 8 }, resourceHash: changedHash })
+    const backend = api(); const user = userEvent.setup(); const projected = sessionData()
+    sessionPage(backend, projected)
+    backend.handlers.post = () => admitted('PATCH')
+    backend.handlers.operation = () => {
+      backend.views.set(secondVersionId, candidate)
+      return response(generationView('PATCH', 'SUCCEEDED', 'PROPOSED', candidate))
+    }
+    await restoreSession(user); await selectVersion(user); await startPatch(user)
+    await user.click(await screen.findByRole('button', { name: '생성된 후보 검토' }))
+    await screen.findByLabelText('계약 JSON')
+    await confirm(user, '승인', '이전 세션에서 검토한 패치')
+    backend.handlers.session = () => response({ ...projected, csrfToken: `${sessionCsrf}-renewed` })
+    await restoreSession(user)
+    expect(screen.queryByRole('dialog')).not.toBeInTheDocument()
+    expect(screen.queryByLabelText('계약 JSON')).not.toBeInTheDocument()
+    await selectVersion(user, candidate)
+    unavailable('생성된 후보 검토')
+    await user.click(screen.getByRole('button', { name: '승인 검토' }))
+    const dialog = screen.getByRole('dialog', { name: '계약 승인 확인' })
+    expect(within(dialog).getByLabelText('검토 의견')).toHaveValue('')
+    expect(within(dialog).getByRole('checkbox', { name: consent })).not.toBeChecked()
+    expect(backend.posts()).toHaveLength(1)
+    expect(operationGets(backend)).toHaveLength(1)
   })
 })

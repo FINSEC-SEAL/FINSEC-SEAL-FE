@@ -5,6 +5,7 @@ import {
   readContractListResponse,
   readContractProblem,
   readContractUuid,
+  readContractValidationResponse,
   readContractVersionResponse,
   readStoredContractReviewResponse,
 } from './wire'
@@ -74,6 +75,58 @@ function expectInvalid(action: () => unknown) {
     expect(JSON.stringify(error)).not.toContain(canary)
   }
 }
+
+// ContractPersistenceService.validationResult emits these fields without a full version identity.
+function canonicalValidation(status = 'VALID', overrides: Record<string, unknown> = {}) {
+  return {
+    versionId: identity.versionId, state: status === 'INVALID' ? 'CANDIDATE' : 'VALIDATED',
+    policyHash, resourceHash: changedHash, status,
+    issues: status === 'VALID' ? [] : [{ jsonPointer: '/purpose', code: 'STORED_ISSUE',
+      severity: status === 'INVALID' ? 'ERROR' : 'WARNING', message: 'Stored validation issue' }],
+    validationProof: { private: canary },
+    ...overrides,
+  }
+}
+
+describe('canonical validation receipts', () => {
+  it.each(['VALID', 'WARN', 'INVALID'])('reads actual %s evidence without inventing identity or retaining private proof', status => {
+    const source = canonicalValidation(status, { workspaceId: canary, releaseId: canary, contractKey: canary, version: canary })
+    const result = readContractValidationResponse(envelope(source), identity.versionId)
+    expect(result).toEqual({ versionId: identity.versionId, state: source.state, policyHash, resourceHash: changedHash,
+      validation: { status, issues: source.issues } })
+    expect(JSON.stringify(result)).not.toContain(canary)
+    expect(result).not.toHaveProperty('identity')
+    for (const name of ['workspaceId', 'releaseId', 'contractKey', 'version', 'validationProof']) expect(result).not.toHaveProperty(name)
+    expect(Object.isFrozen(result)).toBe(true)
+    expect(Object.isFrozen(result.validation)).toBe(true)
+    expect(Object.isFrozen(result.validation.issues)).toBe(true)
+    if (source.issues[0]) {
+      source.issues[0].message = canary
+      expect(result.validation.issues[0]?.message).toBe('Stored validation issue')
+      expect(Object.isFrozen(result.validation.issues[0])).toBe(true)
+    }
+  })
+
+  it.each(['versionId', 'state', 'policyHash', 'resourceHash', 'status', 'issues'])('requires the canonical own %s field', name => {
+    const source: Record<string, unknown> = canonicalValidation()
+    delete source[name]
+    expectInvalid(() => readContractValidationResponse(envelope(source), identity.versionId))
+  })
+
+  it.each([
+    { versionId: otherId }, { versionId: canary }, { policyHash: canary }, { resourceHash: 'sha256:short' },
+    { state: 'APPROVED' }, { state: 'CANDIDATE' }, { status: 'WARN', issues: [] },
+    { status: 'INVALID', issues: [] }, { status: 'UNKNOWN' }, { issues: null },
+    { issues: [{ jsonPointer: '/purpose', code: 'X', severity: 'ERROR', message: 'X' }] },
+  ])('rejects malformed or contradictory validation receipts', overrides => {
+    expectInvalid(() => readContractValidationResponse(envelope(canonicalValidation('VALID', overrides)), identity.versionId))
+  })
+
+  it('rejects an otherwise valid INVALID result marked VALIDATED and legacy Version shapes', () => {
+    expectInvalid(() => readContractValidationResponse(envelope(canonicalValidation('INVALID', { state: 'VALIDATED' })), identity.versionId))
+    expectInvalid(() => readContractValidationResponse(envelope(platformVersion()), identity.versionId))
+  })
+})
 
 describe('contract response projections', () => {
   it('maps A flat ids to selected identities while discarding policy and private evidence', () => {

@@ -1,6 +1,7 @@
 import { ContractRequestError, ContractReviewClient, prepareContractMutation, prepareInitialGeneration, preparePatchGeneration,
   type ContractAction, type PreparedContractMutation, type PreparedGeneration, type GenerationOperationReference,
   type ProposedPatchOperation } from './client'
+import { readReviewerSessionResponse, type ReviewerSession } from './reviewerSession'
 
 const identity = {
   versionId: '019903ac-abcd-7000-8000-000000000003',
@@ -23,6 +24,14 @@ function version(overrides: Record<string, unknown> = {}) {
   return { id: identity.versionId, workspaceId: identity.workspaceId, releaseId: identity.releaseId,
     contractKey: identity.contractKey, version: identity.version, state: 'VALIDATED', policyHash, resourceHash,
     policy: { private: reviewerKey }, validation: {}, review: {}, ...overrides }
+}
+
+function validationResult(status = 'VALID', overrides: Record<string, unknown> = {}) {
+  return { versionId: identity.versionId, state: status === 'INVALID' ? 'CANDIDATE' : 'VALIDATED',
+    policyHash, resourceHash: changedHash, status,
+    issues: status === 'VALID' ? [] : [{ jsonPointer: '/purpose', code: 'STORED_ISSUE',
+      severity: status === 'INVALID' ? 'ERROR' : 'WARNING', message: 'Stored validation issue' }],
+    validationProof: { private: reviewerKey }, ...overrides }
 }
 
 function review(overrides: Record<string, unknown> = {}) {
@@ -98,7 +107,7 @@ describe('stored contract review transport', () => {
     const result = await client.executeMutation(prepared, reviewerKey)
     expect(result.state).toBe('APPROVED')
     const [url, init] = fetchMock.mock.calls[0]!
-    expect(url).toBe(`https://api.test/api/v1/platform/contracts/${identity.versionId}:approve`)
+    expect(url).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:approve`)
     expect(init).toMatchObject({ method: 'POST', body: JSON.stringify({ comment }), credentials: 'omit', redirect: 'error', cache: 'no-store' })
     expect(Object.fromEntries(new Headers(init?.headers))).toEqual({
       accept: 'application/json', 'x-contract-reviewer-key': reviewerKey,
@@ -121,6 +130,7 @@ describe('stored contract review transport', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
     const first = fetchMock.mock.calls[0]!
     const second = fetchMock.mock.calls[1]!
+    expect(first[0]).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:reject`)
     expect(second[0]).toBe(first[0])
     expect(second[1]?.body).toBe(first[1]?.body)
     expect(Object.fromEntries(new Headers(second[1]?.headers))).toEqual(Object.fromEntries(new Headers(first[1]?.headers)))
@@ -131,7 +141,7 @@ describe('stored contract review transport', () => {
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000011')
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000012')
     const fetchMock = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(response(envelope(version({ resourceHash: changedHash }))))
+      .mockResolvedValueOnce(response(envelope(validationResult())))
       .mockResolvedValueOnce(response(envelope(review({ state: 'VALIDATED', resourceHash: changedHash, validation: { status: 'VALID', issues: [] } }))))
       .mockResolvedValueOnce(response(envelope(version({ state: 'APPROVED', resourceHash: changedHash }))))
     const validate = operation()
@@ -140,14 +150,21 @@ describe('stored contract review transport', () => {
     const approve = prepareContractMutation('approve', fresh, '새 검증 결과 검토')
     await client.executeMutation(approve, reviewerKey)
     expect(validate.body).toBe('{}')
+    expect(fetchMock.mock.calls[0]![0]).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:validate`)
+    expect(fetchMock.mock.calls[1]![0]).toBe(`https://api.test/api/v1/platform/contracts/${identity.versionId}/review`)
     expect(approve.idempotencyKey).not.toBe(validate.idempotencyKey)
     expect(approve.ifMatch).toBe(`"${changedHash}"`)
     expect(new Headers(fetchMock.mock.calls[2]![1]?.headers).get('If-Match')).toBe(`"${changedHash}"`)
   })
 
-  it('accepts the actual invalid-validation response remaining CANDIDATE', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response(envelope(version({ state: 'CANDIDATE', resourceHash: changedHash }))))
-    expect((await client.executeMutation(operation(), reviewerKey)).state).toBe('CANDIDATE')
+  it.each(['VALID', 'WARN', 'INVALID'])('accepts the canonical %s validation receipt without manufacturing identity', async status => {
+    const source = validationResult(status)
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response(envelope(source)))
+    const result = await client.executeMutation(operation(), reviewerKey)
+    expect(result).toEqual({ versionId: identity.versionId, state: source.state, policyHash, resourceHash: changedHash,
+      validation: { status, issues: source.issues } })
+    expect(result).not.toHaveProperty('identity')
+    expect(JSON.stringify(result)).not.toContain(reviewerKey)
   })
 
   it.each([
@@ -181,9 +198,11 @@ describe('stored contract review transport', () => {
   it.each([
     () => new Response('{', { status: 200 }),
     () => response({ traceId, timestamp: 'now' }),
-    () => response(envelope(version({ id: traceId }))),
-    () => response(envelope(version({ releaseId: traceId }))),
-    () => response(envelope(version({ state: 'APPROVED' }))),
+    () => response(envelope(validationResult('VALID', { versionId: traceId }))),
+    () => response(envelope(validationResult('VALID', { resourceHash: reviewerKey }))),
+    () => response(envelope(validationResult('VALID', { state: 'APPROVED' }))),
+    () => response(envelope(validationResult('INVALID', { state: 'VALIDATED' }))),
+    () => response(envelope(version())),
     () => new Response(null, { status: 204 }),
   ])('treats malformed or mismatched successful mutation responses as unknown outcomes', async makeResponse => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(makeResponse())
@@ -191,6 +210,20 @@ describe('stored contract review transport', () => {
     assertSafeError(error)
     expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown', retryable: false })
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['approve', 'reject'] as const)('keeps every full identity binding for canonical %s detail responses', async action => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const fields = ['id', 'workspaceId', 'releaseId', 'contractKey', 'version']
+    for (const field of fields) {
+      const state = action === 'approve' ? 'APPROVED' : 'REJECTED'
+      fetchMock.mockResolvedValueOnce(response(envelope(version({ state,
+        [field]: field === 'version' ? 8 : field === 'contractKey' ? 'another-contract' : traceId }))))
+      const error: unknown = await client.executeMutation(operation(action), reviewerKey).catch(error => error)
+      assertSafeError(error)
+      expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(fields.length)
   })
 
   it('does not equate an aborted response wait with cancellation of the server mutation', async () => {
@@ -557,5 +590,361 @@ describe('contract generation operation transport', () => {
     const prepare = prepareContractMutation as (action: ContractAction, target: { identity: typeof identity; resourceHash: string; policyHash: string }, comment: string, proposal: ProposedPatchOperation) => PreparedContractMutation
     expect(() => prepare(mismatch === 'action' ? 'reject' : 'approve', { identity, resourceHash, policyHash }, '확인', patch as unknown as ProposedPatchOperation)).toThrow(ContractRequestError)
     expect(fetchMock).not.toHaveBeenCalled()
+  })
+})
+
+const sessionNow = Date.parse('2026-09-17T12:00:00Z')
+const csrfToken = 'SYNTHETIC_CSRF_CANARY_opaque+/=token'
+const sessionExpiresAt = sessionNow / 1000 + 1800
+function sessionView(overrides: Record<string, unknown> = {}) {
+  return { actorId: 'session-reviewer', workspaceId: identity.workspaceId, role: 'AI_SECURITY_REVIEWER',
+    csrfToken, expiresAt: sessionExpiresAt, private: reviewerKey, ...overrides }
+}
+
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (error: unknown) => void
+  const promise = new Promise<T>((accept, fail) => { resolve = accept; reject = fail })
+  return { promise, resolve, reject }
+}
+
+function heldBody(status = 200, headers: Record<string, string> = {}) {
+  const body = deferred<unknown>(), entered = deferred<void>()
+  const value = response(null, status, headers)
+  vi.spyOn(value, 'json').mockImplementation(() => { entered.resolve(); return body.promise })
+  return { response: value, body, entered: entered.promise }
+}
+
+async function restoredClient() {
+  const subject = new ContractReviewClient('https://api.test/')
+  const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(envelope(sessionView())))
+  const credential = await subject.connectReviewerSession()
+  return { subject, credential, fetchMock }
+}
+
+function assertSessionErrorSafe(error: unknown) {
+  assertSafeError(error)
+  expect(String(error)).not.toContain(csrfToken)
+  expect(JSON.stringify(error)).not.toContain(csrfToken)
+}
+
+describe('reviewer session transport', () => {
+  beforeEach(() => { vi.spyOn(Date, 'now').mockReturnValue(sessionNow) })
+
+  it('confirms key exchange with a second cookie-only GET and returns only a frozen session projection', async () => {
+    const subject = new ContractReviewClient('https://api.test/')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response(envelope(sessionView())))
+      .mockResolvedValueOnce(response(envelope(sessionView())))
+    const credential = await subject.connectReviewerSession(reviewerKey)
+    expect(credential).toEqual({ kind: 'session', actorId: 'session-reviewer', workspaceId: identity.workspaceId,
+      role: 'AI_SECURITY_REVIEWER', csrfToken, expiresAt: sessionExpiresAt })
+    expect(Object.isFrozen(credential)).toBe(true)
+    expect(JSON.stringify(credential)).not.toContain(reviewerKey)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    for (const [index, [url, init]] of fetchMock.mock.calls.entries()) {
+      expect(url).toBe('https://api.test/api/v1/reviewer-session')
+      expect(init).toMatchObject({ method: 'GET', credentials: 'include', redirect: 'error', cache: 'no-store' })
+      expect(init?.body).toBeUndefined()
+      expect(init?.signal).toBeUndefined()
+      expect(Object.fromEntries(new Headers(init?.headers))).toEqual(index === 0
+        ? { accept: 'application/json', 'x-contract-reviewer-key': reviewerKey } : { accept: 'application/json' })
+    }
+  })
+
+  it('restores with one cookie-only GET and accepts the original registered credential for a read', async () => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    expect(Object.fromEntries(new Headers(fetchMock.mock.calls[0]![1]?.headers))).toEqual({ accept: 'application/json' })
+    fetchMock.mockResolvedValueOnce(response(envelope([version()])))
+    expect((await subject.listVersions(identity.releaseId, credential))[0]!.identity).toEqual(identity)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each([
+    ['actorId', 'another-reviewer'], ['workspaceId', traceId], ['role', 'OPERATOR'],
+    ['csrfToken', 'another-opaque-token'], ['expiresAt', sessionExpiresAt + 1],
+  ])('rejects a changed confirmation %s without fallback or registration', async (field, value) => {
+    const subject = new ContractReviewClient('https://api.test/')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response(envelope(sessionView())))
+      .mockResolvedValueOnce(response(envelope(sessionView({ [field as string]: value }))))
+    const error: unknown = await subject.connectReviewerSession(reviewerKey).catch(error => error)
+    assertSessionErrorSafe(error)
+    expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    const unconfirmed = readReviewerSessionResponse(envelope(sessionView()))
+    await expect(subject.listVersions(identity.releaseId, unconfirmed)).rejects.toMatchObject({
+      code: 'CONTRACT_SESSION_INVALID', outcome: 'not_sent',
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['403', '503', 'network', 'abort', 'malformed'] as const)(
+    'does not retry or fall back after %s confirmation failure', async failure => {
+      const subject = new ContractReviewClient('https://api.test/')
+      const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(envelope(sessionView())))
+      if (failure === 'network' || failure === 'abort') {
+        fetchMock.mockRejectedValueOnce(failure === 'abort' ? new DOMException(csrfToken, 'AbortError') : new TypeError(reviewerKey))
+      } else if (failure === 'malformed') fetchMock.mockResolvedValueOnce(response(envelope({ private: csrfToken })))
+      else fetchMock.mockResolvedValueOnce(response({ code: 'CONTRACT_AUTH_REQUIRED', detail: `${reviewerKey}${csrfToken}` }, Number(failure)))
+      const error: unknown = await subject.connectReviewerSession(reviewerKey).catch(error => error)
+      assertSessionErrorSafe(error)
+      expect(error).toMatchObject({ outcome: failure === '403' ? 'rejected' : 'unknown' })
+      expect(fetchMock).toHaveBeenCalledTimes(2)
+      expect(fetchMock.mock.calls.every(([, init]) => init?.method === 'GET')).toBe(true)
+      expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+    })
+
+  it('does not confirm malformed issuance and releases the lock only for an explicit next connection', async () => {
+    const subject = new ContractReviewClient('https://api.test/')
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(response(envelope(sessionView({ expiresAt: sessionNow / 1000 }))))
+      .mockResolvedValueOnce(response(envelope(sessionView())))
+    await expect(subject.connectReviewerSession(reviewerKey)).rejects.toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+    await subject.connectReviewerSession()
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(new Headers(fetchMock.mock.calls[1]![1]?.headers).has('X-Contract-Reviewer-Key')).toBe(false)
+  })
+
+  it('holds one connection through delayed headers, issuance body and confirmation body', async () => {
+    const subject = new ContractReviewClient('https://api.test/')
+    const headers = deferred<Response>(), first = heldBody(), confirmation = heldBody()
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockReturnValueOnce(headers.promise)
+      .mockResolvedValueOnce(confirmation.response).mockResolvedValueOnce(response(envelope(sessionView())))
+    const pending = subject.connectReviewerSession(reviewerKey)
+    const rejectOverlap = async (calls: number) => {
+      await expect(subject.connectReviewerSession()).rejects.toMatchObject({
+        code: 'CONTRACT_SESSION_CONNECTION_PENDING', outcome: 'not_sent',
+      })
+      expect(fetchMock).toHaveBeenCalledTimes(calls)
+    }
+    await rejectOverlap(1)
+    headers.resolve(first.response)
+    await first.entered
+    await rejectOverlap(1)
+    first.body.resolve(envelope(sessionView()))
+    await confirmation.entered
+    await rejectOverlap(2)
+    confirmation.body.resolve(envelope(sessionView()))
+    expect(await pending).toMatchObject({ kind: 'session', csrfToken })
+    await subject.connectReviewerSession()
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls.every(([, init]) => init?.signal === undefined)).toBe(true)
+  })
+
+  it('keeps the connection pending until a failed confirmation body settles, then allows explicit restore', async () => {
+    const subject = new ContractReviewClient('https://api.test/'), confirmation = heldBody()
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(response(envelope(sessionView())))
+      .mockResolvedValueOnce(confirmation.response).mockResolvedValueOnce(response(envelope(sessionView())))
+    const pending = subject.connectReviewerSession(reviewerKey).catch(error => error as unknown)
+    await confirmation.entered
+    await expect(subject.connectReviewerSession(reviewerKey)).rejects.toMatchObject({ code: 'CONTRACT_SESSION_CONNECTION_PENDING', outcome: 'not_sent' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    confirmation.body.reject(new TypeError(`${reviewerKey}${csrfToken}`))
+    const error: unknown = await pending
+    assertSessionErrorSafe(error)
+    expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    await subject.connectReviewerSession()
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it.each(['restore', 'exchange'] as const)('rejects HTTP session %s before dispatch', async mode => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    await expect(new ContractReviewClient('http://api.test/').connectReviewerSession(mode === 'exchange' ? reviewerKey : undefined)).rejects.toMatchObject({
+      code: 'CONTRACT_SESSION_HTTPS_REQUIRED', outcome: 'not_sent',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+  })
+
+  it('rejects copied, direct-decoder and malformed credentials before dispatch', async () => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const candidates = [{ ...credential }, readReviewerSessionResponse(envelope(sessionView())), null, { kind: 'session' }]
+    for (const candidate of candidates) {
+      await expect(subject.listVersions(identity.releaseId, candidate as ReviewerSession)).rejects.toMatchObject({
+        code: 'CONTRACT_SESSION_INVALID', outcome: 'not_sent',
+      })
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['https://api.test/', 'https://other-api.test/'])(
+    'rejects a credential from another client at %s before fetch', async base => {
+      const { credential, fetchMock } = await restoredClient()
+      await expect(new ContractReviewClient(base).listVersions(identity.releaseId, credential)).rejects.toMatchObject({
+        code: 'CONTRACT_SESSION_INVALID', outcome: 'not_sent',
+      })
+      expect(fetchMock).toHaveBeenCalledTimes(1)
+    })
+
+  it.each(['list', 'review', 'operation'] as const)('uses cookie-only authentication for %s GET', async read => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const signal = new AbortController().signal
+    fetchMock.mockResolvedValueOnce(response(envelope(read === 'list' ? [version()] : read === 'review' ? review() : generation())))
+    if (read === 'list') await subject.listVersions(identity.releaseId, credential, signal)
+    else if (read === 'review') await subject.review(identity, credential, signal)
+    else await subject.generationOperation(generationReference(), credential, signal)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]![0]).toBe(read === 'list'
+      ? `https://api.test/api/v1/platform/contracts?releaseId=${identity.releaseId}`
+      : read === 'review' ? `https://api.test/api/v1/platform/contracts/${identity.versionId}/review` : `https://api.test${operationUrl}`)
+    const init = fetchMock.mock.calls[1]![1]
+    expect(init).toMatchObject({ method: 'GET', credentials: 'include', cache: 'no-store', redirect: 'error', signal })
+    expect(init?.body).toBeUndefined()
+    expect(Object.fromEntries(new Headers(init?.headers))).toEqual({ accept: 'application/json' })
+  })
+
+  it.each(['validate', 'approve', 'reject'] as const)('sends canonical %s with only CSRF and exact immutable intent', async action => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const prepared = operation(action), before = JSON.stringify(prepared), signal = new AbortController().signal
+    fetchMock.mockResolvedValueOnce(response(envelope(action === 'validate' ? validationResult()
+      : version({ state: action === 'approve' ? 'APPROVED' : 'REJECTED', resourceHash: changedHash }))))
+    await subject.executeMutation(prepared, credential, signal)
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [url, init] = fetchMock.mock.calls[1]!
+    expect(url).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:${action}`)
+    expect(init).toMatchObject({ method: 'POST', body: prepared.body, credentials: 'include', cache: 'no-store', redirect: 'error', signal })
+    expect(Object.fromEntries(new Headers(init?.headers))).toEqual({ accept: 'application/json', 'content-type': 'application/json',
+      'x-csrf-token': csrfToken, 'if-match': prepared.ifMatch, 'idempotency-key': prepared.idempotencyKey })
+    expect(JSON.stringify(prepared)).toBe(before)
+    expect(before).not.toContain(csrfToken)
+    expect(before).not.toContain(reviewerKey)
+  })
+
+  it.each(['CONTRACT', 'PATCH'] as const)('preserves %s generation body, identity and idempotency under session authentication', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const prepared = kind === 'CONTRACT' ? prepareInitialGeneration(identity.releaseId) : preparePatchGeneration(findingId, identity)
+    const before = JSON.stringify(prepared), signal = new AbortController().signal
+    fetchMock.mockResolvedValueOnce(response(envelope(generation(kind)), 202, { Location: operationUrl }))
+    expect((await subject.submitGeneration(prepared, credential, signal)).status).toBe('QUEUED')
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const [url, init] = fetchMock.mock.calls[1]!
+    expect(url).toBe(kind === 'CONTRACT' ? `https://api.test/api/v1/releases/${identity.releaseId}/contracts:generate`
+      : `https://api.test/api/v1/findings/${findingId}/patch-proposals`)
+    expect(init).toMatchObject({ method: 'POST', body: prepared.body, credentials: 'include', cache: 'no-store', redirect: 'error', signal })
+    expect(Object.fromEntries(new Headers(init?.headers))).toEqual({ accept: 'application/json', 'content-type': 'application/json',
+      'x-csrf-token': csrfToken, 'idempotency-key': prepared.idempotencyKey })
+    expect(JSON.stringify(prepared)).toBe(before)
+    expect(before).not.toContain(csrfToken)
+  })
+
+  it('retains the server proposal binding in session approval bytes', async () => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    fetchMock.mockResolvedValueOnce(response(envelope(generation('PATCH', 'SUCCEEDED', 'PROPOSED'))))
+      .mockResolvedValueOnce(response(envelope(version({ state: 'APPROVED', resourceHash: changedHash }))))
+    const proposal = await subject.generationOperation(generationReference('PATCH'), credential)
+    expect(proposal.status).toBe('SUCCEEDED')
+    const prepared = prepareContractMutation('approve', { identity, resourceHash, policyHash }, '패치 검토', proposal as ProposedPatchOperation)
+    await subject.executeMutation(prepared, credential)
+    expect(prepared.body).toBe(JSON.stringify({ comment: '패치 검토', patchProposalId: proposalId }))
+    expect(fetchMock.mock.calls[2]![1]?.body).toBe(prepared.body)
+    expect(new Headers(fetchMock.mock.calls[2]![1]?.headers).get('X-CSRF-Token')).toBe(csrfToken)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('keeps explicit local-key reads and writes cookie-free after connecting a session', async () => {
+    const { subject, fetchMock } = await restoredClient()
+    fetchMock.mockResolvedValueOnce(response(envelope([version()])))
+      .mockResolvedValueOnce(response(envelope(validationResult())))
+    await subject.listVersions(identity.releaseId, reviewerKey)
+    await subject.executeMutation(operation(), reviewerKey)
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    for (const [, init] of fetchMock.mock.calls.slice(1)) {
+      const headers = new Headers(init?.headers)
+      expect(init?.credentials).toBe('omit')
+      expect(headers.get('X-Contract-Reviewer-Key')).toBe(reviewerKey)
+      expect(headers.has('X-CSRF-Token')).toBe(false)
+      expect(headers.has('X-Actor-Id')).toBe(false)
+    }
+  })
+
+  it.each(['review', 'mutation', 'patch'] as const)('rejects known foreign workspace for %s before fetch', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const foreign = { ...identity, workspaceId: traceId }
+    const call = () => kind === 'review' ? subject.review(foreign, credential)
+      : kind === 'mutation' ? subject.executeMutation(prepareContractMutation('validate', { identity: foreign, resourceHash }), credential)
+        : subject.submitGeneration(preparePatchGeneration(findingId, foreign), credential)
+    await expect(Promise.resolve().then(async () => await call())).rejects.toMatchObject({ outcome: 'not_sent' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['list', 'review'] as const)('rejects a foreign workspace %s response without follow-up requests', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    fetchMock.mockResolvedValueOnce(response(envelope(kind === 'list' ? [version({ workspaceId: traceId })]
+      : review({ identity: { ...identity, workspaceId: traceId } }))))
+    const pending = kind === 'list' ? subject.listVersions(identity.releaseId, credential) : subject.review(identity, credential)
+    await expect(pending).rejects.toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['read', 'mutation', 'generation'] as const)('rejects registered expired credentials before %s dispatch', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    vi.mocked(Date.now).mockReturnValue(sessionExpiresAt * 1000)
+    const call = () => kind === 'read' ? subject.listVersions(identity.releaseId, credential)
+      : kind === 'mutation' ? subject.executeMutation(operation(), credential)
+        : subject.submitGeneration(prepareInitialGeneration(identity.releaseId), credential)
+    await expect(Promise.resolve().then(async () => await call())).rejects.toMatchObject({ code: 'CONTRACT_SESSION_EXPIRED', outcome: 'not_sent' })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['list', 'review', 'operation'] as const)('rejects an otherwise valid pending %s GET received after expiry', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient(), held = heldBody()
+    fetchMock.mockResolvedValueOnce(held.response)
+    const pending = kind === 'list' ? subject.listVersions(identity.releaseId, credential)
+      : kind === 'review' ? subject.review(identity, credential) : subject.generationOperation(generationReference(), credential)
+    await held.entered
+    vi.mocked(Date.now).mockReturnValue(sessionExpiresAt * 1000)
+    held.body.resolve(envelope(kind === 'list' ? [version()] : kind === 'review' ? review() : generation()))
+    await expect(pending).rejects.toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it.each(['mutation', 'generation'] as const)('accepts a valid sent %s POST receipt after expiry without resubmitting', async kind => {
+    const { subject, credential, fetchMock } = await restoredClient()
+    const held = heldBody(kind === 'mutation' ? 200 : 202, kind === 'mutation' ? {} : { Location: operationUrl })
+    fetchMock.mockResolvedValueOnce(held.response)
+    const pending = kind === 'mutation' ? subject.executeMutation(operation(), credential)
+      : subject.submitGeneration(prepareInitialGeneration(identity.releaseId), credential)
+    await held.entered
+    vi.mocked(Date.now).mockReturnValue(sessionExpiresAt * 1000)
+    held.body.resolve(envelope(kind === 'mutation' ? validationResult() : generation()))
+    const result = await pending
+    expect(result).toMatchObject(kind === 'mutation' ? { versionId: identity.versionId, resourceHash: changedHash } : { operationId, status: 'QUEUED' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    expect(fetchMock.mock.calls[1]![1]?.method).toBe('POST')
+  })
+
+  it('preserves an unknown session operation for explicit retry without leaking credentials into state or diagnostics', async () => {
+    const storage = vi.spyOn(Storage.prototype, 'setItem')
+    const logs = [vi.spyOn(console, 'log'), vi.spyOn(console, 'info'), vi.spyOn(console, 'debug'), vi.spyOn(console, 'warn'), vi.spyOn(console, 'error')]
+    const { subject, credential, fetchMock } = await restoredClient()
+    const prepared = operation('approve'), before = JSON.stringify(prepared)
+    fetchMock.mockRejectedValueOnce(new TypeError(`${reviewerKey}${csrfToken}`))
+      .mockResolvedValueOnce(response({ code: 'CONTRACT_AUTH_REQUIRED', detail: `${reviewerKey}${csrfToken}` }, 403))
+    const unknown: unknown = await subject.executeMutation(prepared, credential).catch(error => error)
+    assertSessionErrorSafe(unknown)
+    expect(unknown).toMatchObject({ code: 'NETWORK_ERROR', outcome: 'unknown' })
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+    const rejected: unknown = await subject.executeMutation(prepared, credential).catch(error => error)
+    assertSessionErrorSafe(rejected)
+    expect(rejected).toMatchObject({ status: 403, outcome: 'rejected' })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock.mock.calls[2]![0]).toBe(fetchMock.mock.calls[1]![0])
+    expect(fetchMock.mock.calls[2]![1]?.body).toBe(fetchMock.mock.calls[1]![1]?.body)
+    expect(Object.fromEntries(new Headers(fetchMock.mock.calls[2]![1]?.headers)))
+      .toEqual(Object.fromEntries(new Headers(fetchMock.mock.calls[1]![1]?.headers)))
+    expect(JSON.stringify(prepared)).toBe(before)
+    for (const secret of [reviewerKey, csrfToken]) {
+      expect(JSON.stringify({ prepared, subject, unknown, rejected })).not.toContain(secret)
+      for (const [url, init] of fetchMock.mock.calls) {
+        expect(String(url)).not.toContain(secret)
+        expect(init?.body ?? '').not.toContain(secret)
+      }
+    }
+    expect(storage).not.toHaveBeenCalled()
+    for (const log of logs) expect(log).not.toHaveBeenCalled()
   })
 })

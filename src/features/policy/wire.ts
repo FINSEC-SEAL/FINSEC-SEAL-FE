@@ -35,6 +35,15 @@ export interface ContractValidation {
   readonly issues: readonly ContractIssue[]
 }
 
+/** A canonical validation result does not contain the full stored version identity. */
+export interface ContractValidationReceipt {
+  readonly versionId: string
+  readonly state: 'CANDIDATE' | 'VALIDATED'
+  readonly policyHash: string
+  readonly resourceHash: string
+  readonly validation: ContractValidation
+}
+
 export interface ContractReviewMetadata {
   readonly actorId: string
   readonly role: string
@@ -226,6 +235,22 @@ function validation(value: unknown): ContractValidation | null {
     : issues.some(issue => issue.severity === 'WARNING') ? 'WARN' : 'VALID'
   if (status !== derived) invalid()
   return Object.freeze({ status, issues: Object.freeze(issues) })
+}
+
+export function readContractValidationResponse(value: unknown, requestedVersionId: string): ContractValidationReceipt {
+  const expected = readContractUuid(requestedVersionId)
+  const source = record(envelopeData(value))
+  const versionId = readContractUuid(field(source, 'versionId'))
+  const state = enumeration(field(source, 'state'), ['CANDIDATE', 'VALIDATED'] as const)
+  const result = validation(source)
+  if (versionId !== expected || result === null
+      || state !== (result.status === 'INVALID' ? 'CANDIDATE' : 'VALIDATED')) invalid()
+  return Object.freeze({
+    versionId, state,
+    policyHash: readContractHash(field(source, 'policyHash')),
+    resourceHash: readContractHash(field(source, 'resourceHash')),
+    validation: result,
+  })
 }
 
 function reviewMetadata(value: unknown): ContractReviewMetadata | null {
