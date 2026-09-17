@@ -64,6 +64,12 @@ function platformVersion(view: StoredContractReview, overrides: Record<string, u
     validation: {}, review: { sessionId: key }, ...overrides }
 }
 
+function validationResult(view: StoredContractReview) {
+  if (!view.validation) throw new Error('Synthetic canonical validation requires stored evidence')
+  return { versionId: view.identity.versionId, state: view.state, policyHash: view.policyHash,
+    resourceHash: view.resourceHash, ...view.validation, validationProof: { private: key } }
+}
+
 function response(data: unknown, status = 200): Response {
   return new Response(JSON.stringify({ data, traceId, timestamp: '2026-09-07T06:00:00Z' }), {
     status, headers: { 'Content-Type': 'application/json' },
@@ -101,7 +107,13 @@ function api(initial: StoredContractReview[] = [snapshot()]) {
   }
   const fetchMock = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
     const url = new URL(String(input))
-    if (init.method === 'POST') return handlers.post(url.pathname, init)
+    if (init.method === 'POST') {
+      if (!/^\/api\/v1\/contract-versions\/[0-9a-f-]+:(validate|approve|reject)$/.test(url.pathname)
+        && !/^\/api\/v1\/(releases\/[0-9a-f-]+\/contracts:generate|findings\/[0-9a-f-]+\/patch-proposals)$/.test(url.pathname)) {
+        throw new Error('Unexpected synthetic mutation route')
+      }
+      return handlers.post(url.pathname, init)
+    }
     if (url.pathname.startsWith('/api/v1/operations/')) return handlers.operation(url.pathname.split('/').at(-1)!, init)
     if (url.pathname.endsWith('/review')) return handlers.detail(url.pathname.split('/').at(-2)!)
     if (url.pathname === '/api/v1/platform/contracts') return handlers.list(url.searchParams.get('releaseId')!)
@@ -193,16 +205,25 @@ describe('stored contract page selection and authority', () => {
 
   it('validates a candidate, reloads WARN evidence, and requires a separate explicit approval', async () => {
     const backend = api()
+    const inspected = deferred<Response>()
     const warn = validated({ resourceHash: changedHash, validation: { status: 'WARN', issues: [
       { jsonPointer: '/purpose', code: 'STORED_WARNING', severity: 'WARNING', message: '저장된 검토 경고' },
     ] } })
     backend.handlers.post = path => {
-      expect(path.endsWith(':validate')).toBe(true)
+      expect(path).toBe(`/api/v1/contract-versions/${versionId}:validate`)
       backend.views.set(versionId, warn)
-      return response(platformVersion(warn))
+      backend.handlers.detail = () => inspected.promise
+      return response(validationResult(warn))
     }
     const user = userEvent.setup(); page(); await load(user)
     await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText('계약 검증 요청이 처리되었습니다.')).toBeInTheDocument()
+    unavailable('승인 검토')
+    expect(screen.queryByText('저장된 검토 경고')).not.toBeInTheDocument()
+    expect(within(screen.getByRole('table', { name: '저장 버전 이력' })).getByText('CANDIDATE')).toBeInTheDocument()
+    expect(backend.posts()).toHaveLength(1)
+    await act(async () => inspected.resolve(response(warn)))
+    backend.handlers.detail = id => response(backend.views.get(id))
     expect(await screen.findByText('저장된 검토 경고')).toBeInTheDocument()
     expect(screen.getByRole('button', { name: '승인 검토' })).toBeEnabled()
     unavailable('계약 검증')
@@ -222,7 +243,7 @@ describe('stored contract page selection and authority', () => {
     const invalid = snapshot({ resourceHash: changedHash, validation: { status: 'INVALID', issues: [
       { jsonPointer: '/allowedTools', code: 'MINIMUM_AVAILABILITY', severity: 'ERROR', message: '필수 업무 도구 누락' },
     ] } })
-    backend.handlers.post = () => { backend.views.set(versionId, invalid); return response(platformVersion(invalid)) }
+    backend.handlers.post = () => { backend.views.set(versionId, invalid); return response(validationResult(invalid)) }
     const user = userEvent.setup(); page(); await load(user)
     await user.click(screen.getByRole('button', { name: '계약 검증' }))
     expect(await screen.findByText('필수 업무 도구 누락')).toBeInTheDocument()
@@ -291,7 +312,7 @@ describe('explicit review consent and conflicts', () => {
     await user.click(within(dialog).getByRole('button', { name: '거절 요청 전송' }))
     await waitFor(() => expect(screen.getByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument())
     expect(backend.posts()).toHaveLength(1)
-    expect(backend.posts()[0]![0]).toBe(`https://api.test/api/v1/platform/contracts/${versionId}:reject`)
+    expect(backend.posts()[0]![0]).toBe(`https://api.test/api/v1/contract-versions/${versionId}:reject`)
     expect(backend.posts()[0]![1]?.body).toBe(JSON.stringify({ comment: '검토\n"범위" 거절' }))
   })
 
@@ -324,24 +345,29 @@ describe('explicit review consent and conflicts', () => {
     expect(document.body.textContent).not.toContain(key)
   })
 
-  it('keeps a confirmed mutation success separate from a failed subsequent GET and offers only reinspection', async () => {
-    const backend = api([validated()])
+  it.each(['validate', 'approve'] as const)('keeps a confirmed %s success separate from a failed subsequent GET and offers only reinspection', async action => {
+    const initial = action === 'approve' ? validated() : snapshot()
+    const result = validated({ state: action === 'approve' ? 'APPROVED' : 'VALIDATED', resourceHash: changedHash })
+    const backend = api([initial])
     backend.handlers.post = () => {
       backend.handlers.detail = () => problem(503, 'CONTRACT_REVIEW_UNAVAILABLE')
-      return response(platformVersion(validated({ state: 'APPROVED', resourceHash: changedHash })))
+      return response(action === 'validate' ? validationResult(result) : platformVersion(result))
     }
-    const user = userEvent.setup(); page(); await load(user, validated())
-    const dialog = await confirm(user, '승인')
-    await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
-    expect(await screen.findByText('계약 승인 요청이 처리되었습니다.')).toBeInTheDocument()
+    const user = userEvent.setup(); page(); await load(user, initial)
+    if (action === 'approve') {
+      const dialog = await confirm(user, '승인')
+      await user.click(within(dialog).getByRole('button', { name: '승인 요청 전송' }))
+    } else await user.click(screen.getByRole('button', { name: '계약 검증' }))
+    expect(await screen.findByText(`계약 ${action === 'approve' ? '승인' : '검증'} 요청이 처리되었습니다.`)).toBeInTheDocument()
     expect(await screen.findByText('변경 요청은 처리됐지만 최신 검토 내용을 불러오지 못했습니다.')).toBeInTheDocument()
     expect(screen.queryByText('요청 처리 여부가 미확정입니다.')).not.toBeInTheDocument()
     unavailable('동일 요청 재전송 검토'); unavailable('승인 검토')
     expect(screen.getByRole('button', { name: '최신 계약 다시 조회' })).toBeEnabled()
     expect(backend.posts()).toHaveLength(1)
-    backend.handlers.detail = () => response(validated({ state: 'APPROVED', resourceHash: changedHash }))
+    backend.handlers.detail = () => response(result)
     await user.click(screen.getByRole('button', { name: '최신 계약 다시 조회' }))
-    expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    if (action === 'approve') expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
+    else expect(await screen.findByRole('button', { name: '승인 검토' })).toBeEnabled()
     expect(backend.posts()).toHaveLength(1)
   })
 })
@@ -562,7 +588,7 @@ describe('selection races and uncertain operations', () => {
     const retryDialog = await screen.findByRole('dialog', { name: '동일 요청 재전송 확인' })
     await user.click(within(retryDialog).getByRole('checkbox', { name: retryConsent }))
     const result = validated({ state: action === 'approve' ? 'APPROVED' : 'VALIDATED', resourceHash: changedHash })
-    backend.handlers.post = () => { backend.views.set(versionId, result); return response(platformVersion(result)) }
+    backend.handlers.post = () => { backend.views.set(versionId, result); return response(action === 'validate' ? validationResult(result) : platformVersion(result)) }
     await user.click(within(retryDialog).getByRole('button', { name: '동일 요청 재전송' }))
     expect(await screen.findByText(`계약 ${action === 'approve' ? '승인' : '검증'} 요청이 처리되었습니다.`)).toBeInTheDocument()
     await waitFor(() => expect(screen.queryByText('요청 처리 여부가 미확정입니다.')).not.toBeInTheDocument())
@@ -651,7 +677,7 @@ function mutationLifecycle(backend: ReturnType<typeof api>, generationKind: 'CON
       : { ...previous, state: path.endsWith(':approve') ? 'APPROVED' as const : 'REJECTED' as const, resourceHash: baseHash }
     expect(init.credentials).toBe('omit')
     backend.views.set(id, next)
-    return response(platformVersion(next))
+    return response(path.endsWith(':validate') ? validationResult(next) : platformVersion(next))
   }
 }
 

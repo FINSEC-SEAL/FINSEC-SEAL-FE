@@ -25,6 +25,14 @@ function version(overrides: Record<string, unknown> = {}) {
     policy: { private: reviewerKey }, validation: {}, review: {}, ...overrides }
 }
 
+function validationResult(status = 'VALID', overrides: Record<string, unknown> = {}) {
+  return { versionId: identity.versionId, state: status === 'INVALID' ? 'CANDIDATE' : 'VALIDATED',
+    policyHash, resourceHash: changedHash, status,
+    issues: status === 'VALID' ? [] : [{ jsonPointer: '/purpose', code: 'STORED_ISSUE',
+      severity: status === 'INVALID' ? 'ERROR' : 'WARNING', message: 'Stored validation issue' }],
+    validationProof: { private: reviewerKey }, ...overrides }
+}
+
 function review(overrides: Record<string, unknown> = {}) {
   return { identity: { ...identity }, state: 'CANDIDATE', policyHash, resourceHash,
     storedPolicyJson: '{ "version": 7 }', canonicalPolicyJson: '{"version":7}',
@@ -98,7 +106,7 @@ describe('stored contract review transport', () => {
     const result = await client.executeMutation(prepared, reviewerKey)
     expect(result.state).toBe('APPROVED')
     const [url, init] = fetchMock.mock.calls[0]!
-    expect(url).toBe(`https://api.test/api/v1/platform/contracts/${identity.versionId}:approve`)
+    expect(url).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:approve`)
     expect(init).toMatchObject({ method: 'POST', body: JSON.stringify({ comment }), credentials: 'omit', redirect: 'error', cache: 'no-store' })
     expect(Object.fromEntries(new Headers(init?.headers))).toEqual({
       accept: 'application/json', 'x-contract-reviewer-key': reviewerKey,
@@ -121,6 +129,7 @@ describe('stored contract review transport', () => {
     expect(fetchMock).toHaveBeenCalledTimes(2)
     const first = fetchMock.mock.calls[0]!
     const second = fetchMock.mock.calls[1]!
+    expect(first[0]).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:reject`)
     expect(second[0]).toBe(first[0])
     expect(second[1]?.body).toBe(first[1]?.body)
     expect(Object.fromEntries(new Headers(second[1]?.headers))).toEqual(Object.fromEntries(new Headers(first[1]?.headers)))
@@ -131,7 +140,7 @@ describe('stored contract review transport', () => {
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000011')
       .mockReturnValueOnce('00000000-0000-4000-8000-000000000012')
     const fetchMock = vi.spyOn(globalThis, 'fetch')
-      .mockResolvedValueOnce(response(envelope(version({ resourceHash: changedHash }))))
+      .mockResolvedValueOnce(response(envelope(validationResult())))
       .mockResolvedValueOnce(response(envelope(review({ state: 'VALIDATED', resourceHash: changedHash, validation: { status: 'VALID', issues: [] } }))))
       .mockResolvedValueOnce(response(envelope(version({ state: 'APPROVED', resourceHash: changedHash }))))
     const validate = operation()
@@ -140,14 +149,21 @@ describe('stored contract review transport', () => {
     const approve = prepareContractMutation('approve', fresh, '새 검증 결과 검토')
     await client.executeMutation(approve, reviewerKey)
     expect(validate.body).toBe('{}')
+    expect(fetchMock.mock.calls[0]![0]).toBe(`https://api.test/api/v1/contract-versions/${identity.versionId}:validate`)
+    expect(fetchMock.mock.calls[1]![0]).toBe(`https://api.test/api/v1/platform/contracts/${identity.versionId}/review`)
     expect(approve.idempotencyKey).not.toBe(validate.idempotencyKey)
     expect(approve.ifMatch).toBe(`"${changedHash}"`)
     expect(new Headers(fetchMock.mock.calls[2]![1]?.headers).get('If-Match')).toBe(`"${changedHash}"`)
   })
 
-  it('accepts the actual invalid-validation response remaining CANDIDATE', async () => {
-    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response(envelope(version({ state: 'CANDIDATE', resourceHash: changedHash }))))
-    expect((await client.executeMutation(operation(), reviewerKey)).state).toBe('CANDIDATE')
+  it.each(['VALID', 'WARN', 'INVALID'])('accepts the canonical %s validation receipt without manufacturing identity', async status => {
+    const source = validationResult(status)
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(response(envelope(source)))
+    const result = await client.executeMutation(operation(), reviewerKey)
+    expect(result).toEqual({ versionId: identity.versionId, state: source.state, policyHash, resourceHash: changedHash,
+      validation: { status, issues: source.issues } })
+    expect(result).not.toHaveProperty('identity')
+    expect(JSON.stringify(result)).not.toContain(reviewerKey)
   })
 
   it.each([
@@ -181,9 +197,11 @@ describe('stored contract review transport', () => {
   it.each([
     () => new Response('{', { status: 200 }),
     () => response({ traceId, timestamp: 'now' }),
-    () => response(envelope(version({ id: traceId }))),
-    () => response(envelope(version({ releaseId: traceId }))),
-    () => response(envelope(version({ state: 'APPROVED' }))),
+    () => response(envelope(validationResult('VALID', { versionId: traceId }))),
+    () => response(envelope(validationResult('VALID', { resourceHash: reviewerKey }))),
+    () => response(envelope(validationResult('VALID', { state: 'APPROVED' }))),
+    () => response(envelope(validationResult('INVALID', { state: 'VALIDATED' }))),
+    () => response(envelope(version())),
     () => new Response(null, { status: 204 }),
   ])('treats malformed or mismatched successful mutation responses as unknown outcomes', async makeResponse => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(makeResponse())
@@ -191,6 +209,20 @@ describe('stored contract review transport', () => {
     assertSafeError(error)
     expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown', retryable: false })
     expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each(['approve', 'reject'] as const)('keeps every full identity binding for canonical %s detail responses', async action => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const fields = ['id', 'workspaceId', 'releaseId', 'contractKey', 'version']
+    for (const field of fields) {
+      const state = action === 'approve' ? 'APPROVED' : 'REJECTED'
+      fetchMock.mockResolvedValueOnce(response(envelope(version({ state,
+        [field]: field === 'version' ? 8 : field === 'contractKey' ? 'another-contract' : traceId }))))
+      const error: unknown = await client.executeMutation(operation(action), reviewerKey).catch(error => error)
+      assertSafeError(error)
+      expect(error).toMatchObject({ code: 'CONTRACT_RESPONSE_INVALID', outcome: 'unknown' })
+    }
+    expect(fetchMock).toHaveBeenCalledTimes(fields.length)
   })
 
   it('does not equate an aborted response wait with cancellation of the server mutation', async () => {
