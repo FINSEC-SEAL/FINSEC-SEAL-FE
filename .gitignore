@@ -26,3 +26,6 @@ output/playwright/
 # Private environment variants; keep the public template
 .env.*
 !.env.example
+
+# Local Role C handoff documentation
+/docs/C_STORED_CONTRACT_REVIEW_UI_HANDOFF.md
