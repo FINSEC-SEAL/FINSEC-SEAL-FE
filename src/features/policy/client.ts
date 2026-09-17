@@ -4,9 +4,11 @@ import {
   readContractListResponse,
   readContractProblem,
   readContractUuid,
+  readContractValidationResponse,
   readContractVersionResponse,
   readStoredContractReviewResponse,
   type ContractProblem,
+  type ContractValidationReceipt,
   type ContractVersionIdentity,
   type ContractVersionSummary,
   type StoredContractReview,
@@ -326,14 +328,13 @@ export class ContractReviewClient {
       payload => readStoredContractReviewResponse(payload, target), undefined, signal)
   }
 
-  executeMutation(operation: PreparedContractMutation, reviewerKey: string, signal?: AbortSignal): Promise<ContractVersionSummary> {
+  executeMutation(operation: PreparedContractMutation, reviewerKey: string, signal?: AbortSignal): Promise<ContractValidationReceipt | ContractVersionSummary> {
     if (!(operation instanceof PreparedMutation)) throw invalidRequest()
-    return this.request(`${prefix}/${encodeURIComponent(operation.identity.versionId)}:${operation.action}`, reviewerKey,
+    return this.request(`/api/v1/contract-versions/${encodeURIComponent(operation.identity.versionId)}:${operation.action}`, reviewerKey,
       payload => {
+        if (operation.action === 'validate') return readContractValidationResponse(payload, operation.identity.versionId)
         const version = readContractVersionResponse(payload, operation.identity)
-        const expected = operation.action === 'validate' ? ['CANDIDATE', 'VALIDATED']
-          : operation.action === 'approve' ? ['APPROVED'] : ['REJECTED']
-        if (!expected.includes(version.state)) throw invalidRequest()
+        if (version.state !== (operation.action === 'approve' ? 'APPROVED' : 'REJECTED')) throw invalidRequest()
         return version
       }, operation, signal)
   }

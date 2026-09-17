@@ -170,13 +170,16 @@ function livePolicyApi() {
     })))
     if (url.pathname === '/api/v1/platform/contracts') return envelope(url.searchParams.get('releaseId') === selectedReleaseId ? [platformContract(current)] : [])
     if (url.pathname === `/api/v1/platform/contracts/${liveVersionId}/review`) return handlers.review()
-    if (init.method === 'POST' && url.pathname === `/api/v1/platform/contracts/${liveVersionId}:approve`) {
+    if (init.method === 'POST' && url.pathname === `/api/v1/contract-versions/${liveVersionId}:approve`) {
       current = { ...current, state: 'APPROVED', resourceHash: `sha256:${'c'.repeat(64)}` }
       return envelope(platformContract(current))
     }
     throw new Error('Unexpected synthetic app HTTP route')
   })
-  const contracts = () => fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.startsWith('/api/v1/platform/contracts'))
+  const contracts = () => fetch.mock.calls.filter(([input]) => {
+    const path = new URL(String(input), window.location.origin).pathname
+    return path.startsWith('/api/v1/platform/contracts') || path.startsWith('/api/v1/contract-versions/')
+  })
   return { fetch, handlers, contracts, posts: () => contracts().filter(([, init]) => init?.method === 'POST') }
 }
 
@@ -218,7 +221,7 @@ describe('live stored contract review routing', () => {
     expect(await screen.findByText('이 버전은 읽기 전용입니다.')).toBeInTheDocument()
     expect(backend.posts()).toHaveLength(1)
     const [postUrl, post] = backend.posts()[0]!
-    expect(new URL(String(postUrl)).pathname).toBe(`/api/v1/platform/contracts/${liveVersionId}:approve`)
+    expect(new URL(String(postUrl)).pathname).toBe(`/api/v1/contract-versions/${liveVersionId}:approve`)
     expect(post?.body).toBe(JSON.stringify({ comment: '저장된 변경 내역과 검증 결과를 검토했습니다.' }))
     expect(new Headers(post?.headers).get('If-Match')).toBe(`"${resourceHash}"`)
     expect(new Headers(post?.headers).get('Idempotency-Key')).toMatch(/^contract-approve-[0-9a-f-]{36}$/)

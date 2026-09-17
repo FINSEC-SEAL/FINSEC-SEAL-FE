@@ -9,7 +9,7 @@ import type { ContractVersionIdentity, ContractVersionSummary, StoredContractRev
 const defaultClient = new ContractReviewClient()
 const actionNames = { validate: '검증', approve: '승인', reject: '거절' } as const
 type OperationRecord = { operation: PreparedContractMutation; epoch: number; phase: 'pending' | 'unknown' }
-type MutationResult = { ok: true; version: ContractVersionSummary } | { ok: false; error: ContractRequestError }
+type MutationResult = { ok: true } | { ok: false; error: ContractRequestError }
 type GenerationRecord = { request: PreparedGeneration; epoch: number; releaseSignature: string; client: ContractReviewClient; phase: 'submitting' | 'unknown' | 'rejected' | 'accepted'; operation: GenerationOperation | null; error: ContractRequestError | null; readError: ContractRequestError | null }
 type PatchBinding = { identity: ContractVersionIdentity; operation: ProposedPatchOperation; epoch: number; releaseSignature: string; client: ContractReviewClient }
 type Session = { id: number; releaseId: string; releaseSignature: string; reviewerKey: string; epoch: number; client: ContractReviewClient }
@@ -125,9 +125,9 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
     // Register before dispatch, outside the keyed session. Navigation cannot erase an in-flight request.
     recordOperation(key, { operation, epoch: context.epoch, phase: 'pending' })
     try {
-      const version = await context.client.executeMutation(operation, context.reviewerKey, signal)
+      await context.client.executeMutation(operation, context.reviewerKey, signal)
       recordOperation(key, null)
-      return { ok: true, version }
+      return { ok: true }
     } catch (cause) {
       const error = safeError(cause)
       // A failed retry describes that attempt only; it cannot resolve an earlier unknown outcome.
@@ -378,7 +378,6 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
       mutationController.current = null
       if (result.ok) {
         setMessage(`계약 ${actionNames[operation.action]} 요청이 처리되었습니다.`)
-        updateVersion(result.version)
         await readReview(operation.identity, { preserveMessage: true, afterSuccess: true })
       } else {
         setError(result.error)
