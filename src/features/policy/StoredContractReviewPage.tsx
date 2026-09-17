@@ -5,14 +5,31 @@ import { Badge, DataTable, Modal, Notice, Panel } from '../../components/Product
 import { ContractRequestError, ContractReviewClient, prepareContractMutation, type ContractAction, type PreparedContractMutation, prepareInitialGeneration, preparePatchGeneration, type PreparedGeneration, type GenerationOperation, type ProposedPatchOperation } from './client'
 import { PolicyReviewDetails } from './PolicyReviewDetails'
 import type { ContractVersionIdentity, ContractVersionSummary, StoredContractReview } from './wire'
+import type { ContractReviewCredential, ReviewerSession } from './reviewerSession'
 
 const defaultClient = new ContractReviewClient()
 const actionNames = { validate: '검증', approve: '승인', reject: '거절' } as const
 type OperationRecord = { operation: PreparedContractMutation; epoch: number; phase: 'pending' | 'unknown' }
 type MutationResult = { ok: true } | { ok: false; error: ContractRequestError }
-type GenerationRecord = { request: PreparedGeneration; epoch: number; releaseSignature: string; client: ContractReviewClient; phase: 'submitting' | 'unknown' | 'rejected' | 'accepted'; operation: GenerationOperation | null; error: ContractRequestError | null; readError: ContractRequestError | null }
+type SessionPrincipal = Readonly<Pick<ReviewerSession, 'actorId' | 'workspaceId'>>
+type GenerationRecord = { request: PreparedGeneration; epoch: number; releaseSignature: string; client: ContractReviewClient; principal: SessionPrincipal | null; phase: 'submitting' | 'unknown' | 'rejected' | 'accepted'; operation: GenerationOperation | null; error: ContractRequestError | null; readError: ContractRequestError | null }
 type PatchBinding = { identity: ContractVersionIdentity; operation: ProposedPatchOperation; epoch: number; releaseSignature: string; client: ContractReviewClient }
-type Session = { id: number; releaseId: string; releaseSignature: string; reviewerKey: string; epoch: number; client: ContractReviewClient }
+type Session = { id: number; releaseId: string; releaseSignature: string; credential: ContractReviewCredential; epoch: number; client: ContractReviewClient }
+
+function credentialCurrent(credential: ContractReviewCredential): boolean {
+  return typeof credential === 'string' || credential.expiresAt * 1000 > Date.now()
+}
+
+function canReadGeneration(record: GenerationRecord, context: Session): boolean {
+  return record.client === context.client && credentialCurrent(context.credential)
+    && (record.epoch === context.epoch || (typeof context.credential !== 'string'
+      && record.principal !== null && record.principal.actorId === context.credential.actorId
+      && record.principal.workspaceId === context.credential.workspaceId))
+}
+
+function expiredSession(): ContractRequestError {
+  return new ContractRequestError(null, { code: 'CONTRACT_SESSION_EXPIRED', retryable: false }, 'not_sent')
+}
 
 function targetKey(identity: ContractVersionIdentity): string {
   return `${identity.workspaceId}/${identity.releaseId}/${identity.versionId}`
@@ -66,6 +83,12 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
 }) {
   const [releaseId, setReleaseId] = useState(() => releases.some(item => item.id === preferredReleaseId) ? preferredReleaseId! : '')
   const [reviewerKey, setReviewerKey] = useState('')
+  const [authMode, setAuthMode] = useState<'session' | 'local'>('session')
+  const [connection, setConnection] = useState<{ credential: ReviewerSession; client: ContractReviewClient } | null>(null)
+  const [connectionError, setConnectionError] = useState<ContractRequestError | null>(null)
+  const [connecting, setConnecting] = useState(false)
+  const connectionFlight = useRef<Promise<ReviewerSession> | null>(null)
+  const connectionToken = useRef(0)
   const [epoch, setEpoch] = useState(0)
   const [session, setSession] = useState<Session | null>(null)
   const nextSession = useRef(0)
@@ -84,8 +107,13 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   const queuedPoll = useRef<Session | null>(null)
   const [generationReading, setGenerationReading] = useState(false)
   const selectedRelease = releases.find(item => item.id === releaseId)
+  const connectionScope = useRef({ client, releaseId, signature: selectedRelease ? releaseSignature(selectedRelease) : '', reviewerKey, authMode })
+  connectionScope.current = { client, releaseId, signature: selectedRelease ? releaseSignature(selectedRelease) : '', reviewerKey, authMode }
+  const currentConnection = authMode === 'session' && connection?.client === client && credentialCurrent(connection.credential) ? connection : null
   const currentSession = session && selectedRelease && session.releaseId === releaseId && session.epoch === epoch
-    && session.releaseSignature === releaseSignature(selectedRelease) && session.client === client ? session : null
+    && session.releaseSignature === releaseSignature(selectedRelease) && session.client === client
+    && (authMode === 'local' ? typeof session.credential === 'string' : session.credential === currentConnection?.credential)
+    && credentialCurrent(session.credential) ? session : null
 
   activeSession.current = currentSession
 
@@ -97,18 +125,42 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
     pollFlight.current?.abort()
   }, [currentSession])
 
-  useEffect(() => { alive.current = true; return () => { alive.current = false } }, [])
+  useEffect(() => { alive.current = true; return () => { alive.current = false; connectionToken.current++ } }, [])
   useEffect(() => {
     if (previousPreferred.current !== preferredReleaseId) {
       previousPreferred.current = preferredReleaseId
       const next = releases.some(item => item.id === preferredReleaseId) ? preferredReleaseId! : ''
-      if (next !== releaseId) { setReleaseId(next); setSession(null) }
-    } else if (releaseId && !selectedRelease) { setReleaseId(''); setSession(null) }
+      if (next !== releaseId) { connectionToken.current++; setReleaseId(next); setSession(null) }
+    } else if (releaseId && !selectedRelease) { connectionToken.current++; setReleaseId(''); setSession(null) }
     if (previousClient.current !== client) {
       previousClient.current = client
-      setEpoch(value => value + 1); setSession(null)
+      invalidateCredentials()
     }
   }, [preferredReleaseId, releaseId, releases, selectedRelease, client])
+
+  useEffect(() => {
+    if (!connection || authMode !== 'session') return
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let cancelled = false
+    const check = () => {
+      if (cancelled) return
+      const remaining = connection.credential.expiresAt * 1000 - Date.now()
+      if (remaining > 0) { timer = setTimeout(check, Math.min(remaining, 2_147_483_647)); return }
+      connectionToken.current++
+      setEpoch(value => value + 1); setConnection(null); setSession(null); setConnectionError(expiredSession())
+    }
+    check()
+    return () => { cancelled = true; if (timer !== undefined) clearTimeout(timer) }
+  }, [connection, authMode])
+
+  function invalidateCredentials() {
+    connectionToken.current++
+    setEpoch(value => value + 1); setSession(null); setConnection(null); setConnectionError(null)
+  }
+
+  function contextCurrent(context: Session): boolean {
+    return alive.current && activeSession.current === context && credentialCurrent(context.credential)
+  }
 
   function recordOperation(key: string, record: OperationRecord | null) {
     if (record) ledger.current.set(key, record)
@@ -117,6 +169,8 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   }
 
   async function perform(operation: PreparedContractMutation, context: Session, signal: AbortSignal): Promise<MutationResult> {
+    if (!contextCurrent(context)) return { ok: false, error: credentialCurrent(context.credential)
+      ? new ContractRequestError(null, { code: 'CONTRACT_REQUEST_INVALID', retryable: false }, 'not_sent') : expiredSession() }
     const key = targetKey(operation.identity)
     const previous = ledger.current.get(key)
     if (previous && (previous.phase === 'pending' || previous.operation !== operation || previous.epoch !== context.epoch)) {
@@ -125,7 +179,7 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
     // Register before dispatch, outside the keyed session. Navigation cannot erase an in-flight request.
     recordOperation(key, { operation, epoch: context.epoch, phase: 'pending' })
     try {
-      await context.client.executeMutation(operation, context.reviewerKey, signal)
+      await context.client.executeMutation(operation, context.credential, signal)
       recordOperation(key, null)
       return { ok: true }
     } catch (cause) {
@@ -143,19 +197,19 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   }
 
   function pollGeneration(context: Session) {
-    if (!alive.current || activeSession.current !== context) return
-    if (pollFlight.current) { queuedPoll.current = context; return }
+    if (!contextCurrent(context)) return
     const record = generationLedger.current.get(context.releaseId)
-    if (record?.phase !== 'accepted' || !record.operation) return
+    if (record?.phase !== 'accepted' || !record.operation || !canReadGeneration(record, context)) return
+    if (pollFlight.current) { queuedPoll.current = context; return }
     if (pollTimer.current) clearTimeout(pollTimer.current)
     pollTimer.current = null
     const token = ++pollToken.current
     const controller = new AbortController(); pollFlight.current = controller
     setGenerationReading(true)
     let again = false
-    const current = () => alive.current && activeSession.current === context && pollToken.current === token
+    const current = () => contextCurrent(context) && pollToken.current === token
       && generationLedger.current.get(context.releaseId)?.request === record.request
-    void context.client.generationOperation(record.operation, context.reviewerKey, controller.signal)
+    void context.client.generationOperation(record.operation, context.credential, controller.signal)
       .then(operation => {
         if (!current()) return
         recordGeneration({ ...record, operation, readError: null })
@@ -172,17 +226,19 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   }
 
   async function submitGeneration(request: PreparedGeneration, context: Session, signal: AbortSignal) {
-    if (activeSession.current !== context || request.releaseId !== context.releaseId
+    if (!contextCurrent(context) || request.releaseId !== context.releaseId
       || generationBlocked(generationLedger.current.get(request.releaseId))) return
     const record: GenerationRecord = { request, epoch: context.epoch, releaseSignature: context.releaseSignature, client: context.client,
+      principal: typeof context.credential === 'string' ? null
+        : Object.freeze({ actorId: context.credential.actorId, workspaceId: context.credential.workspaceId }),
       phase: 'submitting', operation: null, error: null, readError: null }
     // Unknown admission has no safe replay window. Never unlock it through navigation or retries.
     recordGeneration(record)
     try {
-      const operation = await context.client.submitGeneration(request, context.reviewerKey, signal)
+      const operation = await context.client.submitGeneration(request, context.credential, signal)
       if (generationLedger.current.get(request.releaseId)?.request !== request) return
       recordGeneration({ ...record, phase: 'accepted', operation })
-      if (activeSession.current === context) pollGeneration(context)
+      if (contextCurrent(context)) pollGeneration(context)
     } catch (cause) {
       const error = safeError(cause)
       if (generationLedger.current.get(request.releaseId)?.request === request) {
@@ -192,7 +248,7 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
   }
 
   function bindPatch(identity: ContractVersionIdentity, operation: ProposedPatchOperation, context: Session) {
-    if (activeSession.current !== context) return
+    if (!contextCurrent(context)) return
     setPatchBindings(previous => new Map(previous).set(targetKey(identity), {
       identity, operation, epoch: context.epoch, releaseSignature: context.releaseSignature, client: context.client,
     }))
@@ -200,27 +256,75 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
 
   function applyCredentials(event: FormEvent) {
     event.preventDefault()
-    if (!selectedRelease || !reviewerKey) return
-    setSession({ id: ++nextSession.current, releaseId, releaseSignature: releaseSignature(selectedRelease), reviewerKey, epoch, client })
+    if (!selectedRelease || connectionFlight.current) return
+    const credential = authMode === 'local' ? reviewerKey : currentConnection?.credential
+    if (!credential || !credentialCurrent(credential)) return
+    setSession({ id: ++nextSession.current, releaseId, releaseSignature: releaseSignature(selectedRelease), credential, epoch, client })
+  }
+
+  async function connectSession(restore: boolean) {
+    if (!selectedRelease || authMode !== 'session' || connectionFlight.current || (!restore && !reviewerKey)) return
+    const scope = connectionScope.current
+    const token = ++connectionToken.current
+    const nextEpoch = epoch + 1
+    setEpoch(nextEpoch); setSession(null); setConnection(null); setConnectionError(null); setConnecting(true)
+    const flight = client.connectReviewerSession(restore ? undefined : reviewerKey)
+    connectionFlight.current = flight
+    const current = () => {
+      const latest = connectionScope.current
+      return alive.current && connectionToken.current === token && latest.client === scope.client
+        && latest.releaseId === scope.releaseId && latest.signature === scope.signature
+        && latest.reviewerKey === scope.reviewerKey && latest.authMode === scope.authMode
+    }
+    try {
+      const credential = await flight
+      if (!current()) return
+      if (!credentialCurrent(credential)) throw expiredSession()
+      setConnection({ credential, client }); setReviewerKey('')
+      setSession({ id: ++nextSession.current, releaseId, releaseSignature: scope.signature, credential, epoch: nextEpoch, client })
+    } catch (cause) { if (current()) setConnectionError(safeError(cause)) }
+    finally {
+      if (connectionFlight.current === flight) connectionFlight.current = null
+      if (alive.current) setConnecting(false)
+    }
   }
 
   return <div className="stack">
     <PageHeader eyebrow="SAFETY CONTRACT" title="안전 정책 검토" description="저장된 정책과 변경 내역을 검토하고, 검증·승인·거절을 요청합니다." />
     <form className="panel form-grid" onSubmit={applyCredentials}>
+      <label>인증 방식<select aria-label="인증 방식" value={authMode} onChange={event => {
+        setAuthMode(event.target.value as 'session' | 'local'); invalidateCredentials()
+      }}><option value="session">브라우저 세션</option><option value="local">로컬 개발 키</option></select></label>
       <label>정책 Release<select aria-label="정책 Release" value={releaseId} onChange={event => {
-        const next = event.target.value; setReleaseId(next); setSession(null); onReleaseChange?.(next)
+        const next = event.target.value; connectionToken.current++; setReleaseId(next); setSession(null); onReleaseChange?.(next)
       }}><option value="">Release 선택</option>{releases.map(release => <option key={release.id} value={release.id}>Release v{release.version} · {release.id}</option>)}</select></label>
       <label>검토자 키<input aria-label="검토자 키" type="password" autoComplete="off" spellCheck={false} value={reviewerKey} onChange={event => {
-        setReviewerKey(event.target.value); setEpoch(value => value + 1); setSession(null)
+        setReviewerKey(event.target.value); invalidateCredentials()
       }} /></label>
-      <p className="muted">키는 이 화면의 메모리에만 유지됩니다. 페이지를 벗어나면 다시 입력해야 합니다.</p>
-      <button className="primary-button" disabled={!selectedRelease || !reviewerKey}>계약 목록 조회</button>
+      <p className="muted">{authMode === 'session' ? '서버에서 확인한 세션을 사용합니다. 연결에 성공하면 입력한 키를 지웁니다.'
+        : '로컬 개발용 키는 이 화면의 메모리에만 유지되며 요청마다 전송됩니다.'}</p>
+      <div className="button-row span-2">
+        {authMode === 'session' && <>
+          <button className="primary-button" type="button" disabled={!selectedRelease || !reviewerKey || connecting} onClick={() => void connectSession(false)}>키로 세션 연결</button>
+          <button className="secondary-button" type="button" disabled={!selectedRelease || connecting} onClick={() => void connectSession(true)}>기존 세션 복원</button>
+        </>}
+        <button className="secondary-button" disabled={!selectedRelease || connecting || (authMode === 'local' ? !reviewerKey : !currentConnection)}>계약 목록 조회</button>
+      </div>
+      {connecting && <p className="muted span-2" role="status">검토자 세션 연결 응답을 기다리는 중</p>}
     </form>
+    <ErrorBanner error={connectionError} />
+    {currentConnection && <Notice title="검토자 세션 연결됨">
+      <DataTable caption="확인된 검토자 세션" headings={['기록', '값']} rows={[
+        ['검토자', <code>{currentConnection.credential.actorId}</code>],
+        ['Workspace', <code>{currentConnection.credential.workspaceId}</code>],
+        ['만료', new Date(currentConnection.credential.expiresAt * 1000).toLocaleString('ko-KR')],
+      ]} />
+    </Notice>}
     {records.size > 0 && <Notice title={`확인할 이전 요청 ${records.size}건`} tone="amber">
       <ul>{Array.from(records.values()).map(record => <li key={targetKey(record.operation.identity)}>
         계약 v{record.operation.identity.version} · <code>{record.operation.identity.versionId}</code> · {record.phase === 'pending' ? '응답 대기 중' : '처리 여부 미확정'}
       </li>)}</ul>
-      버전이나 키를 바꿔도 이전 요청이 취소되지는 않습니다. 해당 버전에서 처리 상태를 확인해 주세요.
+      버전이나 인증 방식을 바꿔도 이전 요청이 취소되지는 않습니다. 해당 버전에서 처리 상태를 확인해 주세요.
     </Notice>}
     {Array.from(generationRecords.values()).filter(record => record.phase === 'unknown' || record.phase === 'submitting').map(record =>
       <Notice key={record.request.releaseId} title={record.phase === 'unknown' ? '생성 접수 여부 미확정' : '생성 접수 응답 대기 중'} tone="amber">
@@ -231,7 +335,7 @@ export function StoredContractReviewPage({ releases, preferredReleaseId, onRelea
       : currentSession ? <ReviewSession key={currentSession.id} context={currentSession} records={records} perform={perform}
           generationRecord={generationRecords.get(currentSession.releaseId)} submitGeneration={submitGeneration}
           pollGeneration={pollGeneration} generationReading={generationReading} patchBindings={patchBindings} bindPatch={bindPatch} />
-        : <Notice title="검토할 릴리스와 검토자 키를 입력해 주세요.">계약 목록을 조회한 뒤 검토할 버전을 직접 선택하세요.</Notice>}
+        : <Notice title="검토할 릴리스와 인증 방식을 선택해 주세요.">세션을 연결하거나 로컬 개발 키를 적용한 뒤 검토할 버전을 직접 선택하세요.</Notice>}
   </div>
 }
 
@@ -271,13 +375,13 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
   const mutationController = useRef<AbortController | null>(null)
   const sending = useRef(false)
   const record = selected ? records.get(targetKey(selected)) : undefined
-  const current = (token: number) => mounted.current && generation.current === token
+  const current = (token: number) => mounted.current && generation.current === token && credentialCurrent(context.credential)
 
   useEffect(() => {
     mounted.current = true
     const token = ++generation.current
     const controller = new AbortController(); getController.current = controller
-    void context.client.listVersions(context.releaseId, context.reviewerKey, controller.signal)
+    void context.client.listVersions(context.releaseId, context.credential, controller.signal)
       .then(items => { if (current(token)) setVersions(items) })
       .catch(cause => { if (current(token)) setError(safeError(cause)) })
       .finally(() => { if (current(token)) setBusy(false) })
@@ -319,13 +423,13 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
     setBusy(true); setReview(null); setSelected(null); setConfirmation(null); setConsent(false); setComment('')
     setError(null); setCandidateReadFailed(false); setMessage(''); setReconciledKey(null)
     try {
-      const items = await context.client.listVersions(context.releaseId, context.reviewerKey, controller.signal)
+      const items = await context.client.listVersions(context.releaseId, context.credential, controller.signal)
       if (!current(token)) return
       const operation = candidateOperation(generationRecord.operation)!
       const candidate = items.find(item => item.identity.versionId === operation.result.contractVersionId)
       if (!candidate || !candidateMatches(generationRecord, candidate)) throw new ContractRequestError(null,
         { code: 'CONTRACT_RESPONSE_INVALID', retryable: false }, 'not_sent')
-      const loaded = await context.client.review(candidate.identity, context.reviewerKey, controller.signal)
+      const loaded = await context.client.review(candidate.identity, context.credential, controller.signal)
       if (!current(token)) return
       if (!candidateMatches(generationRecord, loaded)) throw new ContractRequestError(null,
         { code: 'CONTRACT_RESPONSE_INVALID', retryable: false }, 'not_sent')
@@ -350,7 +454,7 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
     if (!options.preserveMessage) setMessage('')
     if (!options.preserveError) setError(null)
     try {
-      const loaded = await context.client.review(identity, context.reviewerKey, controller.signal)
+      const loaded = await context.client.review(identity, context.credential, controller.signal)
       if (!current(token)) return
       setReview(loaded); updateVersion(loaded)
       const pending = records.get(targetKey(identity))
@@ -442,8 +546,9 @@ function ReviewSession({ context, records, perform, generationRecord, submitGene
           {generationRecord.readError && <Notice title="생성 상태 조회 실패" tone="amber">마지막 정상 상태를 유지합니다. 조회 실패는 작업 실패가 아닙니다.<ErrorBanner error={generationRecord.readError} /></Notice>}
           {generationRecord.operation.status === 'RECOVERY_REQUIRED' && <Notice title="생성 작업 운영 복구 필요" tone="amber">외부 실행 여부가 불확실합니다. 새 생성 요청을 보내지 말고 운영 확인을 진행해 주세요.</Notice>}
           {generationRecord.operation.status === 'SUCCEEDED' && !candidateOperation(generationRecord.operation) && <Notice title="생성 판단 완료 · 저장 후보 없음">이 결과에서 검토하거나 승인할 새 후보는 없습니다.</Notice>}
+          {!canReadGeneration(generationRecord, context) && <Notice title="이전 인증의 생성 기록" tone="amber">이 작업의 원래 API 연결과 검토자 범위가 확인되어야 상태를 조회할 수 있습니다. 이전 기록과 생성 요청 잠금은 유지됩니다.</Notice>}
           <div className="button-row">
-            <button className="secondary-button" disabled={generationReading} onClick={() => pollGeneration(context)}>생성 상태 다시 조회</button>
+            <button className="secondary-button" disabled={generationReading || !canReadGeneration(generationRecord, context)} onClick={() => pollGeneration(context)}>생성 상태 다시 조회</button>
             {candidateOperation(generationRecord.operation) && <button className="secondary-button" disabled={busy || mutationPending || generationRecord.client !== context.client || generationRecord.epoch !== context.epoch || generationRecord.releaseSignature !== context.releaseSignature} onClick={() => void openGeneratedCandidate()}>생성된 후보 검토</button>}
           </div>
           {generationReading && <p role="status">생성 상태를 조회하는 중</p>}

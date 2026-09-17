@@ -185,6 +185,7 @@ function livePolicyApi() {
 
 async function applyLiveReviewer(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByRole('heading', { name: '안전 정책 검토' })
+  await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
   await user.selectOptions(screen.getByLabelText('정책 Release'), selectedReleaseId)
   await user.type(screen.getByLabelText('검토자 키'), reviewerKey)
   await user.click(screen.getByRole('button', { name: '계약 목록 조회' }))
@@ -200,6 +201,7 @@ describe('live stored contract review routing', () => {
     await screen.findByRole('heading', { name: '안전 정책 검토' })
     expect(screen.getByLabelText('정책 Release')).toHaveValue('')
     expect(backend.contracts()).toHaveLength(0)
+    await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')
     await user.selectOptions(screen.getByLabelText('정책 Release'), selectedReleaseId)
     await user.type(screen.getByLabelText('검토자 키'), reviewerKey)
     expect(backend.contracts()).toHaveLength(0)
