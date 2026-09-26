@@ -230,24 +230,27 @@ export class FinsecApiClient {
 
   testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
   startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
-  async eventHistory(runId: string, actorId: string): Promise<EventHistory> {
+  async eventHistory(runId: string, actorId: string, after = 0): Promise<EventHistory> {
+    if (!Number.isSafeInteger(after) || after < 0) {
+      throw new Error('Event history cursor is invalid')
+    }
     const limit = 1000
     const items: EventHistory['items'] = []
     const eventIds = new Set<string>()
-    let after = 0
+    let cursor = after
     let snapshotHead: number | null = null
     let pages = 0
 
     while (true) {
-      if (snapshotHead !== null && pages >= Math.max(1, Math.ceil(snapshotHead / limit))) {
+      if (snapshotHead !== null && pages >= Math.max(1, Math.ceil((snapshotHead - after) / limit))) {
         throw new Error('Event history snapshot is incomplete')
       }
       const page = await this.request<EventHistory>(
-        `/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=${after}&limit=${limit}`,
+        `/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=${cursor}&limit=${limit}`,
         {}, { actorId },
       )
       pages += 1
-      if (!Number.isSafeInteger(page.headSequence) || page.headSequence < 0
+      if (!Number.isSafeInteger(page.headSequence) || page.headSequence < cursor
         || !Array.isArray(page.items) || page.items.length > limit) {
         throw new Error('Event history page is invalid')
       }
@@ -256,11 +259,11 @@ export class FinsecApiClient {
         throw new Error('Event history page is invalid')
       }
       if (page.nextCursor !== null && (!Number.isSafeInteger(page.nextCursor)
-        || page.nextCursor <= after || page.items.length !== limit)) {
+        || page.nextCursor <= cursor || page.items.length !== limit)) {
         throw new Error('Event history cursor is invalid')
       }
 
-      let expectedSequence = after + 1
+      let expectedSequence = cursor + 1
       for (const event of page.items) {
         if (!event || event.runId !== runId || event.sequence !== expectedSequence
           || typeof event.eventId !== 'string' || !event.eventId || eventIds.has(event.eventId)) {
@@ -277,13 +280,13 @@ export class FinsecApiClient {
         && page.nextCursor !== page.items[page.items.length - 1]?.sequence) {
         throw new Error('Event history cursor is invalid')
       }
-      if (items.length === snapshotHead) {
+      if (items.length === snapshotHead - after) {
         return { items, headSequence: snapshotHead, nextCursor: null }
       }
       if (page.nextCursor === null) {
         throw new Error('Event history snapshot is incomplete')
       }
-      after = page.nextCursor
+      cursor = page.nextCursor
     }
   }
   verifyEventChain(runId: string, actorId: string): Promise<EventChainVerification> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/events:verify`, {}, { actorId }) }

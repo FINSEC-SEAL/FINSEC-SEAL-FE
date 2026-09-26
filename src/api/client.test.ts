@@ -248,6 +248,44 @@ describe('FinsecApiClient', () => {
     }
   })
 
+  it('loads a complete contiguous catch-up after a nonzero Run cursor', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: Array.from({ length: 1000 }, (_, index) => historyEvent(index + 1001)),
+        headSequence: 2002, nextCursor: 2000,
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: [historyEvent(2001), historyEvent(2002)],
+        headSequence: 2002, nextCursor: null,
+      } }))
+    const client = new FinsecApiClient('http://api.test')
+
+    const caughtUp = await client.eventHistory('run-1', 'role-a-console', 1000)
+
+    expect(caughtUp.headSequence).toBe(2002)
+    expect(caughtUp.items).toHaveLength(1002)
+    expect(caughtUp.items[0]?.sequence).toBe(1001)
+    expect(caughtUp.items.at(-1)?.sequence).toBe(2002)
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://api.test/api/v1/test-runs/run-1/event-history?after=1000&limit=1000',
+      'http://api.test/api/v1/test-runs/run-1/event-history?after=2000&limit=1000',
+    ])
+  })
+
+  it('accepts an empty catch-up at the current head and rejects invalid local cursors', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: {
+      items: [], headSequence: 10, nextCursor: null,
+    } }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.eventHistory('run-1', 'role-a-console', 10)).resolves.toEqual({
+      items: [], headSequence: 10, nextCursor: null,
+    })
+    await expect(client.eventHistory('run-1', 'role-a-console', -1)).rejects.toThrow(/cursor/)
+    await expect(client.eventHistory('run-1', 'role-a-console', 1.5)).rejects.toThrow(/cursor/)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
   it('returns an empty event snapshot for an empty Run', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: {
       items: [], headSequence: 0, nextCursor: null,
