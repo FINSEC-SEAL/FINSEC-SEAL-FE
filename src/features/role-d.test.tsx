@@ -1,7 +1,7 @@
-import { render, screen } from '@testing-library/react'
+import { render, screen, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { api } from '../api/client'
-import type { Finding, MetricValue, Release } from '../api/contracts'
+import type { Finding, MetricValue, MetricsView, Release } from '../api/contracts'
 import { AssurancePage } from './Assurance'
 import { FindingsPage } from './Findings'
 
@@ -69,13 +69,48 @@ describe('Role D console', () => {
     vi.spyOn(api, 'metrics').mockResolvedValue({ releaseId: release.id, metrics: {
       attackSuccessRate: unavailable('ASR'), attackBlockRate: unavailable('ABR'), heldOutAttackSuccessRate: unavailable('HeldOutASR'),
       normalTaskSuccessRate: unavailable('NTSR'), falseBlockRate: unavailable('FBR'), operationalErrorRate: unavailable('OperationalErrorRate'),
-      unauthorizedRecordExposureCount: 0, sensitiveFieldExposureCount: 0, exfiltrationSuccessCount: 0, highImpactMutationCount: 0,
+      unauthorizedRecordExposureCount: null, sensitiveFieldExposureCount: null,
+      exfiltrationSuccessCount: null, highImpactMutationCount: null,
       normalConclusiveTrials: 0, trials: [],
     } })
     render(<AssurancePage releases={[release]} actorId="role-d-console" />)
 
-    expect((await screen.findAllByText('N/A')).length).toBe(6)
-    expect(screen.getByText(/N\/A는 0이 아니라/)).toBeInTheDocument()
+    expect((await screen.findAllByText('N/A')).length).toBe(10)
+    expect(screen.getByText(/N\/A는 0이 아니라 정확한 건수를/)).toBeInTheDocument()
+  })
+
+  it('preserves evidenced zero and hides unsafe effect count claims', async () => {
+    vi.spyOn(api, 'metrics').mockResolvedValue({ releaseId: release.id, metrics: {
+      attackSuccessRate: unavailable('ASR'), attackBlockRate: unavailable('ABR'), heldOutAttackSuccessRate: unavailable('HeldOutASR'),
+      normalTaskSuccessRate: unavailable('NTSR'), falseBlockRate: unavailable('FBR'), operationalErrorRate: unavailable('OperationalErrorRate'),
+      unauthorizedRecordExposureCount: null, sensitiveFieldExposureCount: 0,
+      exfiltrationSuccessCount: Number.MAX_SAFE_INTEGER + 1, highImpactMutationCount: 2,
+      normalConclusiveTrials: 0, trials: [],
+    } })
+    render(<AssurancePage releases={[release]} actorId="role-d-console" />)
+
+    await screen.findByText('Observed security effects')
+    expect(within(screen.getByText('Unauthorized records').parentElement!).getByText('N/A')).toBeInTheDocument()
+    expect(within(screen.getByText('Sensitive fields').parentElement!).getByText('0')).toBeInTheDocument()
+    expect(within(screen.getByText('Exfiltrations').parentElement!).getByText('N/A')).toBeInTheDocument()
+    expect(within(screen.getByText('High-impact mutations').parentElement!).getByText('2')).toBeInTheDocument()
+  })
+
+  it('does not claim exact effects from malformed or omitted legacy counts', async () => {
+    vi.spyOn(api, 'metrics').mockResolvedValue({ releaseId: release.id, metrics: {
+      attackSuccessRate: unavailable('ASR'), attackBlockRate: unavailable('ABR'), heldOutAttackSuccessRate: unavailable('HeldOutASR'),
+      normalTaskSuccessRate: unavailable('NTSR'), falseBlockRate: unavailable('FBR'), operationalErrorRate: unavailable('OperationalErrorRate'),
+      unauthorizedRecordExposureCount: -1, sensitiveFieldExposureCount: 1.5,
+      exfiltrationSuccessCount: 0,
+      normalConclusiveTrials: 0, trials: [],
+    } } as unknown as MetricsView)
+    render(<AssurancePage releases={[release]} actorId="role-d-console" />)
+
+    await screen.findByText('Observed security effects')
+    expect(within(screen.getByText('Unauthorized records').parentElement!).getByText('N/A')).toBeInTheDocument()
+    expect(within(screen.getByText('Sensitive fields').parentElement!).getByText('N/A')).toBeInTheDocument()
+    expect(within(screen.getByText('Exfiltrations').parentElement!).getByText('0')).toBeInTheDocument()
+    expect(within(screen.getByText('High-impact mutations').parentElement!).getByText('N/A')).toBeInTheDocument()
   })
 
   it('shows replay comparability and mismatch reasons when B/C evidence is available', async () => {
