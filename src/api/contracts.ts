@@ -44,7 +44,10 @@ export interface AgentCreate {
 export type ReleaseLifecycle =
   | 'DRAFT'
   | 'ANALYZED'
+  | 'TESTING'
+  | 'REMEDIATION'
   | 'VERIFYING'
+  | 'DECISION_PENDING'
   | 'PASS'
   | 'REVIEW'
   | 'BLOCKED'

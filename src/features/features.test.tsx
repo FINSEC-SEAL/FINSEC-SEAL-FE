@@ -109,6 +109,27 @@ describe('Role A feature consoles', () => {
     expect(screen.getByText('temperature must be a JSON number')).toBeInTheDocument()
   })
 
+  it.each([
+    ['TESTING', 'REMEDIATION'],
+    ['REMEDIATION', 'REMEDIATION'],
+    ['DECISION_PENDING', 'DECISION_PENDING'],
+  ] as const)('shows Release lifecycle %s and effective status %s separately', async (lifecycleState, effectiveStatus) => {
+    vi.spyOn(api, 'listReleases').mockResolvedValue([{ ...release, lifecycleState, effectiveStatus }])
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    const detail = document.querySelector('.release-detail')
+    expect(detail).not.toBeNull()
+    const lifecycleRow = within(detail as HTMLElement).getByText('Release 단계').closest('div')
+    const effectiveRow = within(detail as HTMLElement).getByText('현재 유효 상태').closest('div')
+    expect(lifecycleRow?.querySelector('dd')).toHaveTextContent(lifecycleState.replaceAll('_', ' '))
+    expect(effectiveRow?.querySelector('dd')).toHaveTextContent(effectiveStatus.replaceAll('_', ' '))
+    expect(lifecycleRow?.querySelector('.status')).toHaveClass('status--neutral')
+    expect(effectiveRow?.querySelector('.status')).toHaveClass('status--neutral')
+    expect(within(detail as HTMLElement).queryByText('최종 판정')).not.toBeInTheDocument()
+  })
+
   it('discards a late validation result after another Release is selected', async () => {
     const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
     vi.spyOn(api, 'listReleases').mockResolvedValue([release, nextRelease])
