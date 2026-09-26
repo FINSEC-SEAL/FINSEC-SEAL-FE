@@ -183,6 +183,65 @@ function livePolicyApi() {
   return { fetch, handlers, contracts, posts: () => contracts().filter(([, init]) => init?.method === 'POST') }
 }
 
+describe('live Release identity navigation', () => {
+  it('opens the exact inventory Release in Manifest and Evidence, then restores it on reload', async () => {
+    window.history.replaceState(null, '', '/#/live/releases')
+    livePolicyApi()
+    const user = userEvent.setup()
+    const view = render(<App />)
+    await screen.findByRole('heading', { name: '릴리스 버전 관리' })
+
+    await user.click(within(screen.getByText('v2.0.0').closest('tr')!).getByRole('button', { name: '릴리스 열기 →' }))
+    expect(await screen.findByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
+    expect(window.location.hash).toBe(`#/live/manifest?releaseId=${selectedReleaseId}`)
+    await user.click(within(screen.getByRole('navigation', { name: '주요 메뉴' })).getByRole('button', { name: '구성·증거' }))
+    expect(screen.getByLabelText('Release')).toHaveValue(selectedReleaseId)
+    expect(window.location.hash).toBe(`#/live/evidence?releaseId=${selectedReleaseId}`)
+
+    view.unmount()
+    render(<App />)
+    await screen.findByRole('heading', { name: '구성과 증거' })
+    expect(screen.getByLabelText('Release')).toHaveValue(selectedReleaseId)
+  })
+
+  it('updates the URL from Evidence selection and restores the chosen ID on hash history changes', async () => {
+    window.history.replaceState(null, '', `/#/live/evidence?releaseId=${liveReleaseId}`)
+    livePolicyApi()
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: '구성과 증거' })
+    expect(screen.getByLabelText('Release')).toHaveValue(liveReleaseId)
+
+    await user.selectOptions(screen.getByLabelText('Release'), selectedReleaseId)
+    expect(window.location.hash).toBe(`#/live/evidence?releaseId=${selectedReleaseId}`)
+    act(() => { window.location.hash = `/live/evidence?releaseId=${liveReleaseId}`; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    expect(screen.getByLabelText('Release')).toHaveValue(liveReleaseId)
+    act(() => { window.location.hash = `/live/evidence?releaseId=${selectedReleaseId}`; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+    expect(screen.getByLabelText('Release')).toHaveValue(selectedReleaseId)
+  })
+
+  it('never falls back to another Release for an unknown direct-link ID', async () => {
+    window.history.replaceState(null, '', '/#/live/evidence?releaseId=missing-release')
+    livePolicyApi()
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: '선택한 Release를 찾을 수 없습니다.' })).toBeInTheDocument()
+    expect(screen.getByText('다른 Release로 자동 전환하지 않습니다.')).toBeInTheDocument()
+    expect(screen.queryByRole('button', { name: 'Attestation 검증' })).not.toBeInTheDocument()
+  })
+
+  it('ignores a live Release query when opening the isolated demo Evidence page', async () => {
+    window.history.replaceState(null, '', `/#/demo/evidence?releaseId=${selectedReleaseId}`)
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    render(<App />)
+
+    await screen.findByRole('heading', { name: '구성과 증거' })
+    expect(screen.getByLabelText('Release')).not.toHaveValue(selectedReleaseId)
+    expect(screen.getByText('SIMULATED · 합성 체험')).toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
 async function applyLiveReviewer(user: ReturnType<typeof userEvent.setup>) {
   await screen.findByRole('heading', { name: '안전 정책 검토' })
   await user.selectOptions(screen.getByLabelText('인증 방식'), 'local')

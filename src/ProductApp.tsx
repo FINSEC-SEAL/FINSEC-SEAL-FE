@@ -100,7 +100,9 @@ function ProductApp({ mode, page, releaseId, go }: { mode: Mode; page: Page; rel
       preferredReleaseId={simulated ? undefined : selectedReleaseId}
       onReleaseSelect={release => go(mode, page, release?.id ?? null)} client={client}
       onReleaseInventory={(items, agentId) => setReleases(current => [...current.filter(r => r.agentId !== agentId), ...items])} /></>
-    if (page === 'evidence') return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}<EvidencePage releases={releases} actorId={actorId} client={client} simulated={simulated} /></>
+    if (page === 'evidence') return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}<EvidencePage releases={releases} actorId={actorId}
+      preferredReleaseId={simulated ? undefined : selectedReleaseId} onReleaseChange={simulated ? undefined : changeReleaseId}
+      client={client} simulated={simulated} /></>
     if (page === 'audit') return <>{simulated && <Notice title="샘플 감사 리소스">Resource type: AGENT_RELEASE<br /><code>{DEMO_RELEASE_ID}</code></Notice>}<AuditPage actorId={actorId} client={client} /></>
     if (page === 'recovery') return <RecoveryPage actorId={actorId} onActorChange={actor => { setActorId(actor); setActorDraft(actor) }} client={client} simulated={simulated} />
     const props = { navigate, workflow }
