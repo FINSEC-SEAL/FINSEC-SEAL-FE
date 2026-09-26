@@ -1,7 +1,7 @@
-import { act, render, screen, waitFor } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { api } from '../api/client'
-import type { Agent, Fingerprint, PendingRecovery, Release, ValidationResult } from '../api/contracts'
+import type { Agent, Attestation, Fingerprint, JsonValue, PendingRecovery, Release, ValidationResult } from '../api/contracts'
 import { AgentsPage, ReleasesPage } from './AgentsReleases'
 import { AuditPage } from './Audit'
 import { EvidencePage } from './Evidence'
@@ -34,6 +34,28 @@ const release: Release = {
   lastTestedAt: null,
   createdAt: '2026-09-01T00:00:00Z',
   updatedAt: '2026-09-01T00:00:00Z',
+}
+const effectRunId = '0198f200-0000-7000-8000-000000000010'
+
+function effectAttestation(document: Record<string, JsonValue>, stale = false): Attestation {
+  return {
+    id: '0198f200-0000-7000-8000-000000000003',
+    releaseDecisionId: '0198f200-0000-7000-8000-000000000004',
+    document,
+    documentHash: `sha256:${'c'.repeat(64)}`,
+    generatedAt: '2026-09-01T00:00:00Z',
+    disclaimerVersion: 'finsec-internal/v1',
+    stale,
+    invalidation: stale ? { reason: 'MODEL_CHANGE' } : null,
+  }
+}
+
+function observedCounts(exfiltration: JsonValue): JsonValue[] {
+  return [{
+    metric: 'UnauthorizedRecordExposureCount', calculatorVersion: 'mvp-metrics/1',
+    status: 'AVAILABLE', value: 2, sourceTestRunIds: [effectRunId],
+    evidenceDigest: `sha256:${'a'.repeat(64)}`,
+  }, exfiltration]
 }
 
 describe('Role A feature consoles', () => {
@@ -428,6 +450,92 @@ describe('Role A feature consoles', () => {
     expect(await screen.findByRole('heading', { name: 'Historical attestation' })).toBeInTheDocument()
     expect(screen.getByText('STALE / NEEDS REVALIDATION')).toBeInTheDocument()
     expect(screen.getByText('BLOCKED')).toBeInTheDocument()
+    expect(screen.getByText('이전 증명서에는 관측 효과 건수가 없습니다. 0건으로 간주하지 않습니다.')).toBeInTheDocument()
+  })
+
+  it('shows stored observed counts including an actual zero while retaining the stale banner', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({
+      decision: { value: 'REVIEW' },
+      observedEffectCounts: observedCounts({
+        metric: 'ExfiltrationSuccessCount', calculatorVersion: 'mvp-metrics/1',
+        status: 'AVAILABLE', value: 0, sourceTestRunIds: [effectRunId],
+        evidenceDigest: `sha256:${'b'.repeat(64)}`,
+      }),
+    }, true))
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="role-a-console" />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+
+    const effects = within(await screen.findByRole('region', { name: '관측 효과 건수' }))
+    expect(effects.getByText('무단 고객 레코드 노출')).toBeInTheDocument()
+    expect(effects.getByText('2건')).toBeInTheDocument()
+    expect(effects.getByText('외부 반출 성공')).toBeInTheDocument()
+    expect(effects.getByText('0건')).toBeInTheDocument()
+    expect(screen.getByText('STALE / NEEDS REVALIDATION')).toBeInTheDocument()
+  })
+
+  it('shows an explicit unavailable reason without inventing a zero count', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({
+      decision: { value: 'REVIEW' },
+      observedEffectCounts: observedCounts({
+        metric: 'ExfiltrationSuccessCount', calculatorVersion: 'mvp-metrics/1',
+        status: 'N_A', reason: 'No conclusive attack trial', sourceTestRunIds: [],
+      }),
+    }))
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="role-a-console" />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+
+    const effects = within(await screen.findByRole('region', { name: '관측 효과 건수' }))
+    expect(effects.getByText('N/A · No conclusive attack trial')).toBeInTheDocument()
+    expect(effects.queryByText('0건')).not.toBeInTheDocument()
+  })
+
+  it('rejects a malformed present count array instead of showing a numeric claim', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({
+      decision: { value: 'REVIEW' },
+      observedEffectCounts: observedCounts({
+        metric: 'ExfiltrationSuccessCount', calculatorVersion: 'mvp-metrics/1',
+        status: 'AVAILABLE', value: Number.MAX_SAFE_INTEGER + 1,
+        sourceTestRunIds: [effectRunId], evidenceDigest: `sha256:${'b'.repeat(64)}`,
+      }),
+    }))
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="role-a-console" />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+
+    const effects = within(await screen.findByRole('region', { name: '관측 효과 건수' }))
+    expect(effects.getByRole('alert')).toHaveTextContent('저장 형식을 확인할 수 없습니다')
+    expect(effects.queryByText('2건')).not.toBeInTheDocument()
+    expect(effects.queryByText('0건')).not.toBeInTheDocument()
+    expect(effects.queryByText(/이전 증명서/)).not.toBeInTheDocument()
+  })
+
+  it.each([
+    ['empty', []],
+    ['malformed', ['not-a-run-id']],
+    ['duplicate', [effectRunId, effectRunId.toUpperCase()]],
+  ])('does not display a numeric effect for %s AVAILABLE source runs', async (_case, sourceTestRunIds) => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({
+      decision: { value: 'REVIEW' },
+      observedEffectCounts: observedCounts({
+        metric: 'ExfiltrationSuccessCount', calculatorVersion: 'mvp-metrics/1',
+        status: 'AVAILABLE', value: 0, sourceTestRunIds,
+        evidenceDigest: `sha256:${'b'.repeat(64)}`,
+      }),
+    }))
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="role-a-console" />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+
+    const effects = within(await screen.findByRole('region', { name: '관측 효과 건수' }))
+    expect(effects.getByRole('alert')).toHaveTextContent('저장 형식을 확인할 수 없습니다')
+    expect(effects.queryByText('2건')).not.toBeInTheDocument()
+    expect(effects.queryByText('0건')).not.toBeInTheDocument()
   })
 
   it('shows the confirmed Decision instead of assuming a current Attestation passed', async () => {
