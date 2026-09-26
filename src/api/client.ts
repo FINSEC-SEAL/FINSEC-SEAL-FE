@@ -103,7 +103,7 @@ export class FinsecApiClient {
             // Preserve the status when an intermediary returns a non-JSON response.
           }
           const error = new FinsecApiError(response.status, problem)
-          if (attempt < maxRetries && error.retryable) {
+          if (attempt < maxRetries && error.retryable && error.code !== 'STREAM_CURSOR_EXPIRED') {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
             continue
           }
@@ -112,7 +112,11 @@ export class FinsecApiClient {
         return ((await response.json()) as ApiEnvelope<T>).data
       } catch (error) {
         lastError = error
-        if (error instanceof FinsecApiError && error.retryable && attempt < maxRetries) {
+        if (error instanceof FinsecApiError && error.code === 'STREAM_CURSOR_EXPIRED') {
+          throw error
+        }
+        if (error instanceof FinsecApiError && error.retryable
+          && attempt < maxRetries) {
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
           continue
         }
@@ -226,7 +230,62 @@ export class FinsecApiClient {
 
   testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
   startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
-  eventHistory(runId: string, actorId: string): Promise<EventHistory> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=0&limit=100`, {}, { actorId }) }
+  async eventHistory(runId: string, actorId: string): Promise<EventHistory> {
+    const limit = 1000
+    const items: EventHistory['items'] = []
+    const eventIds = new Set<string>()
+    let after = 0
+    let snapshotHead: number | null = null
+    let pages = 0
+
+    while (true) {
+      if (snapshotHead !== null && pages >= Math.max(1, Math.ceil(snapshotHead / limit))) {
+        throw new Error('Event history snapshot is incomplete')
+      }
+      const page = await this.request<EventHistory>(
+        `/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=${after}&limit=${limit}`,
+        {}, { actorId },
+      )
+      pages += 1
+      if (!Number.isSafeInteger(page.headSequence) || page.headSequence < 0
+        || !Array.isArray(page.items) || page.items.length > limit) {
+        throw new Error('Event history page is invalid')
+      }
+      snapshotHead ??= page.headSequence
+      if (page.headSequence < snapshotHead) {
+        throw new Error('Event history page is invalid')
+      }
+      if (page.nextCursor !== null && (!Number.isSafeInteger(page.nextCursor)
+        || page.nextCursor <= after || page.items.length !== limit)) {
+        throw new Error('Event history cursor is invalid')
+      }
+
+      let expectedSequence = after + 1
+      for (const event of page.items) {
+        if (!event || event.runId !== runId || event.sequence !== expectedSequence
+          || typeof event.eventId !== 'string' || !event.eventId || eventIds.has(event.eventId)) {
+          throw new Error('Event history sequence is invalid')
+        }
+        eventIds.add(event.eventId)
+        if (event.sequence <= snapshotHead) items.push(event)
+        expectedSequence += 1
+      }
+      if (page.items.length && page.headSequence < page.items[page.items.length - 1]!.sequence) {
+        throw new Error('Event history page is invalid')
+      }
+      if (page.nextCursor !== null
+        && page.nextCursor !== page.items[page.items.length - 1]?.sequence) {
+        throw new Error('Event history cursor is invalid')
+      }
+      if (items.length === snapshotHead) {
+        return { items, headSequence: snapshotHead, nextCursor: null }
+      }
+      if (page.nextCursor === null) {
+        throw new Error('Event history snapshot is incomplete')
+      }
+      after = page.nextCursor
+    }
+  }
   verifyEventChain(runId: string, actorId: string): Promise<EventChainVerification> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/events:verify`, {}, { actorId }) }
   runFindings(runId: string, actorId: string): Promise<Finding[]> { return this.request<{items:Finding[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/findings`, {}, { actorId }).then(v=>v.items) }
   runOracleResults(runId: string, actorId: string): Promise<OracleResult[]> { return this.request<{items:OracleResult[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/oracle-results`, {}, { actorId }).then(v=>v.items) }
