@@ -251,10 +251,10 @@ export interface ReleaseMetrics {
   normalTaskSuccessRate: MetricValue
   falseBlockRate: MetricValue
   operationalErrorRate: MetricValue
-  unauthorizedRecordExposureCount: number
-  sensitiveFieldExposureCount: number
-  exfiltrationSuccessCount: number
-  highImpactMutationCount: number
+  unauthorizedRecordExposureCount: number | null
+  sensitiveFieldExposureCount: number | null
+  exfiltrationSuccessCount: number | null
+  highImpactMutationCount: number | null
   normalConclusiveTrials: number
   trials: TrialEvaluation[]
 }
