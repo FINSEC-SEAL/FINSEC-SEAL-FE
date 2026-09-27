@@ -1,4 +1,4 @@
-import { useEffect, useState, type FormEvent } from 'react'
+import { useEffect, useRef, useState, type FormEvent } from 'react'
 import type { Agent, JsonValue, Release, ValidationResult } from '../api/contracts'
 import { api, type PlatformClient } from '../api/client'
 import { EmptyState, ErrorBanner, PageHeader, ShortHash, StatusBadge, formatDate } from '../components/Primitives'
@@ -63,13 +63,14 @@ export function AgentsPage({ agents, actorId, onChanged, onSelect, client = api 
   </>
 }
 
-export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory, onReleaseSelect, client = api }: {
+export function ReleasesPage({ agents, actorId, initialAgent, preferredReleaseId, onReleaseInventory, onReleaseSelect, client = api }: {
   client?: PlatformClient
   agents: Agent[]
   actorId: string
   initialAgent: Agent | null
+  preferredReleaseId?: string
   onReleaseInventory: (releases: Release[], agentId: string) => void
-  onReleaseSelect?: (release: Release) => void
+  onReleaseSelect?: (release: Release | null) => void
 }) {
   const [agentId, setAgentId] = useState(initialAgent?.id ?? agents.find((a) => a.status === 'ACTIVE')?.id ?? '')
   const [releases, setReleases] = useState<Release[]>([])
@@ -79,46 +80,99 @@ export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory
   const [fingerprint, setFingerprint] = useState<Record<string, string> | null>(null)
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<unknown>()
+  const agentIdRef = useRef(agentId)
+  const selectedIdRef = useRef<string | null>(null)
+  const listRequest = useRef(0)
+  const actionRequest = useRef(0)
+
+  function selectRelease(release: Release | null, notify = true) {
+    selectedIdRef.current = release?.id ?? null
+    actionRequest.current++
+    setSelected(release)
+    setValidation(null)
+    setFingerprint(null)
+    setError(undefined)
+    setBusy(false)
+    if (notify) onReleaseSelect?.(release)
+  }
+
+  function switchAgent(id: string, notify = true) {
+    agentIdRef.current = id
+    listRequest.current++
+    setAgentId(id)
+    setReleases([])
+    selectRelease(null, notify)
+  }
+
+  useEffect(() => { if (initialAgent && initialAgent.id !== agentIdRef.current) switchAgent(initialAgent.id, false) }, [initialAgent?.id]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    if (preferredReleaseId !== undefined) {
+      const match = releases.find(release => release.id === preferredReleaseId) ?? null
+      if (selectedIdRef.current !== (match?.id ?? null)) {
+        selectedIdRef.current = match?.id ?? null
+        actionRequest.current++
+        setValidation(null)
+        setFingerprint(null)
+        setError(undefined)
+        setBusy(false)
+      }
+      setSelected(match)
+    }
+  }, [preferredReleaseId, releases])
 
   async function load(id = agentId) {
+    const request = ++listRequest.current
     if (!id) { setReleases([]); return }
     try {
       const result = await client.listReleases(id, actorId)
+      if (request !== listRequest.current || id !== agentIdRef.current) return
       setReleases(result); onReleaseInventory(result, id)
-      if (selected) setSelected(result.find((release) => release.id === selected.id) ?? null)
-    } catch (cause) { setError(cause) }
+      if (preferredReleaseId === undefined && selectedIdRef.current) {
+        const refreshed = result.find((release) => release.id === selectedIdRef.current) ?? null
+        if (!refreshed) selectRelease(null)
+        else setSelected(refreshed)
+      }
+    } catch (cause) { if (request === listRequest.current && id === agentIdRef.current) setError(cause) }
   }
   useEffect(() => { void load() }, [agentId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function create(event: FormEvent) {
     event.preventDefault(); setBusy(true); setError(undefined)
+    const creatingAgentId = agentIdRef.current
+    const selectionVersion = actionRequest.current
     try {
       if (new TextEncoder().encode(manifestText).length > 2 * 1024 * 1024) throw new Error('Manifest는 최대 2 MB까지 등록할 수 있습니다.')
       const parsed = JSON.parse(manifestText) as JsonValue
-      const created = await client.createRelease(agentId, parsed, actorId)
-      setManifestText(''); await load(); setSelected(created); onReleaseSelect?.(created)
-    } catch (cause) { setError(cause instanceof SyntaxError ? new Error('Manifest JSON 문법을 확인하세요.') : cause) }
-    finally { setBusy(false) }
+      const created = await client.createRelease(creatingAgentId, parsed, actorId)
+      if (creatingAgentId !== agentIdRef.current) return
+      setManifestText(''); await load(creatingAgentId)
+      if (creatingAgentId === agentIdRef.current && selectionVersion === actionRequest.current) selectRelease(created)
+    } catch (cause) { if (creatingAgentId === agentIdRef.current && selectionVersion === actionRequest.current) setError(cause instanceof SyntaxError ? new Error('Manifest JSON 문법을 확인하세요.') : cause) }
+    finally { if (creatingAgentId === agentIdRef.current && selectionVersion === actionRequest.current) setBusy(false) }
   }
 
   async function act(kind: 'validate' | 'analyze' | 'fingerprint') {
     if (!selected) return
+    const releaseId = selected.id
+    const actingAgentId = agentIdRef.current
+    const request = ++actionRequest.current
+    const current = () => request === actionRequest.current && releaseId === selectedIdRef.current && actingAgentId === agentIdRef.current
     setBusy(true); setError(undefined); setValidation(null); setFingerprint(null)
     try {
-      if (kind === 'validate') setValidation(await client.validateRelease(selected.id, actorId))
-      if (kind === 'analyze') { await client.analyzeRelease(selected.id, actorId); await load() }
-      if (kind === 'fingerprint') setFingerprint((await client.fingerprint(selected.id, actorId)).components)
-    } catch (cause) { setError(cause) } finally { setBusy(false) }
+      if (kind === 'validate') { const result = await client.validateRelease(releaseId, actorId); if (current()) setValidation(result) }
+      if (kind === 'analyze') { await client.analyzeRelease(releaseId, actorId); if (current()) await load(actingAgentId) }
+      if (kind === 'fingerprint') { const result = await client.fingerprint(releaseId, actorId); if (current()) setFingerprint(result.components) }
+    } catch (cause) { if (current()) setError(cause) } finally { if (current()) setBusy(false) }
   }
 
   return <>
     <PageHeader eyebrow="RELEASE CONFIGURATION" title="Manifest 등록과 구성 분석" description="에이전트가 무엇을 하고 어떤 도구를 사용하는지 검증 대상으로 고정합니다." />
     <ErrorBanner error={error} onDismiss={() => setError(undefined)} />
     <section className="release-layout">
-      <aside className="panel release-sidebar"><label>Agent<select value={agentId} onChange={(event) => { setAgentId(event.target.value); setSelected(null) }}>
+      <aside className="panel release-sidebar"><label>Agent<select value={agentId} onChange={(event) => switchAgent(event.target.value)}>
         <option value="">선택하세요</option>{agents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name} · {agent.status}</option>)}</select></label>
         <div className="release-list">{releases.length === 0 ? <p className="muted">등록된 Release가 없습니다.</p> : releases.map((release) =>
-          <button key={release.id} className={selected?.id === release.id ? 'release-item release-item--active' : 'release-item'} onClick={() => { setSelected(release); onReleaseSelect?.(release); setValidation(null); setFingerprint(null) }}>
+          <button key={release.id} className={selected?.id === release.id ? 'release-item release-item--active' : 'release-item'} onClick={() => selectRelease(release)}>
             <span><strong>v{release.version}</strong><small>{release.id.slice(0, 8)}</small></span><StatusBadge status={release.effectiveStatus} /></button>)}</div>
       </aside>
       <div className="release-main">
@@ -126,8 +180,9 @@ export function ReleasesPage({ agents, actorId, initialAgent, onReleaseInventory
           <textarea className="code-input" aria-label="Release manifest JSON" rows={9} value={manifestText} onChange={(event) => setManifestText(event.target.value)} placeholder={'{\n  "schemaVersion": "1.0",\n  ...\n}'} required />
           <div className="form-actions"><label className="secondary-button file-button">파일 불러오기<input type="file" accept="application/json,.json" onChange={(event) => { const file = event.target.files?.[0]; if (!file) return; if (file.size > 2 * 1024 * 1024) { setError(new Error('Manifest는 최대 2 MB까지 등록할 수 있습니다.')); event.target.value = ''; return } void file.text().then(setManifestText).catch(setError) }} /></label>
             <button className="primary-button" disabled={busy || !agents.some(a => a.id === agentId && a.status === 'ACTIVE')}>{busy ? '처리 중…' : 'Draft Release 등록'}</button></div></form>
-        {selected ? <article className="panel release-detail"><div className="panel-heading"><div><p className="eyebrow">SELECTED RELEASE</p><h2>v{selected.version}</h2></div><StatusBadge status={selected.effectiveStatus} /></div>
+        {selected ? <article className="panel release-detail"><div className="panel-heading"><div><p className="eyebrow">SELECTED RELEASE</p><h2>v{selected.version}</h2></div></div>
           <p>{selected.businessPurpose}</p><dl className="detail-grid"><div><dt>Release ID</dt><dd><ShortHash value={selected.id} /></dd></div><div><dt>Updated</dt><dd>{formatDate(selected.updatedAt)}</dd></div>
+            <div><dt>Release 단계</dt><dd><StatusBadge status={selected.lifecycleState} /></dd></div><div><dt>현재 유효 상태</dt><dd><StatusBadge status={selected.effectiveStatus} /></dd></div>
             <div><dt>Artifact fingerprint</dt><dd><ShortHash value={selected.agentArtifactFingerprint} /></dd></div><div><dt>Release fingerprint</dt><dd><ShortHash value={selected.releaseFingerprint} /></dd></div></dl>
           <div className="button-row"><button className="secondary-button" disabled={busy} onClick={() => void act('validate')}>Manifest 검증</button><button className="secondary-button" disabled={busy || selected.lifecycleState !== 'DRAFT'} onClick={() => void act('analyze')}>Analyze 고정</button><button className="primary-button" disabled={busy || selected.lifecycleState === 'DRAFT'} onClick={() => void act('fingerprint')}>Fingerprint 확인</button></div>
           {validation ? <div className={validation.valid ? 'result-box result-box--pass' : 'result-box result-box--fail'}><strong>{validation.valid ? '✓ Manifest valid' : `${validation.issues.length}개 문제`}</strong>{validation.issues.map((issue) => <p key={`${issue.path}-${issue.code}`}><code>{issue.path}</code> {issue.message}</p>)}</div> : null}

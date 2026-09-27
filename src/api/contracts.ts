@@ -44,7 +44,10 @@ export interface AgentCreate {
 export type ReleaseLifecycle =
   | 'DRAFT'
   | 'ANALYZED'
+  | 'TESTING'
+  | 'REMEDIATION'
   | 'VERIFYING'
+  | 'DECISION_PENDING'
   | 'PASS'
   | 'REVIEW'
   | 'BLOCKED'
@@ -66,6 +69,22 @@ export interface Release {
   lastTestedAt: string | null
   createdAt: string
   updatedAt: string
+}
+
+export interface ReleaseDiffComponent {
+  component: string
+  jsonPointers: string[]
+  oldDigest: string | null
+  newDigest: string | null
+  changed: boolean
+  redactedSummary: string
+}
+
+export interface ReleaseDiff {
+  against: string
+  releaseId: string
+  components: ReleaseDiffComponent[]
+  meaningfulChange: boolean
 }
 
 export interface ManifestIssue {

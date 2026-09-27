@@ -19,11 +19,13 @@ export function navigationParent(page: Page): Page {
   if (page === 'changed') return 'evidence'
   return page
 }
-export function readRoute(): { mode: Mode; page: Page } {
-  const [, rawMode, rawPage] = window.location.hash.split('/')
+export function readRoute(): { mode: Mode; page: Page; releaseId?: string } {
+  const [path = '', query = ''] = window.location.hash.split('?')
+  const [, rawMode, rawPage] = path.split('/')
   const mode = rawMode === 'live' ? 'live' : 'demo'
   const page = rawPage && Object.hasOwn(pageLabels, rawPage) ? rawPage as Page : 'start'
-  return { mode, page }
+  const releaseId = mode === 'live' ? new URLSearchParams(query).get('releaseId') || undefined : undefined
+  return { mode, page, releaseId }
 }
 export type Phase = 'ready' | 'running' | 'review' | 'replaying' | 'compared' | 'verifying' | 'complete' | 'cancelled'
 export function useDemoWorkflow() {

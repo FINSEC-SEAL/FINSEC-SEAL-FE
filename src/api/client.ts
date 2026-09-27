@@ -18,8 +18,11 @@ import type {
   RecoveryRequest,
   RecoveryResult,
   Release,
+  ReleaseDiff,
   ValidationResult,
 } from './contracts'
+import { ContractReviewClient } from '../features/policy/client'
+import { readReviewerSessionCredential, type ReviewerSession } from '../features/policy/reviewerSession'
 
 const defaultBaseUrl = import.meta.env.VITE_FINSEC_API_BASE_URL ?? 'http://localhost:8080'
 
@@ -36,6 +39,23 @@ export class FinsecApiError extends Error {
     this.code = problem.code ?? 'UNKNOWN_ERROR'
     this.traceId = problem.traceId
     this.retryable = problem.retryable ?? false
+  }
+}
+
+export type RunStartFailure = 'session' | 'invalid' | 'rejected' | 'unknown'
+
+const runStartMessages: Record<RunStartFailure, string> = {
+  session: '검토자 세션이 만료되었거나 철회되었습니다. 다시 연결해 주세요.',
+  invalid: '검토자 세션 또는 실행 요청을 확인해 주세요.',
+  rejected: '실행 요청이 거절되었습니다. 입력과 현재 상태를 확인해 주세요.',
+  unknown: '실행 요청의 처리 여부가 불명확합니다. 같은 요청으로 확인하거나 Run 기록을 검토해 주세요.',
+}
+
+/** Only fixed messages leave the Run-start transport; response bodies may contain secrets. */
+export class RunStartError extends Error {
+  constructor(readonly kind: RunStartFailure, readonly status: number | null = null) {
+    super(runStartMessages[kind])
+    this.name = 'RunStartError'
   }
 }
 
@@ -65,6 +85,9 @@ function isRetryableNetworkError(error: unknown): boolean {
 }
 
 export class FinsecApiClient {
+  private reviewerClient?: ContractReviewClient
+  private readonly confirmedRunSessions = new WeakSet<ReviewerSession>()
+
   constructor(
     private readonly baseUrl = defaultBaseUrl,
     private readonly options: FinsecApiClientOptions = {},
@@ -103,7 +126,7 @@ export class FinsecApiClient {
             // Preserve the status when an intermediary returns a non-JSON response.
           }
           const error = new FinsecApiError(response.status, problem)
-          if (attempt < maxRetries && error.retryable) {
+          if (attempt < maxRetries && error.retryable && error.code !== 'STREAM_CURSOR_EXPIRED') {
             await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
             continue
           }
@@ -112,7 +135,11 @@ export class FinsecApiClient {
         return ((await response.json()) as ApiEnvelope<T>).data
       } catch (error) {
         lastError = error
-        if (error instanceof FinsecApiError && error.retryable && attempt < maxRetries) {
+        if (error instanceof FinsecApiError && error.code === 'STREAM_CURSOR_EXPIRED') {
+          throw error
+        }
+        if (error instanceof FinsecApiError && error.retryable
+          && attempt < maxRetries) {
           await new Promise((resolve) => setTimeout(resolve, retryDelayMs))
           continue
         }
@@ -173,6 +200,10 @@ export class FinsecApiClient {
     return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {}, { actorId })
   }
 
+  releaseDetail(releaseId: string, actorId: string): Promise<Release> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}`, {}, { actorId })
+  }
+
   createRelease(agentId: string, manifest: JsonValue, actorId: string): Promise<Release> {
     return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {
       method: 'POST',
@@ -196,6 +227,10 @@ export class FinsecApiClient {
 
   fingerprint(releaseId: string, actorId: string): Promise<Fingerprint> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
+  }
+
+  releaseDiff(releaseId: string, againstId: string, actorId: string): Promise<ReleaseDiff> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/diff?against=${encodeURIComponent(againstId)}`, {}, { actorId })
   }
 
   listTestSuites(releaseId: string, actorId: string, filters: { status?: string; limit?: number; cursor?: string } = {}): Promise<TestSuiteSummary[]> {
@@ -225,8 +260,125 @@ export class FinsecApiClient {
   }
 
   testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
-  startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
-  eventHistory(runId: string, actorId: string): Promise<EventHistory> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=0&limit=100`, {}, { actorId }) }
+
+  async connectRunReviewerSession(reviewerKey?: string): Promise<ReviewerSession> {
+    this.reviewerClient ??= new ContractReviewClient(this.baseUrl)
+    const session = await this.reviewerClient.connectReviewerSession(reviewerKey)
+    this.confirmedRunSessions.add(session)
+    return session
+  }
+
+  /** A sent Run start is never retried here; callers retain its body/key for an explicit same-key retry. */
+  async startTestRun(input: TestRunStart, session: ReviewerSession, idempotencyKey: string): Promise<TestRunRegistered> {
+    if (!this.confirmedRunSessions.has(session)) throw new RunStartError('session')
+    let reviewer: ReviewerSession
+    try { reviewer = readReviewerSessionCredential(session) }
+    catch { throw new RunStartError('session') }
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyKey)) throw new RunStartError('invalid')
+    let body: string
+    try {
+      body = JSON.stringify(input)
+      if (!body) throw new Error()
+    } catch { throw new RunStartError('invalid') }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30000)
+    try {
+      const response = await fetch(`${this.baseUrl.replace(/\/+$/, '')}/api/v1/test-runs`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json', 'Content-Type': 'application/json',
+          'X-Actor-Id': reviewer.actorId, 'X-CSRF-Token': reviewer.csrfToken,
+          'Idempotency-Key': idempotencyKey,
+        },
+        body, credentials: 'include', redirect: 'error', cache: 'no-store', signal: controller.signal,
+      })
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          this.confirmedRunSessions.delete(session)
+          throw new RunStartError('session', response.status)
+        }
+        if (response.status >= 400 && response.status < 500
+          && ![408, 409, 425, 429].includes(response.status)) throw new RunStartError('rejected', response.status)
+        throw new RunStartError('unknown', response.status)
+      }
+      if (response.status !== 202) throw new RunStartError('unknown', response.status)
+      const payload: unknown = await response.json()
+      if (!payload || typeof payload !== 'object' || !Object.hasOwn(payload, 'data')) {
+        throw new RunStartError('unknown', response.status)
+      }
+      const data = (payload as { data: unknown }).data
+      if (!data || typeof data !== 'object') throw new RunStartError('unknown', response.status)
+      const receipt = data as Record<string, unknown>
+      const runId = receipt.runId
+      if (typeof runId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)
+        || receipt.status !== 'QUEUED' || receipt.statusUrl !== `/api/v1/test-runs/${runId}`
+        || receipt.streamUrl !== `/api/v1/test-runs/${runId}/events`) throw new RunStartError('unknown', response.status)
+      return { runId, status: 'QUEUED', statusUrl: receipt.statusUrl, streamUrl: receipt.streamUrl }
+    } catch (error) {
+      if (error instanceof RunStartError) throw error
+      throw new RunStartError('unknown')
+    } finally { clearTimeout(timeout) }
+  }
+  async eventHistory(runId: string, actorId: string, after = 0): Promise<EventHistory> {
+    if (!Number.isSafeInteger(after) || after < 0) {
+      throw new Error('Event history cursor is invalid')
+    }
+    const limit = 1000
+    const items: EventHistory['items'] = []
+    const eventIds = new Set<string>()
+    let cursor = after
+    let snapshotHead: number | null = null
+    let pages = 0
+
+    while (true) {
+      if (snapshotHead !== null && pages >= Math.max(1, Math.ceil((snapshotHead - after) / limit))) {
+        throw new Error('Event history snapshot is incomplete')
+      }
+      const page = await this.request<EventHistory>(
+        `/api/v1/test-runs/${encodeURIComponent(runId)}/event-history?after=${cursor}&limit=${limit}`,
+        {}, { actorId },
+      )
+      pages += 1
+      if (!Number.isSafeInteger(page.headSequence) || page.headSequence < cursor
+        || !Array.isArray(page.items) || page.items.length > limit) {
+        throw new Error('Event history page is invalid')
+      }
+      snapshotHead ??= page.headSequence
+      if (page.headSequence < snapshotHead) {
+        throw new Error('Event history page is invalid')
+      }
+      if (page.nextCursor !== null && (!Number.isSafeInteger(page.nextCursor)
+        || page.nextCursor <= cursor || page.items.length !== limit)) {
+        throw new Error('Event history cursor is invalid')
+      }
+
+      let expectedSequence = cursor + 1
+      for (const event of page.items) {
+        if (!event || event.runId !== runId || event.sequence !== expectedSequence
+          || typeof event.eventId !== 'string' || !event.eventId || eventIds.has(event.eventId)) {
+          throw new Error('Event history sequence is invalid')
+        }
+        eventIds.add(event.eventId)
+        if (event.sequence <= snapshotHead) items.push(event)
+        expectedSequence += 1
+      }
+      if (page.items.length && page.headSequence < page.items[page.items.length - 1]!.sequence) {
+        throw new Error('Event history page is invalid')
+      }
+      if (page.nextCursor !== null
+        && page.nextCursor !== page.items[page.items.length - 1]?.sequence) {
+        throw new Error('Event history cursor is invalid')
+      }
+      if (items.length === snapshotHead - after) {
+        return { items, headSequence: snapshotHead, nextCursor: null }
+      }
+      if (page.nextCursor === null) {
+        throw new Error('Event history snapshot is incomplete')
+      }
+      cursor = page.nextCursor
+    }
+  }
   verifyEventChain(runId: string, actorId: string): Promise<EventChainVerification> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}/events:verify`, {}, { actorId }) }
   runFindings(runId: string, actorId: string): Promise<Finding[]> { return this.request<{items:Finding[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/findings`, {}, { actorId }).then(v=>v.items) }
   runOracleResults(runId: string, actorId: string): Promise<OracleResult[]> { return this.request<{items:OracleResult[]}>(`/api/v1/test-runs/${encodeURIComponent(runId)}/oracle-results`, {}, { actorId }).then(v=>v.items) }
@@ -296,10 +448,10 @@ export class FinsecApiClient {
     })
   }
 
-  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string): Promise<void> {
+  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string, signal?: AbortSignal): Promise<void> {
     const response = await fetch(
       `${this.baseUrl}/api/v1/releases/${encodeURIComponent(releaseId)}/evidence-export?format=${format}`,
-      { headers: { 'X-Actor-Id': actorId } },
+      { headers: { 'X-Actor-Id': actorId }, signal },
     )
     if (!response.ok) {
       let problem: ApiProblem = { status: response.status, title: response.statusText }
@@ -311,14 +463,19 @@ export class FinsecApiClient {
       throw new FinsecApiError(response.status, problem)
     }
     const blob = await response.blob()
+    if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
     const disposition = response.headers.get('Content-Disposition') ?? ''
     const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `finsec-attestation.${format}`
     const href = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = href
-    link.download = name
-    link.click()
-    URL.revokeObjectURL(href)
+    try {
+      if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
+      const link = document.createElement('a')
+      link.href = href
+      link.download = name
+      link.click()
+    } finally {
+      URL.revokeObjectURL(href)
+    }
   }
 }
 
