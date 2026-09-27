@@ -70,6 +70,42 @@ describe('FinsecApiClient', () => {
     } satisfies Partial<FinsecApiError>)
   })
 
+  it('reads the server Release diff with encoded IDs and nullable component digests', async () => {
+    const data = {
+      against: 'release/old', releaseId: 'release/new', meaningfulChange: true,
+      components: [{
+        component: 'serverToolCatalogHash', jsonPointers: ['/serverToolCatalog'],
+        oldDigest: null, newDigest: `sha256:${'a'.repeat(64)}`,
+        changed: true, redactedSummary: 'Canonical digest changed; raw sensitive values are redacted',
+      }],
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      data, traceId: 'trace-diff', timestamp: '2026-09-01T00:00:00Z',
+    }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.releaseDiff('release/new', 'release/old', 'role-a-console')).resolves.toEqual(data)
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.test/api/v1/releases/release%2Fnew/diff?against=release%2Fold',
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+    const headers = new Headers(fetchMock.mock.calls[0]![1]?.headers)
+    expect(headers.get('X-Actor-Id')).toBe('role-a-console')
+    expect(headers.get('Idempotency-Key')).toBeNull()
+  })
+
+  it('preserves a failed Release diff response for the live view', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      status: 422, code: 'VALIDATION_ERROR', detail: 'Release diff requires the same Agent',
+      traceId: 'trace-diff-error', retryable: false,
+    }, 422))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.releaseDiff('current', 'other', 'role-a-console')).rejects.toMatchObject({
+      status: 422, code: 'VALIDATION_ERROR', traceId: 'trace-diff-error', retryable: false,
+    } satisfies Partial<FinsecApiError>)
+  })
+
   it('never clicks an old Attestation export after cancellation during blob download', async () => {
     const response = new Response('synthetic report', {
       status: 200,

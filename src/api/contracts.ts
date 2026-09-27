@@ -71,6 +71,22 @@ export interface Release {
   updatedAt: string
 }
 
+export interface ReleaseDiffComponent {
+  component: string
+  jsonPointers: string[]
+  oldDigest: string | null
+  newDigest: string | null
+  changed: boolean
+  redactedSummary: string
+}
+
+export interface ReleaseDiff {
+  against: string
+  releaseId: string
+  components: ReleaseDiffComponent[]
+  meaningfulChange: boolean
+}
+
 export interface ManifestIssue {
   path: string
   code: string

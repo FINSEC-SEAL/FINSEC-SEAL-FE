@@ -18,6 +18,7 @@ import type {
   RecoveryRequest,
   RecoveryResult,
   Release,
+  ReleaseDiff,
   ValidationResult,
 } from './contracts'
 
@@ -200,6 +201,10 @@ export class FinsecApiClient {
 
   fingerprint(releaseId: string, actorId: string): Promise<Fingerprint> {
     return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/fingerprint`, {}, { actorId })
+  }
+
+  releaseDiff(releaseId: string, againstId: string, actorId: string): Promise<ReleaseDiff> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}/diff?against=${encodeURIComponent(againstId)}`, {}, { actorId })
   }
 
   listTestSuites(releaseId: string, actorId: string, filters: { status?: string; limit?: number; cursor?: string } = {}): Promise<TestSuiteSummary[]> {

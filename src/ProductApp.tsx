@@ -10,6 +10,7 @@ import { ExecutionPage } from './features/Execution'
 import { FindingsPage as LiveFindingsPage } from './features/Findings'
 import { AssurancePage } from './features/Assurance'
 import { RecoveryPage } from './features/Recovery'
+import { ReleaseDiffPage } from './features/ReleaseDiff'
 import { StoredContractReviewPage } from './features/policy/StoredContractReviewPage'
 import { GatewayEvidencePage } from './features/policy/GatewayEvidencePage'
 import { StoredReplayPolicyPage } from './features/policy/StoredReplayPolicyPage'
@@ -29,7 +30,7 @@ export default function App() {
   return <ProductApp key={route.mode} mode={route.mode} page={route.page} releaseId={route.releaseId} go={go} />
 }
 const detailPages: Page[] = ['release','trace','finding','policy','gateway','replay','verification','report']
-const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway','replay']
+const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','changed','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway','replay']
 const detailTitles: Partial<Record<Page, [string,string]>> = {
   release: ['이 에이전트는 어디까지 허용되나요?','대출서류 검토의 업무 경계와 검증 구성을 먼저 확인하세요.'],
   trace: ['공격은 어디서 실제 행동이 됐나요?','도구 제안, 정책 판단, API 응답, 실제 영향을 순서대로 확인합니다.'],
@@ -89,6 +90,7 @@ function ProductApp({ mode, page, releaseId, go }: { mode: Mode; page: Page; rel
     if (!simulated && page === 'replay') return <StoredReplayPolicyPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
     if (!simulated && (page === 'runs' || page === 'trace')) return <ExecutionPage releases={releases} actorId={actorId} />
     if (!simulated && page === 'findings') return <LiveFindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
+    if (!simulated && page === 'changed') return <ReleaseDiffPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
     if (!simulated && ['reports','report','verification'].includes(page)) return <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
     if (page === 'start') return <StartPage navigate={navigate} start={start} simulated={simulated} />
     if (page === 'overview') return <WorkspacePage agents={agents} releases={releases} navigate={navigate} workflow={workflow} simulated={simulated} start={start} />
@@ -100,7 +102,7 @@ function ProductApp({ mode, page, releaseId, go }: { mode: Mode; page: Page; rel
       preferredReleaseId={simulated ? undefined : selectedReleaseId}
       onReleaseSelect={release => go(mode, page, release?.id ?? null)} client={client}
       onReleaseInventory={(items, agentId) => setReleases(current => [...current.filter(r => r.agentId !== agentId), ...items])} /></>
-    if (page === 'evidence') return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}<EvidencePage releases={releases} actorId={actorId}
+    if (page === 'evidence') return <>{simulated && <Notice title="샘플 증거 조회">v1.2.0은 추가 검증 후 조회할 수 있습니다. v1.1.0은 과거 증적입니다. <button className="text-button" onClick={() => navigate('changed')}>구성 변경 비교 →</button></Notice>}{!simulated && <div className="button-row section-gap"><button className="secondary-button" onClick={() => navigate('changed')}>Release 구성 변경 비교 →</button></div>}<EvidencePage releases={releases} actorId={actorId}
       preferredReleaseId={simulated ? undefined : selectedReleaseId} onReleaseChange={simulated ? undefined : changeReleaseId}
       client={client} simulated={simulated} /></>
     if (page === 'audit') return <>{simulated && <Notice title="샘플 감사 리소스">Resource type: AGENT_RELEASE<br /><code>{DEMO_RELEASE_ID}</code></Notice>}<AuditPage actorId={actorId} client={client} /></>
