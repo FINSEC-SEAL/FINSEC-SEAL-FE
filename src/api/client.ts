@@ -21,6 +21,8 @@ import type {
   ReleaseDiff,
   ValidationResult,
 } from './contracts'
+import { ContractReviewClient } from '../features/policy/client'
+import { readReviewerSessionCredential, type ReviewerSession } from '../features/policy/reviewerSession'
 
 const defaultBaseUrl = import.meta.env.VITE_FINSEC_API_BASE_URL ?? 'http://localhost:8080'
 
@@ -37,6 +39,23 @@ export class FinsecApiError extends Error {
     this.code = problem.code ?? 'UNKNOWN_ERROR'
     this.traceId = problem.traceId
     this.retryable = problem.retryable ?? false
+  }
+}
+
+export type RunStartFailure = 'session' | 'invalid' | 'rejected' | 'unknown'
+
+const runStartMessages: Record<RunStartFailure, string> = {
+  session: '검토자 세션이 만료되었거나 철회되었습니다. 다시 연결해 주세요.',
+  invalid: '검토자 세션 또는 실행 요청을 확인해 주세요.',
+  rejected: '실행 요청이 거절되었습니다. 입력과 현재 상태를 확인해 주세요.',
+  unknown: '실행 요청의 처리 여부가 불명확합니다. 같은 요청으로 확인하거나 Run 기록을 검토해 주세요.',
+}
+
+/** Only fixed messages leave the Run-start transport; response bodies may contain secrets. */
+export class RunStartError extends Error {
+  constructor(readonly kind: RunStartFailure, readonly status: number | null = null) {
+    super(runStartMessages[kind])
+    this.name = 'RunStartError'
   }
 }
 
@@ -66,6 +85,9 @@ function isRetryableNetworkError(error: unknown): boolean {
 }
 
 export class FinsecApiClient {
+  private reviewerClient?: ContractReviewClient
+  private readonly confirmedRunSessions = new WeakSet<ReviewerSession>()
+
   constructor(
     private readonly baseUrl = defaultBaseUrl,
     private readonly options: FinsecApiClientOptions = {},
@@ -238,7 +260,66 @@ export class FinsecApiClient {
   }
 
   testRun(runId: string, actorId: string): Promise<TestRun> { return this.request(`/api/v1/test-runs/${encodeURIComponent(runId)}`, {}, { actorId }) }
-  startTestRun(input: TestRunStart, actorId: string): Promise<TestRunRegistered> { return this.request('/api/v1/test-runs', { method:'POST', body:JSON.stringify(input) }, { actorId, idempotencyKey:newIdempotencyKey('test-run-start') }) }
+
+  async connectRunReviewerSession(reviewerKey?: string): Promise<ReviewerSession> {
+    this.reviewerClient ??= new ContractReviewClient(this.baseUrl)
+    const session = await this.reviewerClient.connectReviewerSession(reviewerKey)
+    this.confirmedRunSessions.add(session)
+    return session
+  }
+
+  /** A sent Run start is never retried here; callers retain its body/key for an explicit same-key retry. */
+  async startTestRun(input: TestRunStart, session: ReviewerSession, idempotencyKey: string): Promise<TestRunRegistered> {
+    if (!this.confirmedRunSessions.has(session)) throw new RunStartError('session')
+    let reviewer: ReviewerSession
+    try { reviewer = readReviewerSessionCredential(session) }
+    catch { throw new RunStartError('session') }
+    if (!/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyKey)) throw new RunStartError('invalid')
+    let body: string
+    try {
+      body = JSON.stringify(input)
+      if (!body) throw new Error()
+    } catch { throw new RunStartError('invalid') }
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30000)
+    try {
+      const response = await fetch(`${this.baseUrl.replace(/\/+$/, '')}/api/v1/test-runs`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json', 'Content-Type': 'application/json',
+          'X-Actor-Id': reviewer.actorId, 'X-CSRF-Token': reviewer.csrfToken,
+          'Idempotency-Key': idempotencyKey,
+        },
+        body, credentials: 'include', redirect: 'error', cache: 'no-store', signal: controller.signal,
+      })
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          this.confirmedRunSessions.delete(session)
+          throw new RunStartError('session', response.status)
+        }
+        if (response.status >= 400 && response.status < 500
+          && ![408, 409, 425, 429].includes(response.status)) throw new RunStartError('rejected', response.status)
+        throw new RunStartError('unknown', response.status)
+      }
+      if (response.status !== 202) throw new RunStartError('unknown', response.status)
+      const payload: unknown = await response.json()
+      if (!payload || typeof payload !== 'object' || !Object.hasOwn(payload, 'data')) {
+        throw new RunStartError('unknown', response.status)
+      }
+      const data = (payload as { data: unknown }).data
+      if (!data || typeof data !== 'object') throw new RunStartError('unknown', response.status)
+      const receipt = data as Record<string, unknown>
+      const runId = receipt.runId
+      if (typeof runId !== 'string' || !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)
+        || receipt.status !== 'QUEUED' || receipt.statusUrl !== `/api/v1/test-runs/${runId}`
+        || receipt.streamUrl !== `/api/v1/test-runs/${runId}/events`) throw new RunStartError('unknown', response.status)
+      return { runId, status: 'QUEUED', statusUrl: receipt.statusUrl, streamUrl: receipt.streamUrl }
+    } catch (error) {
+      if (error instanceof RunStartError) throw error
+      throw new RunStartError('unknown')
+    } finally { clearTimeout(timeout) }
+  }
   async eventHistory(runId: string, actorId: string, after = 0): Promise<EventHistory> {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new Error('Event history cursor is invalid')

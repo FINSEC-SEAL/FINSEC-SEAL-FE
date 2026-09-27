@@ -1,7 +1,8 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
-import { api } from '../api/client'
+import { api, RunStartError } from '../api/client'
 import type { Agent, Attestation, Fingerprint, JsonValue, PendingRecovery, Release, ValidationResult } from '../api/contracts'
+import type { ReviewerSession } from './policy/reviewerSession'
 import { AgentsPage, ReleasesPage } from './AgentsReleases'
 import { AuditPage } from './Audit'
 import { EvidencePage } from './Evidence'
@@ -36,6 +37,23 @@ const release: Release = {
   updatedAt: '2026-09-01T00:00:00Z',
 }
 const effectRunId = '0198f200-0000-7000-8000-000000000010'
+
+function runReviewer(overrides: Partial<ReviewerSession> = {}): ReviewerSession {
+  return {
+    kind: 'session', actorId: 'verified-run-reviewer',
+    workspaceId: '0198f1e2-0000-7000-8000-000000000001', role: 'AI_SECURITY_REVIEWER',
+    csrfToken: 'PRIVATE_CSRF_CANARY', expiresAt: Math.floor(Date.now() / 1000) + 1200,
+    ...overrides,
+  }
+}
+
+function readyRunStart() {
+  vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+    { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+  ])
+  vi.spyOn(api, 'listTestRuns').mockResolvedValue([])
+  vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
+}
 
 function effectAttestation(document: Record<string, JsonValue>, stale = false): Attestation {
   return {
@@ -277,6 +295,109 @@ describe('Role A feature consoles', () => {
 
     expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled()
     expect(start).not.toHaveBeenCalled()
+  })
+
+  it('requires a confirmed reviewer session for a READY LIVE Run and uses its actor', async () => {
+    readyRunStart()
+    const session = runReviewer()
+    const connect = vi.spyOn(api, 'connectRunReviewerSession').mockResolvedValue(session)
+    const start = vi.spyOn(api, 'startTestRun').mockRejectedValue(new RunStartError('rejected', 400))
+    const user = userEvent.setup()
+    render(<ExecutionPage releases={[release]} actorId="untrusted-page-actor" />)
+
+    expect(await screen.findByRole('option', { name: /1\.0 · READY/ })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled()
+    expect(screen.getByText(/HTTPS API 연결이 필요합니다/)).toBeInTheDocument()
+    await user.type(screen.getByLabelText('Run 검토자 키'), 'PRIVATE_REVIEWER_KEY_CANARY')
+    await user.click(screen.getByRole('button', { name: '검토자 세션 연결' }))
+    await waitFor(() => expect(screen.getByText('verified-run-reviewer')).toBeInTheDocument())
+    expect(connect).toHaveBeenCalledWith('PRIVATE_REVIEWER_KEY_CANARY')
+    expect(screen.getByLabelText('Run 검토자 키')).toHaveValue('')
+    expect(document.body.innerHTML).not.toContain('PRIVATE_REVIEWER_KEY_CANARY')
+    expect(document.body.innerHTML).not.toContain('PRIVATE_CSRF_CANARY')
+    expect(screen.getByRole('button', { name: '실행 시작' })).toBeEnabled()
+
+    await user.click(screen.getByRole('button', { name: '실행 시작' }))
+    await waitFor(() => expect(start).toHaveBeenCalledOnce())
+    const [input, credential, idempotencyKey] = start.mock.calls[0]!
+    expect(credential).toBe(session)
+    expect(input).toMatchObject({ releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE' })
+    expect(idempotencyKey).toMatch(/^test-run-start-[0-9a-f-]{36}$/)
+  })
+
+  it('retains an unknown Run body and key across form changes for explicit same-key retry', async () => {
+    readyRunStart()
+    const connect = vi.spyOn(api, 'connectRunReviewerSession').mockResolvedValue(runReviewer())
+    const start = vi.spyOn(api, 'startTestRun')
+      .mockRejectedValueOnce(new RunStartError('unknown'))
+      .mockRejectedValueOnce(new RunStartError('rejected', 400))
+    const user = userEvent.setup()
+    render(<ExecutionPage releases={[release]} actorId="untrusted-page-actor" />)
+
+    await screen.findByRole('option', { name: /1\.0 · READY/ })
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '실행 시작' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '실행 시작' }))
+    const retry = await screen.findByRole('button', { name: '같은 요청 다시 확인' })
+    expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled()
+    await user.selectOptions(screen.getByLabelText('Run mode'), 'HELD_OUT')
+    connect.mockResolvedValueOnce(runReviewer({ actorId: 'different-reviewer' }))
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByText('different-reviewer')).toBeInTheDocument())
+    expect(retry).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(retry).toBeEnabled())
+    await user.click(retry)
+    await waitFor(() => expect(start).toHaveBeenCalledTimes(2))
+    expect(start.mock.calls[1]![0]).toEqual(start.mock.calls[0]![0])
+    expect(start.mock.calls[1]![1]).toBe(start.mock.calls[0]![1])
+    expect(start.mock.calls[1]![2]).toBe(start.mock.calls[0]![2])
+    expect(start.mock.calls[1]![0].mode).toBe('BASELINE')
+    await waitFor(() => expect(screen.queryByRole('button', { name: '같은 요청 다시 확인' })).not.toBeInTheDocument())
+  })
+
+  it('clears a rejected or expired Run session and requires explicit reconnect', async () => {
+    readyRunStart()
+    const connect = vi.spyOn(api, 'connectRunReviewerSession')
+      .mockResolvedValueOnce(runReviewer())
+      .mockResolvedValueOnce(runReviewer({ csrfToken: 'NEW_PRIVATE_CSRF' }))
+      .mockResolvedValueOnce(runReviewer({ expiresAt: Math.floor(Date.now() / 1000) - 1 }))
+    const start = vi.spyOn(api, 'startTestRun').mockRejectedValueOnce(new RunStartError('session', 403))
+    const user = userEvent.setup()
+    render(<ExecutionPage releases={[release]} actorId="untrusted-page-actor" />)
+
+    await screen.findByRole('option', { name: /1\.0 · READY/ })
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '실행 시작' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '실행 시작' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled())
+    expect(start).toHaveBeenCalledTimes(1)
+    expect(screen.getByText(/다시 연결해 주세요/)).toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '실행 시작' })).toBeEnabled())
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByRole('button', { name: '실행 시작' })).toBeDisabled())
+    expect(connect).toHaveBeenCalledTimes(3)
+    expect(start).toHaveBeenCalledTimes(1)
+  })
+
+  it('ignores a late reviewer connection after the Execution page unmounts', async () => {
+    readyRunStart()
+    let resolveOld!: (session: ReviewerSession) => void
+    const connect = vi.spyOn(api, 'connectRunReviewerSession')
+      .mockImplementationOnce(() => new Promise(resolve => { resolveOld = resolve }))
+      .mockResolvedValueOnce(runReviewer({ actorId: 'new-reviewer' }))
+    const user = userEvent.setup()
+    const old = render(<ExecutionPage releases={[release]} actorId="role-a-console" />)
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    old.unmount()
+    render(<ExecutionPage releases={[release]} actorId="role-a-console" />)
+    await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+    await waitFor(() => expect(screen.getByText('new-reviewer')).toBeInTheDocument())
+    await act(async () => resolveOld(runReviewer({ actorId: 'stale-reviewer' })))
+    expect(screen.getByText('new-reviewer')).toBeInTheDocument()
+    expect(screen.queryByText('stale-reviewer')).not.toBeInTheDocument()
+    expect(connect).toHaveBeenCalledTimes(2)
   })
 
   it('loads replay comparisons for the current release', async () => {
