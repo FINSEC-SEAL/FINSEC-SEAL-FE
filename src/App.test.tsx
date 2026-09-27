@@ -64,7 +64,7 @@ describe('FINAgent SEAL product shell', () => {
   })
 
   it('marks unconnected runtime pages explicitly in LIVE_API', async () => {
-    window.history.replaceState(null, '', '/#/live/changed')
+    window.history.replaceState(null, '', '/#/live/states')
     vi.spyOn(globalThis, 'fetch').mockImplementation(async () => envelope([]))
     render(<App />)
     expect(await screen.findByText('실제 데이터와 합성 결과를 섞지 않습니다.')).toBeInTheDocument()
@@ -182,6 +182,169 @@ function livePolicyApi() {
   })
   return { fetch, handlers, contracts, posts: () => contracts().filter(([, init]) => init?.method === 'POST') }
 }
+
+const otherAgentId = '019903ac-abcd-7000-8000-000000000021'
+const otherReleaseId = '019903ac-abcd-7000-8000-000000000022'
+const diffData = {
+  against: liveReleaseId, releaseId: selectedReleaseId, meaningfulChange: true,
+  components: [{ component: 'serverToolCatalogHash', jsonPointers: ['/serverToolCatalog'],
+    oldDigest: null, newDigest: `sha256:${'e'.repeat(64)}`, changed: true,
+    redactedSummary: 'Canonical digest changed; raw sensitive values are redacted' }],
+}
+
+function liveReleaseDiffApi(reply: () => Response | Promise<Response> = () => envelope(diffData)) {
+  let currentStatus = 'NEEDS_REVALIDATION'
+  let currentContractHash = `sha256:${'d'.repeat(64)}`
+  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+    const url = new URL(String(input), window.location.origin)
+    if (url.pathname === '/api/v1/agents') return envelope([
+      { id: liveAgentId, agentKey: 'loan-agent', name: 'Loan Agent', status: 'ACTIVE' },
+      { id: otherAgentId, agentKey: 'other-agent', name: 'Other Agent', status: 'ACTIVE' },
+    ])
+    if (url.pathname === `/api/v1/agents/${liveAgentId}/releases`) return envelope([
+      { id: liveReleaseId, agentId: liveAgentId, version: '1.0.0', businessPurpose: '서류 검토',
+        lifecycleState: 'REVIEW', effectiveStatus: 'REVIEW', agentArtifactFingerprint: `sha256:${'a'.repeat(64)}`,
+        safetyContractHash: `sha256:${'b'.repeat(64)}`, releaseFingerprint: `sha256:${'c'.repeat(64)}`,
+        updatedAt: '2026-09-01T00:00:00Z' },
+      { id: selectedReleaseId, agentId: liveAgentId, version: '2.0.0', businessPurpose: '서류 검토',
+        lifecycleState: currentStatus, effectiveStatus: currentStatus, agentArtifactFingerprint: `sha256:${'e'.repeat(64)}`,
+        safetyContractHash: currentContractHash, releaseFingerprint: `sha256:${'f'.repeat(64)}`,
+        updatedAt: '2026-09-01T00:00:00Z' },
+    ])
+    if (url.pathname === `/api/v1/agents/${otherAgentId}/releases`) return envelope([
+      { id: otherReleaseId, agentId: otherAgentId, version: '3.0.0', businessPurpose: '별도 업무',
+        lifecycleState: 'ANALYZED', effectiveStatus: 'ANALYZED', agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`,
+        safetyContractHash: null, releaseFingerprint: `sha256:${'2'.repeat(64)}`,
+        updatedAt: '2026-09-01T00:00:00Z' },
+    ])
+    if (url.pathname === `/api/v1/releases/${selectedReleaseId}/diff`
+      || url.pathname === `/api/v1/releases/${liveReleaseId}/diff`) return reply()
+    throw new Error(`Unexpected synthetic diff HTTP route: ${url.pathname}`)
+  })
+  const diffCalls = () => fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.endsWith('/diff'))
+  return {
+    fetch, diffCalls,
+    updateCurrent: () => { currentStatus = 'PASS'; currentContractHash = `sha256:${'9'.repeat(64)}` },
+  }
+}
+
+describe('live Release configuration diff', () => {
+  it('uses an explicit same-Agent pair and renders nullable, redacted server diff separately from Release state', async () => {
+    window.history.replaceState(null, '', `/#/live/changed?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseDiffApi()
+    const user = userEvent.setup()
+    render(<App />)
+
+    await screen.findByRole('heading', { name: 'Release 구성 변경 비교' })
+    expect(screen.getByLabelText('현재 Release')).toHaveValue(selectedReleaseId)
+    const against = screen.getByLabelText('비교할 Release')
+    expect(within(against).queryByRole('option', { name: /v3\.0\.0/ })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: '서버 구성 비교' })).toBeDisabled()
+    expect(backend.diffCalls()).toHaveLength(0)
+
+    await user.selectOptions(against, liveReleaseId)
+    await user.click(screen.getByRole('button', { name: '서버 구성 비교' }))
+    const components = await screen.findByRole('table', { name: 'Release Manifest 구성 요소 변경' })
+    expect(within(components).getByText('serverToolCatalogHash')).toBeInTheDocument()
+    expect(within(components).getByText('/serverToolCatalog')).toBeInTheDocument()
+    expect(within(components).getByText('N/A')).toBeInTheDocument()
+    expect(screen.getByText('Manifest 구성 요소 변경 있음')).toBeInTheDocument()
+    expect(screen.getByText(/Safety Contract 연결 해시도 다릅니다/)).toBeInTheDocument()
+    const identity = screen.getByRole('table', { name: 'Release 식별자와 상태' })
+    expect(within(identity).getAllByText('NEEDS REVALIDATION')).toHaveLength(2)
+    expect(backend.diffCalls()).toHaveLength(1)
+    const [url, init] = backend.diffCalls()[0]!
+    expect(url).toBe(`http://localhost:8080/api/v1/releases/${selectedReleaseId}/diff?against=${liveReleaseId}`)
+    expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('role-a-console')
+  })
+
+  it('preserves the selected Release URL through the live Evidence link', async () => {
+    window.history.replaceState(null, '', `/#/live/evidence?releaseId=${selectedReleaseId}`)
+    liveReleaseDiffApi()
+    const user = userEvent.setup()
+    render(<App />)
+
+    await user.click(await screen.findByRole('button', { name: 'Release 구성 변경 비교 →' }))
+    expect(window.location.hash).toBe(`#/live/changed?releaseId=${selectedReleaseId}`)
+    expect(screen.getByLabelText('현재 Release')).toHaveValue(selectedReleaseId)
+  })
+
+  it('hides an older diff when inventory status or contract hash changes without a new URL or timestamp', async () => {
+    window.history.replaceState(null, '', `/#/live/changed?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseDiffApi()
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Release 구성 변경 비교' })
+    await user.selectOptions(screen.getByLabelText('비교할 Release'), liveReleaseId)
+    await user.click(screen.getByRole('button', { name: '서버 구성 비교' }))
+    await screen.findByRole('table', { name: 'Release Manifest 구성 요소 변경' })
+
+    backend.updateCurrent()
+    await user.click(screen.getByRole('button', { name: '데이터 새로고침' }))
+    await waitFor(() => expect(screen.getByRole('option', { name: /v2\.0\.0.*PASS/ })).toBeInTheDocument())
+    expect(screen.queryByRole('table', { name: 'Release Manifest 구성 요소 변경' })).not.toBeInTheDocument()
+  })
+
+  it.each(['target', 'actor'])('ignores a late Release diff after the %s changes', async changed => {
+    window.history.replaceState(null, '', `/#/live/changed?releaseId=${selectedReleaseId}`)
+    let finish!: (response: Response) => void
+    const backend = liveReleaseDiffApi(() => new Promise(resolve => { finish = resolve }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Release 구성 변경 비교' })
+    await user.selectOptions(screen.getByLabelText('비교할 Release'), liveReleaseId)
+    await user.click(screen.getByRole('button', { name: '서버 구성 비교' }))
+    await waitFor(() => expect(backend.diffCalls()).toHaveLength(1))
+
+    if (changed === 'target') {
+      await user.selectOptions(screen.getByLabelText('현재 Release'), liveReleaseId)
+      expect(window.location.hash).toBe(`#/live/changed?releaseId=${liveReleaseId}`)
+    } else {
+      await user.click(screen.getByRole('button', { name: '환경 설정' }))
+      const dialog = screen.getByRole('dialog', { name: '워크스페이스 환경 설정' })
+      await user.clear(within(dialog).getByLabelText('API actor ID'))
+      await user.type(within(dialog).getByLabelText('API actor ID'), 'other-reviewer')
+      await user.click(within(dialog).getByRole('button', { name: 'Actor 적용' }))
+    }
+    await act(async () => finish(envelope(diffData)))
+    expect(screen.queryByRole('table', { name: 'Release Manifest 구성 요소 변경' })).not.toBeInTheDocument()
+  })
+
+  it('rejects a mismatched server pair and preserves a live HTTP error without demo fallback', async () => {
+    window.history.replaceState(null, '', `/#/live/changed?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseDiffApi(() => envelope({ ...diffData, against: otherReleaseId }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Release 구성 변경 비교' })
+    await user.selectOptions(screen.getByLabelText('비교할 Release'), liveReleaseId)
+    await user.click(screen.getByRole('button', { name: '서버 구성 비교' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('요청한 Release 쌍과 서버 비교 응답이 일치하지 않습니다.')
+    expect(screen.queryByText('NEEDS_REVALIDATION · v1.1.0의 변경 상태 예시')).not.toBeInTheDocument()
+    expect(backend.diffCalls()).toHaveLength(1)
+  })
+
+  it('shows a server validation error instead of synthetic success', async () => {
+    window.history.replaceState(null, '', `/#/live/changed?releaseId=${selectedReleaseId}`)
+    liveReleaseDiffApi(() => new Response(JSON.stringify({
+      status: 422, code: 'VALIDATION_ERROR', detail: 'Release diff requires the same Agent', retryable: false,
+    }), { status: 422 }))
+    const user = userEvent.setup()
+    render(<App />)
+    await screen.findByRole('heading', { name: 'Release 구성 변경 비교' })
+    await user.selectOptions(screen.getByLabelText('비교할 Release'), liveReleaseId)
+    await user.click(screen.getByRole('button', { name: '서버 구성 비교' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('Release diff requires the same Agent')
+    expect(screen.queryByRole('table', { name: 'Release Manifest 구성 요소 변경' })).not.toBeInTheDocument()
+  })
+
+  it('keeps the sample Changed page isolated from all API reads', async () => {
+    window.history.replaceState(null, '', `/#/demo/changed?releaseId=${selectedReleaseId}`)
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    render(<App />)
+    expect(await screen.findByText('NEEDS_REVALIDATION · v1.1.0의 변경 상태 예시')).toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+})
 
 describe('live Release identity navigation', () => {
   it('opens the exact inventory Release in Manifest and Evidence, then restores it on reload', async () => {
