@@ -1,5 +1,5 @@
-import { FinsecApiClient, FinsecApiError } from './client'
-import type { ExecutionEvent } from './contracts'
+import { FinsecApiClient, FinsecApiError, RunStartError } from './client'
+import type { ExecutionEvent, TestRunStart } from './contracts'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -16,6 +16,23 @@ function historyEvent(sequence: number, runId = 'run-1'): ExecutionEvent {
     payloadDigest: `sha256:${'a'.repeat(64)}`, policyDecision: null, reasonCode: null,
     metadata: {}, prevEventHash: null, eventHash: `sha256:${'b'.repeat(64)}`,
   }
+}
+
+const runId = '0198f1e2-0000-7000-8000-000000000123'
+const runInput: TestRunStart = {
+  releaseId: 'release-1', suiteId: 'suite-1', mode: 'BASELINE',
+  contractVersionId: null, caseIds: [], randomSeed: 42,
+}
+const runReceipt = {
+  runId, status: 'QUEUED', statusUrl: `/api/v1/test-runs/${runId}`,
+  streamUrl: `/api/v1/test-runs/${runId}/events`,
+}
+function reviewerEnvelope() {
+  return { data: {
+    csrfToken: 'PRIVATE_CSRF_CANARY', actorId: 'verified-reviewer',
+    workspaceId: '0198f1e2-0000-7000-8000-000000000001', role: 'AI_SECURITY_REVIEWER',
+    expiresAt: Math.floor(Date.now() / 1000) + 1200,
+  }, traceId: 'trace-session', timestamp: '2026-09-27T00:00:00Z' }
 }
 
 describe('FinsecApiClient', () => {
@@ -250,49 +267,100 @@ describe('FinsecApiClient', () => {
     expect(headers.get('X-Actor-Id')).toBe('role-b-console')
   })
 
-  it('starts a run with the B execution request contract', async () => {
-    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
-      data: {
-        runId: 'run-42',
-        status: 'QUEUED',
-        statusUrl: '/api/v1/test-runs/run-42',
-        streamUrl: '/api/v1/test-runs/run-42/events',
-      },
-      traceId: 'trace-start',
-      timestamp: '2026-09-01T00:00:00Z',
-    }))
-    const client = new FinsecApiClient('http://api.test')
+  it('confirms one HTTPS cookie session and starts with its actor and CSRF, never the reviewer key', async () => {
+    const sessionBody = reviewerEnvelope()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse({ data: runReceipt }, 202))
+    const client = new FinsecApiClient('https://api.test')
+    const session = await client.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')
+    const registered = await client.startTestRun(runInput, session, 'test-run-start-fixed-key')
 
-    const registered = await client.startTestRun({
-      releaseId: 'release-1',
-      suiteId: 'suite-1',
-      mode: 'BASELINE',
-      contractVersionId: null,
-      caseIds: [],
-      randomSeed: 42,
-    }, 'role-b-console')
-
-    expect(fetchMock).toHaveBeenCalledWith('http://api.test/api/v1/test-runs', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    for (const [index, [url, init]] of fetchMock.mock.calls.slice(0, 2).entries()) {
+      expect(url).toBe('https://api.test/api/v1/reviewer-session')
+      expect(init).toMatchObject({ method: 'GET', credentials: 'include', redirect: 'error', cache: 'no-store' })
+      const headers = new Headers(init?.headers)
+      expect(headers.get('X-Contract-Reviewer-Key')).toBe(index === 0 ? 'PRIVATE_REVIEWER_KEY_CANARY' : null)
+    }
+    expect(fetchMock).toHaveBeenLastCalledWith('https://api.test/api/v1/test-runs', expect.objectContaining({
       method: 'POST',
-      body: JSON.stringify({
-        releaseId: 'release-1',
-        suiteId: 'suite-1',
-        mode: 'BASELINE',
-        contractVersionId: null,
-        caseIds: [],
-        randomSeed: 42,
-      }),
+      body: JSON.stringify(runInput), credentials: 'include', redirect: 'error', cache: 'no-store',
     }))
-    expect(registered).toEqual({
-      runId: 'run-42',
-      status: 'QUEUED',
-      statusUrl: '/api/v1/test-runs/run-42',
-      streamUrl: '/api/v1/test-runs/run-42/events',
-    })
-    const [, init] = fetchMock.mock.calls[0]!
+    expect(registered).toEqual(runReceipt)
+    const [, init] = fetchMock.mock.calls[2]!
     const headers = new Headers(init?.headers)
-    expect(headers.get('X-Actor-Id')).toBe('role-b-console')
-    expect(headers.get('Idempotency-Key')).toBe('test-run-start-00000000-0000-4000-8000-000000000001')
+    expect(headers.get('X-Actor-Id')).toBe('verified-reviewer')
+    expect(headers.get('X-CSRF-Token')).toBe('PRIVATE_CSRF_CANARY')
+    expect(headers.get('Idempotency-Key')).toBe('test-run-start-fixed-key')
+    expect(headers.has('X-Contract-Reviewer-Key')).toBe(false)
+    expect(JSON.stringify(fetchMock.mock.calls.map(([url]) => url))).not.toMatch(/PRIVATE_CSRF_CANARY|PRIVATE_REVIEWER_KEY_CANARY/)
+  })
+
+  it('does not send a Run when HTTPS, same-client provenance, expiry, or key validation fails', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+    const local = new FinsecApiClient('http://api.test')
+    await expect(local.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')).rejects.toMatchObject({
+      code: 'CONTRACT_SESSION_HTTPS_REQUIRED',
+    })
+    expect(fetchMock).not.toHaveBeenCalled()
+
+    const sessionBody = reviewerEnvelope()
+    fetchMock.mockResolvedValueOnce(jsonResponse(sessionBody)).mockResolvedValueOnce(jsonResponse(sessionBody))
+    const client = new FinsecApiClient('https://api.test')
+    const session = await client.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')
+    const other = new FinsecApiClient('https://api.test')
+    await expect(other.startTestRun(runInput, session, 'fixed-key')).rejects.toMatchObject({ kind: 'session' })
+    await expect(client.startTestRun(runInput, { ...session }, 'fixed-key')).rejects.toMatchObject({ kind: 'session' })
+    await expect(client.startTestRun(runInput, session, 'invalid/key')).rejects.toMatchObject({ kind: 'invalid' })
+    const now = vi.spyOn(Date, 'now').mockReturnValue(session.expiresAt * 1000)
+    try {
+      await expect(client.startTestRun(runInput, session, 'fixed-key')).rejects.toMatchObject({ kind: 'session' })
+    } finally { now.mockRestore() }
+    expect(fetchMock).toHaveBeenCalledTimes(2)
+  })
+
+  it('turns a reflected-secret 403 into a fixed reconnect error without automatic POST retry', async () => {
+    const sessionBody = reviewerEnvelope()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse({ code: 'CONTRACT_AUTH_REQUIRED',
+        detail: 'PRIVATE_REVIEWER_KEY_CANARY PRIVATE_CSRF_CANARY' }, 403))
+    const client = new FinsecApiClient('https://api.test')
+    const session = await client.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')
+    let error: unknown
+    try { await client.startTestRun(runInput, session, 'fixed-key') } catch (cause) { error = cause }
+    expect(error).toBeInstanceOf(RunStartError)
+    expect(error).toMatchObject({ kind: 'session', status: 403 })
+    expect(String(error)).not.toMatch(/PRIVATE_REVIEWER_KEY_CANARY|PRIVATE_CSRF_CANARY/)
+    expect(JSON.stringify(error)).not.toMatch(/PRIVATE_REVIEWER_KEY_CANARY|PRIVATE_CSRF_CANARY/)
+    await expect(client.startTestRun(runInput, session, 'fixed-key')).rejects.toMatchObject({ kind: 'session' })
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+  })
+
+  it('holds an ambiguous network outcome for an explicit same-body, same-key retry', async () => {
+    const sessionBody = reviewerEnvelope()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockRejectedValueOnce(new TypeError('PRIVATE_CSRF_CANARY network failure'))
+      .mockResolvedValueOnce(jsonResponse({ data: runReceipt }, 202))
+    const client = new FinsecApiClient('https://api.test', { maxRetries: 3 })
+    const session = await client.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')
+    let error: unknown
+    try { await client.startTestRun(runInput, session, 'fixed-key') } catch (cause) { error = cause }
+    expect(error).toMatchObject({ kind: 'unknown', status: null })
+    expect(String(error)).not.toContain('PRIVATE_CSRF_CANARY')
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+
+    await expect(client.startTestRun(runInput, session, 'fixed-key')).resolves.toEqual(runReceipt)
+    expect(fetchMock).toHaveBeenCalledTimes(4)
+    const first = fetchMock.mock.calls[2]![1], retry = fetchMock.mock.calls[3]![1]
+    expect(first?.body).toBe(retry?.body)
+    expect(new Headers(first?.headers).get('Idempotency-Key'))
+      .toBe(new Headers(retry?.headers).get('Idempotency-Key'))
   })
 
   it('loads every event through the first history head while a live Run advances', async () => {
