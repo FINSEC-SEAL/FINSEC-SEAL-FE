@@ -11,6 +11,7 @@ import { FindingsPage as LiveFindingsPage } from './features/Findings'
 import { AssurancePage } from './features/Assurance'
 import { RecoveryPage } from './features/Recovery'
 import { ReleaseDiffPage } from './features/ReleaseDiff'
+import { LiveReleaseOverviewPage } from './features/ReleaseOverview'
 import { StoredContractReviewPage } from './features/policy/StoredContractReviewPage'
 import { GatewayEvidencePage } from './features/policy/GatewayEvidencePage'
 import { StoredReplayPolicyPage } from './features/policy/StoredReplayPolicyPage'
@@ -30,7 +31,7 @@ export default function App() {
   return <ProductApp key={route.mode} mode={route.mode} page={route.page} releaseId={route.releaseId} go={go} />
 }
 const detailPages: Page[] = ['release','trace','finding','policy','gateway','replay','verification','report']
-const livePages: Page[] = ['start','overview','agents','releases','manifest','evidence','changed','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway','replay']
+const livePages: Page[] = ['start','overview','agents','releases','release','manifest','evidence','changed','audit','recovery','reports','runs','trace','findings','verification','report','policies','policy','gateway','replay']
 const detailTitles: Partial<Record<Page, [string,string]>> = {
   release: ['이 에이전트는 어디까지 허용되나요?','대출서류 검토의 업무 경계와 검증 구성을 먼저 확인하세요.'],
   trace: ['공격은 어디서 실제 행동이 됐나요?','도구 제안, 정책 판단, API 응답, 실제 영향을 순서대로 확인합니다.'],
@@ -91,12 +92,14 @@ function ProductApp({ mode, page, releaseId, go }: { mode: Mode; page: Page; rel
     if (!simulated && (page === 'runs' || page === 'trace')) return <ExecutionPage releases={releases} actorId={actorId} />
     if (!simulated && page === 'findings') return <LiveFindingsPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
     if (!simulated && page === 'changed') return <ReleaseDiffPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
+    if (!simulated && page === 'release') return <LiveReleaseOverviewPage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId}
+      onReleaseChange={changeReleaseId} onOpenManifest={() => navigate('manifest')} onOpenDiff={() => navigate('changed')} />
     if (!simulated && ['reports','report','verification'].includes(page)) return <AssurancePage releases={releases} actorId={actorId} preferredReleaseId={selectedReleaseId} onReleaseChange={changeReleaseId} />
     if (page === 'start') return <StartPage navigate={navigate} start={start} simulated={simulated} />
     if (page === 'overview') return <WorkspacePage agents={agents} releases={releases} navigate={navigate} workflow={workflow} simulated={simulated} start={start} />
     if (page === 'agents') return <AgentsPage agents={agents} actorId={actorId} client={client} onChanged={reload} onSelect={agent => { setSelectedAgent(agent); navigate('releases') }} />
     if (page === 'releases') return <ReleaseInventory releases={releases} agents={agents} navigate={navigate} simulated={simulated} selectAgent={setSelectedAgent}
-      onReleaseOpen={release => { const agent = agents.find(item => item.id === release.agentId); if (agent) setSelectedAgent(agent); go(mode, 'manifest', release.id) }} />
+      onReleaseOpen={release => { const agent = agents.find(item => item.id === release.agentId); if (agent) setSelectedAgent(agent); go(mode, 'release', release.id) }} />
     if (page === 'manifest') return <>{simulated && <Notice title="체험용 기본 구조 검사 · 실제 strict schema 검증 아님" tone="amber">아래 값은 UI 체험용이며 실제 hash 계산·보안 검증을 수행하지 않습니다.<details className="section-gap"><summary>붙여넣을 샘플 JSON</summary><pre className="code-block">{demoManifest}</pre></details></Notice>}<ReleasesPage agents={agents} actorId={actorId}
       initialAgent={agents.find(agent => agent.id === releases.find(item => item.id === selectedReleaseId)?.agentId) ?? selectedAgent}
       preferredReleaseId={simulated ? undefined : selectedReleaseId}

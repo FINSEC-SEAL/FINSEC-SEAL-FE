@@ -70,6 +70,47 @@ describe('FinsecApiClient', () => {
     } satisfies Partial<FinsecApiError>)
   })
 
+  it('reads the selected Release detail with an encoded ID and actor header', async () => {
+    const data = {
+      id: 'release/selected', agentId: 'agent-1', version: '1.2.0',
+      businessPurpose: 'Document review', manifestSchemaVersion: '1.1',
+      agentArtifactFingerprint: `sha256:${'a'.repeat(64)}`,
+      releaseFingerprint: `sha256:${'b'.repeat(64)}`,
+      safetyContractHash: null, lifecycleState: 'ANALYZED',
+      effectiveStatus: 'NEEDS_REVALIDATION', revalidationReason: null,
+      analyzedAt: '2026-09-01T00:00:00Z', lastTestedAt: null,
+      createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z',
+    }
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      data, traceId: 'trace-detail', timestamp: '2026-09-01T00:00:00Z',
+    }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.releaseDetail('release/selected', 'role-a-console')).resolves.toEqual(data)
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.test/api/v1/releases/release%2Fselected',
+      expect.objectContaining({ headers: expect.any(Headers) }),
+    )
+    const init = fetchMock.mock.calls[0]![1]
+    const headers = new Headers(init?.headers)
+    expect(init?.method).toBeUndefined()
+    expect(init?.body).toBeUndefined()
+    expect(headers.get('X-Actor-Id')).toBe('role-a-console')
+    expect(headers.get('Idempotency-Key')).toBeNull()
+  })
+
+  it('preserves a failed Release detail problem for the live view', async () => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      status: 404, code: 'RELEASE_NOT_FOUND', detail: 'Release does not exist',
+      traceId: 'trace-detail-error', retryable: false,
+    }, 404))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.releaseDetail('missing', 'role-a-console')).rejects.toMatchObject({
+      status: 404, code: 'RELEASE_NOT_FOUND', traceId: 'trace-detail-error', retryable: false,
+    } satisfies Partial<FinsecApiError>)
+  })
+
   it('reads the server Release diff with encoded IDs and nullable component digests', async () => {
     const data = {
       against: 'release/old', releaseId: 'release/new', meaningfulChange: true,
