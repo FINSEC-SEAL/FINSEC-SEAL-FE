@@ -384,7 +384,7 @@ describe('Role A feature consoles', () => {
       }
       close() {}
       emit(type: string, payload: unknown) {
-        const event = { data: JSON.stringify(payload) } as MessageEvent
+        const event = { data: JSON.stringify(payload), lastEventId: String((payload as { sequence: number }).sequence) } as MessageEvent
         ;(listeners.get(type) ?? []).forEach((listener) => listener(event))
       }
     }
@@ -419,7 +419,7 @@ describe('Role A feature consoles', () => {
       })
       await user.click(await screen.findByRole('button', { name: 'Run 조회' }))
       const stream = MockEventSource.instances[0]!
-      expect(stream.url).toContain('/api/v1/test-runs/run-1/events')
+      expect(stream.url).toContain('/api/v1/test-runs/run-1/events?after=10')
 
       stream.onopen?.call(stream as unknown as EventSource, new Event('open'))
       await waitFor(() => {
