@@ -296,10 +296,10 @@ export class FinsecApiClient {
     })
   }
 
-  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string): Promise<void> {
+  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string, signal?: AbortSignal): Promise<void> {
     const response = await fetch(
       `${this.baseUrl}/api/v1/releases/${encodeURIComponent(releaseId)}/evidence-export?format=${format}`,
-      { headers: { 'X-Actor-Id': actorId } },
+      { headers: { 'X-Actor-Id': actorId }, signal },
     )
     if (!response.ok) {
       let problem: ApiProblem = { status: response.status, title: response.statusText }
@@ -311,14 +311,19 @@ export class FinsecApiClient {
       throw new FinsecApiError(response.status, problem)
     }
     const blob = await response.blob()
+    if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
     const disposition = response.headers.get('Content-Disposition') ?? ''
     const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `finsec-attestation.${format}`
     const href = URL.createObjectURL(blob)
-    const link = document.createElement('a')
-    link.href = href
-    link.download = name
-    link.click()
-    URL.revokeObjectURL(href)
+    try {
+      if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
+      const link = document.createElement('a')
+      link.href = href
+      link.download = name
+      link.click()
+    } finally {
+      URL.revokeObjectURL(href)
+    }
   }
 }
 

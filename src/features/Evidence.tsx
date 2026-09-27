@@ -1,4 +1,4 @@
-import { useState } from 'react'
+import { useLayoutEffect, useRef, useState } from 'react'
 import type { Attestation, JsonValue, Release } from '../api/contracts'
 import { api, type PlatformClient } from '../api/client'
 import { EmptyState, ErrorBanner, PageHeader, ShortHash, StatusBadge, formatDate } from '../components/Primitives'
@@ -69,32 +69,81 @@ function readDecision(attestation: Attestation): AttestationDecision | null {
   return value === 'PASS' || value === 'REVIEW' || value === 'BLOCKED' ? value : null
 }
 
-export function EvidencePage({ releases, actorId, client = api, simulated = false }: { releases: Release[]; actorId: string; client?: PlatformClient; simulated?: boolean }) {
+export function EvidencePage({ releases, actorId, preferredReleaseId, onReleaseChange, client = api, simulated = false }: {
+  releases: Release[]; actorId: string; preferredReleaseId?: string; onReleaseChange?: (releaseId: string) => void
+  client?: PlatformClient; simulated?: boolean
+}) {
   const [releaseId, setReleaseId] = useState(releases[0]?.id ?? '')
-  const [attestation, setAttestation] = useState<Attestation | null>(null)
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<unknown>()
+  const selectedId = preferredReleaseId === undefined ? releaseId : preferredReleaseId
+  const validReleaseId = releases.some(release => release.id === selectedId) ? selectedId : ''
+  const selectionKey = JSON.stringify([actorId, validReleaseId])
+  const selectionKeyRef = useRef(selectionKey)
+  selectionKeyRef.current = selectionKey
+  const requestVersion = useRef(0)
+  const exportController = useRef<AbortController | null>(null)
+  const [storedAttestation, setStoredAttestation] = useState<{ key: string; value: Attestation } | null>(null)
+  const [busyKey, setBusyKey] = useState<string | null>(null)
+  const [storedError, setStoredError] = useState<{ key: string; cause: unknown } | null>(null)
+  const attestation = storedAttestation?.key === selectionKey ? storedAttestation.value : null
+  const busy = busyKey === selectionKey
+  const error = storedError?.key === selectionKey ? storedError.cause : undefined
+
+  useLayoutEffect(() => {
+    requestVersion.current++
+    exportController.current?.abort()
+    exportController.current = null
+    setStoredAttestation(null)
+    setStoredError(null)
+    setBusyKey(null)
+    return () => {
+      requestVersion.current++
+      exportController.current?.abort()
+      exportController.current = null
+    }
+  }, [selectionKey])
+
+  function chooseRelease(id: string) {
+    requestVersion.current++
+    exportController.current?.abort()
+    exportController.current = null
+    setReleaseId(id)
+    setStoredAttestation(null)
+    setStoredError(null)
+    setBusyKey(null)
+    onReleaseChange?.(id)
+  }
 
   async function inspect() {
-    if (!releaseId) return
-    setBusy(true); setError(undefined); setAttestation(null)
-    try { setAttestation(await client.attestation(releaseId, actorId)) }
-    catch (cause) { setError(cause) } finally { setBusy(false) }
+    if (!validReleaseId) return
+    const request = ++requestVersion.current
+    const current = () => request === requestVersion.current && selectionKey === selectionKeyRef.current
+    setBusyKey(selectionKey); setStoredError(null); setStoredAttestation(null)
+    try { const value = await client.attestation(validReleaseId, actorId); if (current()) setStoredAttestation({ key: selectionKey, value }) }
+    catch (cause) { if (current()) setStoredError({ key: selectionKey, cause }) }
+    finally { if (current()) setBusyKey(null) }
   }
 
   async function download(format: 'json' | 'html') {
-    if (!releaseId) return
-    setBusy(true); setError(undefined)
-    try { await client.downloadAttestation(releaseId, format, actorId) }
-    catch (cause) { setError(cause) } finally { setBusy(false) }
+    if (!validReleaseId) return
+    const request = ++requestVersion.current
+    const current = () => request === requestVersion.current && selectionKey === selectionKeyRef.current
+    const controller = new AbortController()
+    exportController.current = controller
+    setBusyKey(selectionKey); setStoredError(null)
+    try { await client.downloadAttestation(validReleaseId, format, actorId, controller.signal) }
+    catch (cause) { if (current() && !(cause instanceof DOMException && cause.name === 'AbortError')) setStoredError({ key: selectionKey, cause }) }
+    finally {
+      if (exportController.current === controller) exportController.current = null
+      if (current()) setBusyKey(null)
+    }
   }
 
   return <>
     <PageHeader eyebrow="EVIDENCE PROJECTION" title="구성과 증거" description="확정된 판정의 입력과 증적을 확인합니다. 과거 보고서와 현재 구성의 상태를 구분합니다." />
-    <ErrorBanner error={error} onDismiss={() => setError(undefined)} />
-    <section className="panel attestation-picker"><label>Release<select value={releaseId} onChange={(event) => { setReleaseId(event.target.value); setAttestation(null) }}>
+    <ErrorBanner error={error} onDismiss={() => setStoredError(null)} />
+    <section className="panel attestation-picker"><label>Release<select value={validReleaseId} onChange={(event) => chooseRelease(event.target.value)}>
       <option value="">선택하세요</option>{releases.map((release) => <option key={release.id} value={release.id}>v{release.version} · {release.businessPurpose} · {release.effectiveStatus}</option>)}</select></label>
-      <button className="primary-button" disabled={!releaseId || busy} onClick={() => void inspect()}>{busy ? '검증 중…' : 'Attestation 검증'}</button>
+      <button className="primary-button" disabled={!validReleaseId || busy} onClick={() => void inspect()}>{busy ? '검증 중…' : 'Attestation 검증'}</button>
     </section>
     {!attestation ? <EmptyState title="Attestation을 선택하세요">확정 Decision이 있는 Release만 증적을 생성할 수 있습니다. A는 Decision을 계산하지 않습니다.</EmptyState> : (() => {
       const decision = readDecision(attestation)

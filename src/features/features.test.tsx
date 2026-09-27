@@ -559,6 +559,60 @@ describe('Role A feature consoles', () => {
     expect(screen.queryByText('PASS')).not.toBeInTheDocument()
   })
 
+  it('discards an in-flight Attestation when the URL-selected Release changes', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    let complete!: (value: Attestation) => void
+    const read = vi.spyOn(api, 'attestation').mockReturnValue(new Promise(resolve => { complete = resolve }))
+    const props = { releases: [release, nextRelease], actorId: 'role-a-console', onReleaseChange: vi.fn() }
+    const user = userEvent.setup()
+    const view = render(<EvidencePage {...props} preferredReleaseId={release.id} />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+    expect(read).toHaveBeenCalledWith(release.id, 'role-a-console')
+    view.rerender(<EvidencePage {...props} preferredReleaseId={nextRelease.id} />)
+    await act(async () => complete(effectAttestation({ decision: { value: 'PASS' } })))
+
+    expect(screen.getByLabelText('Release')).toHaveValue(nextRelease.id)
+    expect(screen.queryByRole('heading', { name: 'Current attestation' })).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Attestation 검증' })).toBeEnabled()
+  })
+
+  it('aborts an old export when a different Release is selected', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    let capturedSignal: AbortSignal | undefined
+    let completeExport!: () => void
+    const exportFile = vi.spyOn(api, 'downloadAttestation').mockImplementation((_id, _format, _actor, signal) => {
+      capturedSignal = signal
+      return new Promise(resolve => { completeExport = resolve })
+    })
+    const props = { releases: [release, nextRelease], actorId: 'role-a-console' }
+    const user = userEvent.setup()
+    const view = render(<EvidencePage {...props} preferredReleaseId={release.id} />)
+
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+    await screen.findByRole('heading', { name: 'Current attestation' })
+    await user.click(screen.getByRole('button', { name: 'JSON 내려받기' }))
+    expect(exportFile).toHaveBeenCalledWith(release.id, 'json', 'role-a-console', expect.any(AbortSignal))
+    expect(capturedSignal?.aborted).toBe(false)
+    view.rerender(<EvidencePage {...props} preferredReleaseId={nextRelease.id} />)
+    expect(capturedSignal?.aborted).toBe(true)
+    await act(async () => completeExport())
+
+    expect(screen.getByLabelText('Release')).toHaveValue(nextRelease.id)
+    expect(screen.queryByRole('heading', { name: 'Current attestation' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('leaves an explicit unknown Release unselected and never requests its Attestation', async () => {
+    const read = vi.spyOn(api, 'attestation')
+    render(<EvidencePage releases={[release]} actorId="role-a-console" preferredReleaseId="missing-release" />)
+
+    expect(screen.getByLabelText('Release')).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Attestation 검증' })).toBeDisabled()
+    expect(read).not.toHaveBeenCalled()
+  })
+
   it('does not submit a recovery until the operator types the exact resolution', async () => {
     const pending: PendingRecovery = {
       idempotencyRecordId: '0198f200-0000-7000-8000-000000000005',

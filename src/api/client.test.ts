@@ -59,6 +59,31 @@ describe('FinsecApiClient', () => {
     } satisfies Partial<FinsecApiError>)
   })
 
+  it('never clicks an old Attestation export after cancellation during blob download', async () => {
+    const response = new Response('synthetic report', {
+      status: 200,
+      headers: { 'Content-Disposition': 'attachment; filename="attestation.json"' },
+    })
+    let completeBlob!: (blob: Blob) => void
+    const blob = vi.spyOn(response, 'blob').mockReturnValue(new Promise(resolve => { completeBlob = resolve }))
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response)
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click')
+    const controller = new AbortController()
+    const client = new FinsecApiClient('http://api.test')
+
+    const exportPromise = client.downloadAttestation('release-old', 'json', 'role-a-console', controller.signal)
+    await vi.waitFor(() => expect(blob).toHaveBeenCalledOnce())
+    controller.abort()
+    completeBlob(new Blob(['synthetic report']))
+
+    await expect(exportPromise).rejects.toMatchObject({ name: 'AbortError' })
+    expect(click).not.toHaveBeenCalled()
+    expect(fetchMock).toHaveBeenCalledWith(
+      'http://api.test/api/v1/releases/release-old/evidence-export?format=json',
+      expect.objectContaining({ signal: controller.signal }),
+    )
+  })
+
   it('authenticates recovery lookup without persisting the operator key', async () => {
     const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
       data: [], traceId: 'trace-id', timestamp: '2026-09-01T00:00:00Z',
@@ -253,4 +278,3 @@ describe('FinsecApiClient', () => {
     } satisfies Partial<FinsecApiError>)
   })
 })
-
