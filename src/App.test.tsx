@@ -1,6 +1,8 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import App from './App'
+import type { Fingerprint, Release } from './api/contracts'
+import { LiveReleaseOverviewPage } from './features/ReleaseOverview'
 import type { StoredContractReview } from './features/policy/wire'
 import { mainNavigation, pageLabels } from './product/model'
 
@@ -158,16 +160,24 @@ function platformContract(review: StoredContractReview) {
 // Synthetic HTTP fixtures cross the real inventory client and the C client, wire and review page.
 function livePolicyApi() {
   let current = storedReview()
+  const releaseRows = (): Release[] => [liveReleaseId, selectedReleaseId].map((id, index) => ({
+    id, agentId: liveAgentId, version: `${index + 1}.0.0`, businessPurpose: '대출 서류 검토', manifestSchemaVersion: '1.0',
+    agentArtifactFingerprint: policyHash, releaseFingerprint: policyHash, safetyContractHash: policyHash,
+    lifecycleState: 'REVIEW', effectiveStatus: 'REVIEW', revalidationReason: null, analyzedAt: '2026-09-07T00:00:00Z',
+    lastTestedAt: null, createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z',
+  }))
   const handlers = { review: () => envelope(current) }
   const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async (input, init = {}) => {
     const url = new URL(String(input), window.location.origin)
     if (url.pathname === '/api/v1/agents') return envelope([{ id: liveAgentId, agentKey: 'live-loan-agent', name: 'Live Loan Agent', purposeSummary: 'Document review', status: 'ACTIVE', createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z' }])
-    if (url.pathname === `/api/v1/agents/${liveAgentId}/releases`) return envelope([liveReleaseId, selectedReleaseId].map((id, index) => ({
-      id, agentId: liveAgentId, version: `${index + 1}.0.0`, businessPurpose: '대출 서류 검토', manifestSchemaVersion: '1.0',
-      agentArtifactFingerprint: policyHash, releaseFingerprint: policyHash, safetyContractHash: policyHash,
-      lifecycleState: 'REVIEW', effectiveStatus: 'REVIEW', revalidationReason: null, analyzedAt: '2026-09-07T00:00:00Z',
-      lastTestedAt: null, createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z',
-    })))
+    if (url.pathname === `/api/v1/agents/${liveAgentId}/releases`) return envelope(releaseRows())
+    const release = releaseRows().find(item => url.pathname === `/api/v1/releases/${item.id}` || url.pathname === `/api/v1/releases/${item.id}/fingerprint`)
+    if (release && url.pathname.endsWith('/fingerprint')) return envelope({
+      canonicalizationVersion: '1.0', agentArtifactFingerprint: release.agentArtifactFingerprint,
+      releaseFingerprint: release.releaseFingerprint, safetyContractHash: release.safetyContractHash,
+      components: { systemPromptHash: policyHash },
+    })
+    if (release) return envelope(release)
     if (url.pathname === '/api/v1/platform/contracts') return envelope(url.searchParams.get('releaseId') === selectedReleaseId ? [platformContract(current)] : [])
     if (url.pathname === `/api/v1/platform/contracts/${liveVersionId}/review`) return handlers.review()
     if (init.method === 'POST' && url.pathname === `/api/v1/contract-versions/${liveVersionId}:approve`) {
@@ -227,6 +237,174 @@ function liveReleaseDiffApi(reply: () => Response | Promise<Response> = () => en
     updateCurrent: () => { currentStatus = 'PASS'; currentContractHash = `sha256:${'9'.repeat(64)}` },
   }
 }
+
+const overviewRelease: Release = {
+  id: selectedReleaseId, agentId: liveAgentId, version: '2.0.0', businessPurpose: '실제 대출서류 검토',
+  manifestSchemaVersion: '1.1', agentArtifactFingerprint: `sha256:${'a'.repeat(64)}`,
+  releaseFingerprint: `sha256:${'b'.repeat(64)}`, safetyContractHash: null,
+  lifecycleState: 'ANALYZED', effectiveStatus: 'NEEDS_REVALIDATION',
+  revalidationReason: { privatePrompt: 'PRIVATE_REASON_CANARY' },
+  analyzedAt: '2026-09-07T00:00:00Z', lastTestedAt: null,
+  createdAt: '2026-09-07T00:00:00Z', updatedAt: '2026-09-07T00:00:00Z',
+}
+const olderOverviewRelease: Release = {
+  ...overviewRelease, id: liveReleaseId, version: '1.0.0', businessPurpose: '과거 대출서류 검토',
+  releaseFingerprint: `sha256:${'c'.repeat(64)}`, effectiveStatus: 'REVIEW',
+}
+function overviewFingerprint(release: Release): Fingerprint {
+  return {
+    canonicalizationVersion: '1.0', agentArtifactFingerprint: release.agentArtifactFingerprint,
+    releaseFingerprint: release.releaseFingerprint, safetyContractHash: release.safetyContractHash,
+    components: { systemPromptHash: `sha256:${'d'.repeat(64)}`, toolCatalogHash: `sha256:${'e'.repeat(64)}` },
+  }
+}
+function liveReleaseOverviewApi() {
+  let selected = overviewRelease
+  const handlers = {
+    detail: (release: Release): Response | Promise<Response> => envelope(release),
+    fingerprint: (release: Release): Response | Promise<Response> => envelope(overviewFingerprint(release)),
+  }
+  const fetch = vi.spyOn(globalThis, 'fetch').mockImplementation(async input => {
+    const url = new URL(String(input), window.location.origin)
+    if (url.pathname === '/api/v1/agents') return envelope([{ id: liveAgentId, name: 'Live Agent', status: 'ACTIVE' }])
+    if (url.pathname === `/api/v1/agents/${liveAgentId}/releases`) return envelope([olderOverviewRelease, selected])
+    const release = [olderOverviewRelease, selected].find(item => url.pathname === `/api/v1/releases/${item.id}`
+      || url.pathname === `/api/v1/releases/${item.id}/fingerprint`)
+    if (release && url.pathname.endsWith('/fingerprint')) return handlers.fingerprint(release)
+    if (release) return handlers.detail(release)
+    throw new Error(`Unexpected Release overview HTTP route: ${url.pathname}`)
+  })
+  const detailCalls = () => fetch.mock.calls.filter(([input]) => /^\/api\/v1\/releases\/[^/]+$/.test(new URL(String(input), window.location.origin).pathname))
+  const fingerprintCalls = () => fetch.mock.calls.filter(([input]) => new URL(String(input), window.location.origin).pathname.endsWith('/fingerprint'))
+  return { fetch, handlers, detailCalls, fingerprintCalls, updateSelected: (patch: Partial<Release>) => { selected = { ...selected, ...patch } } }
+}
+
+describe('live Release overview and fingerprint', () => {
+  it('restores an explicit URL Release and shows matching server status and digest only', async () => {
+    window.history.replaceState(null, '', `/#/live/release?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseOverviewApi()
+    const user = userEvent.setup()
+    render(<App />)
+
+    expect(await screen.findByRole('heading', { name: 'Release 구성과 검증 상태' })).toBeInTheDocument()
+    const detail = await screen.findByRole('table', { name: 'Release 상세와 서버 상태' })
+    expect(screen.getByLabelText('검토할 Release')).toHaveValue(selectedReleaseId)
+    expect(within(detail).getByText('실제 대출서류 검토')).toBeInTheDocument()
+    expect(within(detail).getByText('ANALYZED')).toBeInTheDocument()
+    expect(within(detail).getByText('NEEDS REVALIDATION')).toBeInTheDocument()
+    expect(screen.getByText('재검증이 필요한 Release입니다.')).toBeInTheDocument()
+    const hashes = screen.getByRole('table', { name: 'Release fingerprint 식별자' })
+    expect(within(hashes).getByText('N/A')).toBeInTheDocument()
+    const components = screen.getByRole('table', { name: 'Manifest 구성 요소 digest' })
+    expect(within(components).getByText('systemPromptHash')).toBeInTheDocument()
+    expect(screen.queryByText('PRIVATE_REASON_CANARY')).not.toBeInTheDocument()
+    expect(backend.detailCalls()).toHaveLength(1)
+    expect(backend.fingerprintCalls()).toHaveLength(1)
+    expect(new Headers(backend.detailCalls()[0]![1]?.headers).get('X-Actor-Id')).toBe('role-a-console')
+    await user.click(screen.getByRole('button', { name: '구성 변경 비교 →' }))
+    expect(window.location.hash).toBe(`#/live/changed?releaseId=${selectedReleaseId}`)
+  })
+
+  it('makes no detail read without selection and rejects an unknown direct link', async () => {
+    window.history.replaceState(null, '', '/#/live/release')
+    const backend = liveReleaseOverviewApi()
+    const view = render(<App />)
+    expect(await screen.findByText('Release를 선택하세요')).toBeInTheDocument()
+    expect(backend.detailCalls()).toHaveLength(0)
+    expect(backend.fingerprintCalls()).toHaveLength(0)
+
+    view.unmount()
+    window.history.replaceState(null, '', '/#/live/release?releaseId=missing-release')
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '선택한 Release를 찾을 수 없습니다.' })).toBeInTheDocument()
+    expect(backend.detailCalls()).toHaveLength(0)
+  })
+
+  it.each(['detail ID', 'detail revision', 'fingerprint hash', 'raw component'])('suppresses a %s mismatch instead of mixing responses', async mismatch => {
+    window.history.replaceState(null, '', `/#/live/release?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseOverviewApi()
+    if (mismatch === 'detail ID') backend.handlers.detail = (release) => envelope({ ...release, id: otherReleaseId })
+    if (mismatch === 'detail revision') backend.handlers.detail = (release) => envelope({ ...release, effectiveStatus: 'PASS' })
+    if (mismatch === 'fingerprint hash') backend.handlers.fingerprint = (release) => envelope({ ...overviewFingerprint(release), releaseFingerprint: `sha256:${'f'.repeat(64)}` })
+    if (mismatch === 'raw component') backend.handlers.fingerprint = (release) => envelope({ ...overviewFingerprint(release), components: { systemPromptHash: 'RAW_PROMPT_CANARY' } })
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('서버 Release 상세·fingerprint와 현재 목록이 일치하지 않습니다.')
+    expect(screen.queryByRole('table', { name: 'Release 상세와 서버 상태' })).not.toBeInTheDocument()
+    expect(screen.queryByRole('table', { name: 'Manifest 구성 요소 digest' })).not.toBeInTheDocument()
+    expect(screen.queryByText('RAW_PROMPT_CANARY')).not.toBeInTheDocument()
+  })
+
+  it.each(['agentArtifactFingerprint', 'releaseFingerprint', 'safetyContractHash'] as const)('rejects a malformed %s even when all three reads agree', async field => {
+    window.history.replaceState(null, '', `/#/live/release?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseOverviewApi()
+    backend.updateSelected({ [field]: 'RAW_HASH_CANARY' })
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent('서버 Release 상세·fingerprint와 현재 목록이 일치하지 않습니다.')
+    expect(screen.queryByRole('table', { name: 'Release fingerprint 식별자' })).not.toBeInTheDocument()
+    expect(screen.queryByText('RAW_HASH_CANARY')).not.toBeInTheDocument()
+  })
+
+  it.each(['detail 404', 'fingerprint 409', 'offline'])('keeps a %s as a LIVE error without demo fallback', async failed => {
+    window.history.replaceState(null, '', `/#/live/release?releaseId=${selectedReleaseId}`)
+    const backend = liveReleaseOverviewApi()
+    const status = failed === 'detail 404' ? 404 : 409
+    const reply = () => new Response(JSON.stringify({
+      status, code: failed === 'detail 404' ? 'RELEASE_NOT_FOUND' : 'RELEASE_CHANGED',
+      detail: failed, traceId: 'trace-overview-error', retryable: false,
+    }), { status })
+    if (failed === 'detail 404') backend.handlers.detail = reply
+    else if (failed === 'fingerprint 409') backend.handlers.fingerprint = reply
+    else backend.handlers.detail = () => Promise.reject(new Error('Offline'))
+    render(<App />)
+
+    expect(await screen.findByRole('alert')).toHaveTextContent(failed === 'offline' ? 'Offline' : failed)
+    expect(screen.queryByRole('table', { name: 'Release 상세와 서버 상태' })).not.toBeInTheDocument()
+    expect(screen.queryByText('System prompt')).not.toBeInTheDocument()
+  })
+
+  it.each(['actor', 'Release', 'inventory'])('ignores late dual-GET data after %s changes', async changed => {
+    let resolveOld!: (detail: Release) => void
+    const oldDetail = new Promise<Release>(resolve => { resolveOld = resolve })
+    const nextRelease = changed === 'Release' ? olderOverviewRelease
+      : changed === 'inventory' ? { ...overviewRelease, effectiveStatus: 'PASS' as const } : overviewRelease
+    const oldDigest = `sha256:${'1'.repeat(64)}`
+    const newDigest = `sha256:${'2'.repeat(64)}`
+    const client = {
+      releaseDetail: vi.fn().mockReturnValueOnce(oldDetail).mockResolvedValue(nextRelease),
+      fingerprint: vi.fn().mockResolvedValueOnce({ ...overviewFingerprint(overviewRelease), components: { systemPromptHash: oldDigest } })
+        .mockResolvedValue({ ...overviewFingerprint(nextRelease), components: { systemPromptHash: newDigest } }),
+    }
+    const baseProps = {
+      releases: [overviewRelease], actorId: 'role-a-console', preferredReleaseId: selectedReleaseId,
+      onReleaseChange: vi.fn(), onOpenManifest: vi.fn(), onOpenDiff: vi.fn(), client,
+    }
+    const view = render(<LiveReleaseOverviewPage {...baseProps} />)
+    await waitFor(() => expect(client.releaseDetail).toHaveBeenCalledTimes(1))
+    const nextProps = {
+      ...baseProps,
+      releases: [nextRelease],
+      actorId: changed === 'actor' ? 'other-reviewer' : baseProps.actorId,
+      preferredReleaseId: nextRelease.id,
+    }
+    view.rerender(<LiveReleaseOverviewPage {...nextProps} />)
+    expect(await screen.findByTitle(newDigest)).toBeInTheDocument()
+    await act(async () => resolveOld(overviewRelease))
+    expect(screen.getByTitle(newDigest)).toBeInTheDocument()
+    expect(screen.queryByTitle(oldDigest)).not.toBeInTheDocument()
+    expect(client.releaseDetail).toHaveBeenCalledTimes(2)
+  })
+
+  it('keeps the simulated Release summary isolated from API reads', async () => {
+    window.history.replaceState(null, '', `/#/demo/release?releaseId=${selectedReleaseId}`)
+    const fetch = vi.spyOn(globalThis, 'fetch')
+    render(<App />)
+    expect(await screen.findByRole('heading', { name: '이 에이전트는 어디까지 허용되나요?' })).toBeInTheDocument()
+    expect(screen.queryByRole('heading', { name: 'Release 구성과 검증 상태' })).not.toBeInTheDocument()
+    expect(fetch).not.toHaveBeenCalled()
+  })
+})
 
 describe('live Release configuration diff', () => {
   it('uses an explicit same-Agent pair and renders nullable, redacted server diff separately from Release state', async () => {
@@ -347,7 +525,7 @@ describe('live Release configuration diff', () => {
 })
 
 describe('live Release identity navigation', () => {
-  it('opens the exact inventory Release in Manifest and Evidence, then restores it on reload', async () => {
+  it('opens the exact inventory Release in overview, Manifest and Evidence, then restores it on reload', async () => {
     window.history.replaceState(null, '', '/#/live/releases')
     livePolicyApi()
     const user = userEvent.setup()
@@ -355,6 +533,10 @@ describe('live Release identity navigation', () => {
     await screen.findByRole('heading', { name: '릴리스 버전 관리' })
 
     await user.click(within(screen.getByText('v2.0.0').closest('tr')!).getByRole('button', { name: '릴리스 열기 →' }))
+    expect(await screen.findByRole('heading', { name: 'Release 구성과 검증 상태' })).toBeInTheDocument()
+    expect(window.location.hash).toBe(`#/live/release?releaseId=${selectedReleaseId}`)
+    await screen.findByRole('table', { name: 'Release 상세와 서버 상태' })
+    await user.click(screen.getByRole('button', { name: 'Manifest 관리 →' }))
     expect(await screen.findByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
     expect(window.location.hash).toBe(`#/live/manifest?releaseId=${selectedReleaseId}`)
     await user.click(within(screen.getByRole('navigation', { name: '주요 메뉴' })).getByRole('button', { name: '구성·증거' }))

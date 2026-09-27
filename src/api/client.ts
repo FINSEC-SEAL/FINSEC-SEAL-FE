@@ -178,6 +178,10 @@ export class FinsecApiClient {
     return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {}, { actorId })
   }
 
+  releaseDetail(releaseId: string, actorId: string): Promise<Release> {
+    return this.request(`/api/v1/releases/${encodeURIComponent(releaseId)}`, {}, { actorId })
+  }
+
   createRelease(agentId: string, manifest: JsonValue, actorId: string): Promise<Release> {
     return this.request(`/api/v1/agents/${encodeURIComponent(agentId)}/releases`, {
       method: 'POST',
