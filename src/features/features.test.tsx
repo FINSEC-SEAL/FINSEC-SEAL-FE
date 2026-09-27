@@ -1,7 +1,7 @@
-import { render, screen, waitFor, within } from '@testing-library/react'
+import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { api } from '../api/client'
-import type { Agent, Attestation, JsonValue, PendingRecovery, Release } from '../api/contracts'
+import type { Agent, Attestation, Fingerprint, JsonValue, PendingRecovery, Release, ValidationResult } from '../api/contracts'
 import { AgentsPage, ReleasesPage } from './AgentsReleases'
 import { AuditPage } from './Audit'
 import { EvidencePage } from './Evidence'
@@ -107,6 +107,108 @@ describe('Role A feature consoles', () => {
 
     expect(await screen.findByText('/model/parameters/temperature')).toBeInTheDocument()
     expect(screen.getByText('temperature must be a JSON number')).toBeInTheDocument()
+  })
+
+  it('discards a late validation result after another Release is selected', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    vi.spyOn(api, 'listReleases').mockResolvedValue([release, nextRelease])
+    let complete!: (result: ValidationResult) => void
+    vi.spyOn(api, 'validateRelease').mockReturnValue(new Promise(resolve => { complete = resolve }))
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    await user.click(screen.getByRole('button', { name: 'Manifest 검증' }))
+    await user.click(screen.getByRole('button', { name: /v2\.0\.0/ }))
+    await act(async () => complete({ valid: false, issues: [{ path: '/wrong-release', code: 'TYPE', severity: 'ERROR', message: 'Only Release A failed' }] }))
+
+    expect(screen.getByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
+    expect(screen.queryByText('/wrong-release')).not.toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Manifest 검증' })).toBeEnabled()
+  })
+
+  it('discards a late fingerprint when the selected Release changes', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    vi.spyOn(api, 'listReleases').mockResolvedValue([release, nextRelease])
+    let complete!: (result: Fingerprint) => void
+    vi.spyOn(api, 'fingerprint').mockReturnValue(new Promise(resolve => { complete = resolve }))
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    await user.click(screen.getByRole('button', { name: 'Fingerprint 확인' }))
+    await user.click(screen.getByRole('button', { name: /v2\.0\.0/ }))
+    await act(async () => complete({ canonicalizationVersion: '1.0', agentArtifactFingerprint: 'sha256:old', releaseFingerprint: 'sha256:old', safetyContractHash: null, components: { staleComponent: 'sha256:old' } }))
+
+    expect(screen.getByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
+    expect(screen.queryByText('staleComponent')).not.toBeInTheDocument()
+  })
+
+  it('ignores the previous Agent inventory when its response arrives after switching', async () => {
+    const otherAgent = { ...agent, id: 'agent-2', name: 'Other Agent', agentKey: 'other-agent' }
+    const otherRelease = { ...release, id: 'release-3', agentId: otherAgent.id, version: '3.0.0' }
+    let complete!: (result: Release[]) => void
+    vi.spyOn(api, 'listReleases').mockImplementation(id => id === agent.id
+      ? new Promise(resolve => { complete = resolve })
+      : Promise.resolve([otherRelease]))
+    const inventory = vi.fn()
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent, otherAgent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={inventory} />)
+
+    await user.selectOptions(screen.getByLabelText('Agent'), otherAgent.id)
+    expect(await screen.findByRole('button', { name: /v3\.0\.0/ })).toBeInTheDocument()
+    await act(async () => complete([release]))
+
+    expect(screen.queryByRole('button', { name: /v1\.0\.0/ })).not.toBeInTheDocument()
+    expect(inventory).toHaveBeenCalledTimes(1)
+    expect(inventory).toHaveBeenCalledWith([otherRelease], otherAgent.id)
+  })
+
+  it('does not replace a newer explicit Release selection with a late create result', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    const createdRelease = { ...release, id: 'release-created', version: '3.0.0' }
+    vi.spyOn(api, 'listReleases').mockResolvedValue([release, nextRelease, createdRelease])
+    let complete!: (result: Release) => void
+    vi.spyOn(api, 'createRelease').mockReturnValue(new Promise(resolve => { complete = resolve }))
+    let completeValidation!: (result: ValidationResult) => void
+    vi.spyOn(api, 'validateRelease').mockReturnValue(new Promise(resolve => { completeValidation = resolve }))
+    const onReleaseSelect = vi.fn()
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent}
+      onReleaseInventory={vi.fn()} onReleaseSelect={onReleaseSelect} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    await user.click(screen.getByLabelText('Release manifest JSON'))
+    await user.paste('{}')
+    await user.click(screen.getByRole('button', { name: 'Draft Release 등록' }))
+    await user.click(screen.getByRole('button', { name: /v2\.0\.0/ }))
+    await user.click(screen.getByRole('button', { name: 'Manifest 검증' }))
+    await act(async () => complete(createdRelease))
+
+    expect(screen.getByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
+    expect(screen.getByRole('button', { name: 'Manifest 검증' })).toBeDisabled()
+    expect(onReleaseSelect).toHaveBeenLastCalledWith(nextRelease)
+    await act(async () => completeValidation({ valid: true, issues: [] }))
+    expect(screen.getByText('✓ Manifest valid')).toBeInTheDocument()
+  })
+
+  it('does not show a late create failure beneath a newly selected Release', async () => {
+    const nextRelease = { ...release, id: 'release-2', version: '2.0.0' }
+    vi.spyOn(api, 'listReleases').mockResolvedValue([release, nextRelease])
+    let rejectCreate!: (error: Error) => void
+    vi.spyOn(api, 'createRelease').mockReturnValue(new Promise((_, reject) => { rejectCreate = reject }))
+    const user = userEvent.setup()
+    render(<ReleasesPage agents={[agent]} actorId="role-a-console" initialAgent={agent} onReleaseInventory={vi.fn()} />)
+
+    await user.click(await screen.findByRole('button', { name: /v1\.0\.0/ }))
+    await user.click(screen.getByLabelText('Release manifest JSON'))
+    await user.paste('{}')
+    await user.click(screen.getByRole('button', { name: 'Draft Release 등록' }))
+    await user.click(screen.getByRole('button', { name: /v2\.0\.0/ }))
+    await act(async () => rejectCreate(new Error('old create failed')))
+
+    expect(screen.getByRole('heading', { name: 'v2.0.0' })).toBeInTheDocument()
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
   })
 
   it('loads ready suites and recent runs for the active release in execution console', async () => {
