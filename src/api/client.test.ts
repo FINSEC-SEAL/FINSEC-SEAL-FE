@@ -1,10 +1,21 @@
 import { FinsecApiClient, FinsecApiError } from './client'
+import type { ExecutionEvent } from './contracts'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
     status,
     headers: { 'Content-Type': 'application/json' },
   })
+}
+
+function historyEvent(sequence: number, runId = 'run-1'): ExecutionEvent {
+  return {
+    schemaVersion: '1.0', eventId: `event-${sequence}`, traceId: 'trace-1', runId,
+    testCaseRunId: null, sequence, occurredAt: '2026-09-01T00:00:00Z',
+    eventType: 'MODEL_REQUEST', toolName: null, input: null, output: null,
+    payloadDigest: `sha256:${'a'.repeat(64)}`, policyDecision: null, reasonCode: null,
+    metadata: {}, prevEventHash: null, eventHash: `sha256:${'b'.repeat(64)}`,
+  }
 }
 
 describe('FinsecApiClient', () => {
@@ -205,6 +216,87 @@ describe('FinsecApiClient', () => {
     const headers = new Headers(init?.headers)
     expect(headers.get('X-Actor-Id')).toBe('role-b-console')
     expect(headers.get('Idempotency-Key')).toBe('test-run-start-00000000-0000-4000-8000-000000000001')
+  })
+
+  it('loads every event through the first history head while a live Run advances', async () => {
+    const firstPage = Array.from({ length: 1000 }, (_, index) => historyEvent(index + 1))
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: firstPage, headSequence: 1003, nextCursor: 1000,
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: [historyEvent(1001), historyEvent(1002), historyEvent(1003), historyEvent(1004)],
+        headSequence: 1004, nextCursor: null,
+      } }))
+    const client = new FinsecApiClient('http://api.test')
+
+    const snapshot = await client.eventHistory('run-1', 'role-a-console')
+
+    expect(snapshot.headSequence).toBe(1003)
+    expect(snapshot.nextCursor).toBeNull()
+    expect(snapshot.items).toHaveLength(1003)
+    expect(snapshot.items.map((event) => event.sequence)).toEqual(
+      Array.from({ length: 1003 }, (_, index) => index + 1),
+    )
+    expect(snapshot.items.at(-1)?.eventId).toBe('event-1003')
+    expect(fetchMock.mock.calls.map(([url]) => url)).toEqual([
+      'http://api.test/api/v1/test-runs/run-1/event-history?after=0&limit=1000',
+      'http://api.test/api/v1/test-runs/run-1/event-history?after=1000&limit=1000',
+    ])
+    for (const [, init] of fetchMock.mock.calls) {
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('role-a-console')
+    }
+  })
+
+  it('returns an empty event snapshot for an empty Run', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: {
+      items: [], headSequence: 0, nextCursor: null,
+    } }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.eventHistory('run-1', 'role-a-console')).resolves.toEqual({
+      items: [], headSequence: 0, nextCursor: null,
+    })
+    expect(fetchMock).toHaveBeenCalledTimes(1)
+  })
+
+  it.each([
+    ['sequence gap', { items: [historyEvent(2)], headSequence: 2, nextCursor: null }],
+    ['terminal page before head', { items: [historyEvent(1)], headSequence: 2, nextCursor: null }],
+    ['foreign Run', { items: [historyEvent(1, 'other-run')], headSequence: 1, nextCursor: null }],
+    ['duplicate event ID', { items: [historyEvent(1), { ...historyEvent(2), eventId: 'event-1' }], headSequence: 2, nextCursor: null }],
+    ['stalled cursor', { items: Array.from({ length: 1000 }, (_, index) => historyEvent(index + 1)), headSequence: 1001, nextCursor: 999 }],
+  ])('rejects an invalid history %s', async (_case, page) => {
+    vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({ data: page }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.eventHistory('run-1', 'role-a-console')).rejects.toThrow(/Event history/)
+  })
+
+  it('rejects a missing later history page instead of returning a partial snapshot', async () => {
+    vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: Array.from({ length: 1000 }, (_, index) => historyEvent(index + 1)),
+        headSequence: 1001, nextCursor: 1000,
+      } }))
+      .mockResolvedValueOnce(jsonResponse({ data: {
+        items: [], headSequence: 1001, nextCursor: null,
+      } }))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.eventHistory('run-1', 'role-a-console')).rejects.toThrow(/incomplete/)
+  })
+
+  it('preserves 410 STREAM_CURSOR_EXPIRED without retrying the expired cursor', async () => {
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(jsonResponse({
+      status: 410, code: 'STREAM_CURSOR_EXPIRED', title: 'Gone', retryable: true,
+    }, 410))
+    const client = new FinsecApiClient('http://api.test')
+
+    await expect(client.eventHistory('run-1', 'role-a-console')).rejects.toMatchObject({
+      name: 'FinsecApiError', status: 410, code: 'STREAM_CURSOR_EXPIRED', retryable: true,
+    } satisfies Partial<FinsecApiError>)
+    expect(fetchMock).toHaveBeenCalledTimes(1)
   })
 
   it('lists replay comparisons for a release', async () => {
