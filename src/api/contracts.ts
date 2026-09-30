@@ -264,6 +264,141 @@ export interface MetricsView {
   metrics: ReleaseMetrics
   /** Forward-compatible B/C replay evidence. The current backend may omit this until orchestration is wired. */
   replaySummary?: ReplaySummary | null
+  policyLatency?: PolicyLatency | null
+  completionRate?: CompletionRate | null
+  trialSuccessDistribution?: TrialSuccessDistribution | null
+  attackRateBreakdown?: AttackRateBreakdown | null
+  criticalInvariantAnySuccess?: CriticalInvariantAnySuccess | null
+}
+
+export type AssuranceStatus = 'AVAILABLE' | 'N_A'
+
+export interface PolicyLatency {
+  status: AssuranceStatus
+  reason: string | null
+  observedEventCount: number
+  invalidEventCount: number
+  averageMs: number | null
+  p50Ms: number | null
+  p95Ms: number | null
+  p99Ms: number | null
+  sourceEventIds: string[]
+  sourceRunIds: string[]
+}
+
+export interface CompletionRate {
+  status: AssuranceStatus
+  reason: string | null
+  numerator: number | null
+  denominator: number | null
+  value: number | null
+  cancelledTrials: number | null
+  unmaterializedTrials: number | null
+  sourceRunIds: string[]
+}
+
+export interface TrialBit {
+  runId: string
+  testCaseId: string
+  caseRunId: string
+  trialIndex: number
+  successBit: 0 | 1 | null
+  exclusionReason: string | null
+  secondaryInconclusive: boolean
+}
+
+export interface CaseTrialDistribution {
+  status: AssuranceStatus
+  reason: string | null
+  runId: string
+  mode: string
+  testCaseId: string
+  caseKey: string
+  caseType: string
+  category: string
+  partition: string
+  successBits: Array<0 | 1 | null>
+  orderedTrials: TrialBit[]
+  successCount: number | null
+  trials: number | null
+  excludedTrials: number
+}
+
+export interface CategoryTrialDistribution {
+  status: AssuranceStatus
+  reason: string | null
+  mode: string
+  caseType: string
+  category: string
+  successBits: Array<0 | 1 | null>
+  orderedTrials: TrialBit[]
+  successCount: number | null
+  trials: number | null
+  excludedTrials: number
+  sourceRunIds: string[]
+}
+
+export interface TrialSuccessDistribution {
+  status: AssuranceStatus
+  reason: string | null
+  cases: CaseTrialDistribution[]
+  categories: CategoryTrialDistribution[]
+  sourceRunIds: string[]
+}
+
+export interface AttackRateGroup {
+  status: AssuranceStatus
+  reason: string | null
+  mode: string
+  category: string
+  partition: string
+  numerator: number | null
+  denominator: number | null
+  value: number | null
+  anySuccess: boolean | null
+  excludedTrials: number
+  sourceRunIds: string[]
+}
+
+export interface AttackRateBreakdown {
+  status: AssuranceStatus
+  reason: string | null
+  groups: AttackRateGroup[]
+  sourceRunIds: string[]
+}
+
+export interface CriticalInvariantEvidence {
+  gcId: string
+  invariantId: string
+  status: AssuranceStatus
+  reason: string | null
+  anySuccess: boolean | null
+  sourceRunIds: string[]
+  sourceCaseRunIds: string[]
+  sourceOracleResultIds: string[]
+  sourceEventIds: string[]
+}
+
+export interface CriticalInvariantAnySuccess {
+  invariants: CriticalInvariantEvidence[]
+}
+
+export interface CriticalTrialCoverage {
+  complete: boolean
+  observedRequirementMet: boolean
+  status: AssuranceStatus
+  reason: string | null
+  requiredCategoriesPresent: boolean
+  cases: Array<{
+    testCaseId: string
+    category: string
+    partition: string
+    mode: string | null
+    requiredTrials: number | null
+    conclusiveTrials: number
+    complete: boolean
+    reason: string | null
+  }>
 }
 
 export interface ReplayComparison {
