@@ -59,6 +59,23 @@ export class RunStartError extends Error {
   }
 }
 
+export type RunCancelFailure = 'session' | 'invalid' | 'rejected' | 'unknown'
+
+const runCancelMessages: Record<RunCancelFailure, string> = {
+  session: '검토자 세션이 만료되었거나 철회되었습니다. 다시 연결해 주세요.',
+  invalid: '검토자 세션 또는 취소 요청을 확인해 주세요.',
+  rejected: '취소 요청이 거절되었습니다. Run의 현재 상태를 확인해 주세요.',
+  unknown: '취소 요청의 처리 여부가 불명확합니다. Run 상태를 다시 조회해 주세요.',
+}
+
+/** Only fixed messages leave the Run-cancel transport; response bodies may contain secrets. */
+export class RunCancelError extends Error {
+  constructor(readonly kind: RunCancelFailure, readonly status: number | null = null) {
+    super(runCancelMessages[kind])
+    this.name = 'RunCancelError'
+  }
+}
+
 export interface RequestContext {
   actorId: string
   idempotencyKey?: string
@@ -320,6 +337,56 @@ export class FinsecApiClient {
       throw new RunStartError('unknown')
     } finally { clearTimeout(timeout) }
   }
+
+  /** A sent Run cancellation is never retried here because its outcome may already be committed. */
+  async cancelTestRun(runId: string, session: ReviewerSession, idempotencyKey: string): Promise<TestRun> {
+    if (!this.confirmedRunSessions.has(session)) throw new RunCancelError('session')
+    let reviewer: ReviewerSession
+    try { reviewer = readReviewerSessionCredential(session) }
+    catch { throw new RunCancelError('session') }
+    if (!/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/.test(runId)
+      || !/^[A-Za-z0-9._:-]{1,128}$/.test(idempotencyKey)) throw new RunCancelError('invalid')
+
+    const controller = new AbortController()
+    const timeout = setTimeout(() => controller.abort(), this.options.timeoutMs ?? 30000)
+    try {
+      const response = await fetch(`${this.baseUrl.replace(/\/+$/, '')}/api/v1/test-runs/${encodeURIComponent(runId)}:cancel`, {
+        method: 'POST',
+        headers: {
+          Accept: 'application/json',
+          'X-Actor-Id': reviewer.actorId,
+          'X-CSRF-Token': reviewer.csrfToken,
+          'Idempotency-Key': idempotencyKey,
+        },
+        credentials: 'include', redirect: 'error', cache: 'no-store', signal: controller.signal,
+      })
+      if (!response.ok) {
+        if (response.status === 401 || response.status === 403) {
+          this.confirmedRunSessions.delete(session)
+          throw new RunCancelError('session', response.status)
+        }
+        if (response.status >= 400 && response.status < 500
+          && ![408, 409, 425, 429].includes(response.status)) throw new RunCancelError('rejected', response.status)
+        throw new RunCancelError('unknown', response.status)
+      }
+      if (response.status !== 200) throw new RunCancelError('unknown', response.status)
+      const payload: unknown = await response.json()
+      if (!payload || typeof payload !== 'object' || !Object.hasOwn(payload, 'data')) {
+        throw new RunCancelError('unknown', response.status)
+      }
+      const data = (payload as { data: unknown }).data
+      if (!data || typeof data !== 'object') throw new RunCancelError('unknown', response.status)
+      const cancelled = data as TestRun
+      if (cancelled.id !== runId || cancelled.status !== 'CANCELLED') {
+        throw new RunCancelError('unknown', response.status)
+      }
+      return cancelled
+    } catch (error) {
+      if (error instanceof RunCancelError) throw error
+      throw new RunCancelError('unknown')
+    } finally { clearTimeout(timeout) }
+  }
+
   async eventHistory(runId: string, actorId: string, after = 0): Promise<EventHistory> {
     if (!Number.isSafeInteger(after) || after < 0) {
       throw new Error('Event history cursor is invalid')
@@ -481,5 +548,5 @@ export class FinsecApiClient {
 
 export const api = new FinsecApiClient()
 export type PlatformClient = Pick<FinsecApiClient,
-  'listAgents' | 'createAgent' | 'archiveAgent' | 'listReleases' | 'createRelease' | 'validateRelease' | 'analyzeRelease' | 'fingerprint' | 'attestation' | 'downloadAttestation' | 'audit' | 'pendingRecoveries' | 'recover' | 'listTestSuites' | 'listTestRuns' | 'listReplayComparisons' | 'startTestRun' | 'testRun'
+  'listAgents' | 'createAgent' | 'archiveAgent' | 'listReleases' | 'createRelease' | 'validateRelease' | 'analyzeRelease' | 'fingerprint' | 'attestation' | 'downloadAttestation' | 'audit' | 'pendingRecoveries' | 'recover' | 'listTestSuites' | 'listTestRuns' | 'listReplayComparisons' | 'startTestRun' | 'cancelTestRun' | 'testRun'
 >

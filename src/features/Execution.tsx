@@ -1,13 +1,14 @@
 import type { ReactNode } from 'react'
 import { useEffect, useRef, useState } from 'react'
-import { api, FinsecApiError, RunStartError } from '../api/client'
-import type { EventChainVerification, ExecutionEvent, Finding, OracleResult, Release, ReplayComparison, TestRun, TestRunStart, TestRunSummary, TestSuiteSummary } from '../api/contracts'
+import { api, FinsecApiError, RunCancelError, RunStartError } from '../api/client'
+import type { EventChainVerification, ExecutionEvent, Finding, OracleResult, Release, ReplayComparison, TestRun, TestRunStart, TestRunStatus, TestRunSummary, TestSuiteSummary } from '../api/contracts'
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader, ShortHash, formatDate } from '../components/Primitives'
 import { readReviewerSessionCredential, type ReviewerSession } from './policy/reviewerSession'
 
 const attacks = [['FA-01','악성 문서 지시'],['FA-02','타 고객 데이터 조회'],['FA-03','민감정보 과다 조회'],['FA-04','외부 정보 유출'],['FA-05','고위험 상태 변경']]
 const tone = (value:string) => ['COMPLETED','ATTACK_BLOCKED','NORMAL_SUCCESS','OPEN'].includes(value) ? 'positive' : ['FAILED','ERROR','ATTACK_SUCCESS','BLOCKED'].includes(value) ? 'critical' : 'warning'
-const activeRunStatuses = new Set(['QUEUED', 'PREPARING', 'RUNNING', 'CANCELLING'])
+const activeRunStatuses = new Set<TestRunStatus>(['QUEUED', 'PREPARING', 'RUNNING', 'CANCELLING'])
+const cancellableRunStatuses = new Set<TestRunStatus>(['QUEUED', 'PREPARING', 'RUNNING'])
 const streamBaseUrl = import.meta.env.VITE_FINSEC_API_BASE_URL ?? 'http://localhost:8080'
 const secureRunSessionApi = (() => {
   try { return new URL(streamBaseUrl, globalThis.location?.origin).protocol === 'https:' }
@@ -36,11 +37,13 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
   const [reviewerSession,setReviewerSession]=useState<ReviewerSession|null>(null)
   const [reviewerError,setReviewerError]=useState<unknown>()
   const [connectingReviewer,setConnectingReviewer]=useState(false)
+  const [cancellingRunId,setCancellingRunId]=useState<string|null>(null)
   const [unknownStart,setUnknownStart]=useState<RunStartAttempt|null>(null)
   const reviewerConnectionRef=useRef(0)
   const reviewerConnectingRef=useRef(false)
   const aliveRef=useRef(true)
   const startFlightRef=useRef(false)
+  const cancelFlightRef=useRef(false)
   const streamRef = useRef<EventSource | null>(null)
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null)
   const generationRef = useRef(0)
@@ -226,7 +229,8 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
           if (parsed.sequence === cursorRef.current + 1) appendContiguous(targetRunId, generation, [])
           else repair = synchronize(targetRunId, generation, false)
         }
-        if (parsed.eventType === 'RUN_COMPLETED' || parsed.eventType === 'RUN_FAILED') {
+        if (parsed.eventType === 'RUN_COMPLETED' || parsed.eventType === 'RUN_FAILED'
+          || parsed.eventType === 'RUN_CANCEL_REQUESTED') {
           const pendingRepair = repair ?? recoveryRef.current
           if (pendingRepair) {
             void pendingRepair.then(() => {
@@ -408,7 +412,7 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
   }, [reviewerSession])
 
   async function connectReviewer(withKey: boolean) {
-    if (reviewerConnectingRef.current || startFlightRef.current) return
+    if (reviewerConnectingRef.current || startFlightRef.current || cancelFlightRef.current) return
     const key = withKey ? reviewerKey : undefined
     if (withKey && !key) return
     reviewerConnectingRef.current = true
@@ -432,7 +436,7 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
 
   async function inspect(){ await inspectRun(runId) }
   async function sendStart(attempt: RunStartAttempt, session: ReviewerSession) {
-    if (startFlightRef.current || !aliveRef.current) return
+    if (startFlightRef.current || cancelFlightRef.current || !aliveRef.current) return
     if (attempt.actorId !== session.actorId || attempt.workspaceId !== session.workspaceId) {
       setReviewerError(new RunStartError('session'))
       return
@@ -469,7 +473,7 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
   }
 
   async function start(){
-    if (unknownStart || startFlightRef.current || !releaseId || !suiteId.trim()) return
+    if (unknownStart || startFlightRef.current || cancelFlightRef.current || !releaseId || !suiteId.trim()) return
     if (selectedSuite?.status !== 'READY') {
       setError(new Error('READY 상태의 Suite만 실행할 수 있습니다.'))
       return
@@ -499,6 +503,46 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
       return
     }
     await sendStart(unknownStart, session)
+  }
+
+  async function cancelRun() {
+    if (!run || !cancellableRunStatuses.has(run.status) || startFlightRef.current || cancelFlightRef.current) return
+    const session = currentRunReviewer(reviewerSession)
+    if (!session) {
+      setReviewerSession(null)
+      setReviewerError(new RunCancelError('session'))
+      return
+    }
+    const targetRunId = run.id
+    cancelFlightRef.current = true
+    setCancellingRunId(targetRunId)
+    setBusy(true)
+    setError(undefined)
+    try {
+      const cancelled = await api.cancelTestRun(
+        targetRunId,
+        session,
+        `test-run-cancel-${crypto.randomUUID()}`,
+      )
+      if (!aliveRef.current || feedRunRef.current !== targetRunId) return
+      setRun(cancelled)
+      setReceipt(`Run ${cancelled.id} · ${cancelled.status}`)
+      closeStream()
+      setStreamState('IDLE')
+      void refreshRunList().catch(setError)
+    } catch (cause) {
+      if (!aliveRef.current || feedRunRef.current !== targetRunId) return
+      if (cause instanceof RunCancelError && cause.kind === 'session') {
+        setReviewerSession(null)
+        setReviewerError(cause)
+      } else {
+        setError(cause)
+      }
+    } finally {
+      cancelFlightRef.current = false
+      if (aliveRef.current) setCancellingRunId(null)
+      if (aliveRef.current && feedRunRef.current === targetRunId) setBusy(false)
+    }
   }
   return <><PageHeader eyebrow="ATTACK EXECUTION" title="Runs & Trace" description="B Runtime이 수행한 공격·Replay 상태와 Policy, Tool, Oracle 이벤트 체인을 추적합니다." />
     {error?<ErrorBanner error={error} onDismiss={()=>setError(undefined)}/>:null}
@@ -536,10 +580,10 @@ export function ExecutionPage({ releases, actorId }: { releases:Release[]; actor
       </div>
       <p className="file-hint">READY 상태의 Suite와 검토자 세션이 필요합니다. DRAFT/INVALID suite는 시작 전 검증이 필요합니다.</p>
     </section>
-    <section className="panel run-picker"><div className="execution-form"><label>Run mode filter<select aria-label="Run mode filter" value={runModeFilter} onChange={e=>setRunModeFilter(e.target.value as TestRun['mode'] | '')}><option value="">전체</option><option value="BASELINE">BASELINE</option><option value="SEAL_REPLAY">SEAL_REPLAY</option><option value="HELD_OUT">HELD_OUT</option><option value="REGRESSION">REGRESSION</option></select></label><label>Run status filter<select aria-label="Run status filter" value={runStatusFilter} onChange={e=>setRunStatusFilter(e.target.value)}><option value="">전체</option><option value="QUEUED">QUEUED</option><option value="RUNNING">RUNNING</option><option value="COMPLETED">COMPLETED</option><option value="FAILED">FAILED</option><option value="CANCELED">CANCELED</option></select></label><button className="secondary-button" type="button" onClick={()=>void refreshRunList()}>목록 새로고침</button></div><label>최근 Run<select aria-label="Run list" value={runId} onChange={e=>setRunId(e.target.value)}><option value="">Run 선택</option>{runOptions.map(r=><option key={r.id} value={r.id}>{r.mode} · {r.status} · {r.completedCases}/{r.totalCases}</option>)}</select></label><label>생성된 Test Run ID<input aria-label="Test Run ID" value={runId} onChange={e=>setRunId(e.target.value)} placeholder="UUID를 입력하세요"/></label><button className="primary-button" disabled={!runId.trim()||busy} onClick={()=>void inspect()}>Run 조회</button><p className="file-hint">Live stream: {streamState}</p></section>
+    <section className="panel run-picker"><div className="execution-form"><label>Run mode filter<select aria-label="Run mode filter" value={runModeFilter} onChange={e=>setRunModeFilter(e.target.value as TestRun['mode'] | '')}><option value="">전체</option><option value="BASELINE">BASELINE</option><option value="SEAL_REPLAY">SEAL_REPLAY</option><option value="HELD_OUT">HELD_OUT</option><option value="REGRESSION">REGRESSION</option></select></label><label>Run status filter<select aria-label="Run status filter" value={runStatusFilter} onChange={e=>setRunStatusFilter(e.target.value)}><option value="">전체</option><option value="QUEUED">QUEUED</option><option value="PREPARING">PREPARING</option><option value="RUNNING">RUNNING</option><option value="CANCELLING">CANCELLING</option><option value="COMPLETED">COMPLETED</option><option value="FAILED">FAILED</option><option value="CANCELLED">CANCELLED</option></select></label><button className="secondary-button" type="button" onClick={()=>void refreshRunList()}>목록 새로고침</button></div><label>최근 Run<select aria-label="Run list" value={runId} onChange={e=>setRunId(e.target.value)}><option value="">Run 선택</option>{runOptions.map(r=><option key={r.id} value={r.id}>{r.mode} · {r.status} · {r.completedCases}/{r.totalCases}</option>)}</select></label><label>생성된 Test Run ID<input aria-label="Test Run ID" value={runId} onChange={e=>setRunId(e.target.value)} placeholder="UUID를 입력하세요"/></label><button className="primary-button" disabled={!runId.trim()||busy} onClick={()=>void inspect()}>Run 조회</button><p className="file-hint">Live stream: {streamState}</p></section>
     <section className="panel"><div className="panel-heading"><div><p className="eyebrow">REPLAY COMPARABILITY</p><h2>{replayComparisons.length} replay comparisons</h2></div><span className={`status status--${replayComparisons.some((item) => !item.comparable) ? 'warning' : 'positive'}`}>{replayComparisons.some((item) => !item.comparable) ? 'MISMATCHES PRESENT' : 'COMPARABLE'}</span></div>{replayComparisons.length ? <div className="event-list">{replayComparisons.map((item)=><details key={`${item.baselineRunId ?? 'missing'}-${item.replayRunId}`}><summary><strong>{item.category ?? 'UNSPECIFIED'}</strong><em>{item.comparable ? 'Comparable replay' : 'Non-comparable replay'}</em><span className={`status status--${item.comparable ? 'positive' : 'warning'}`}>{item.comparable ? 'COMPARABLE' : 'MISMATCH'}</span></summary><div className="execution-form"><label>Baseline run<input readOnly value={item.baselineRunId ?? 'NO BASELINE'} /></label><label>Replay run<input readOnly value={item.replayRunId} /></label><button className="secondary-button" type="button" onClick={()=>void openReplayRun(item)}>Replay run 열기</button></div><pre>{JSON.stringify({baselineRunId:item.baselineRunId,replayRunId:item.replayRunId,mismatchReasons:item.mismatchReasons},null,2)}</pre></details>)}</div> : <p className="muted">Replay comparison evidence가 아직 없습니다.</p>}</section>
     <div className="attack-grid">{attacks.map(([id,title])=><article className="panel" key={id}><span>{id}</span><h2>{title}</h2></article>)}</div>
-    {busy&&!run?<LoadingBlock label="Run evidence를 불러오는 중"/>:!run?<EmptyState title="Test Run을 선택하세요">B 실행부가 생성한 Run ID로 상태, Trace, Oracle, Finding을 함께 조회합니다.</EmptyState>:<><section className="run-summary"><article className="panel"><span>Status</span><strong className={`status status--${tone(run.status)}`}>{run.status}</strong></article><article className="panel"><span>Progress</span><strong>{run.completedCases}/{run.totalCases}</strong></article><article className="panel"><span>Mode</span><strong>{run.mode}</strong></article><article className="panel"><span>Errors</span><strong>{run.operationalErrorCount}</strong></article><article className="panel"><span>Event chain</span><strong className={`status status--${historyUnavailable ? 'warning' : chain?.valid ? 'positive' : 'critical'}`}>{historyUnavailable ? 'N/A' : chain?.valid ? 'VALID' : 'INVALID'}</strong></article></section>
+    {busy&&!run?<LoadingBlock label="Run evidence를 불러오는 중"/>:!run?<EmptyState title="Test Run을 선택하세요">B 실행부가 생성한 Run ID로 상태, Trace, Oracle, Finding을 함께 조회합니다.</EmptyState>:<><section className="run-summary"><article className="panel"><span>Status</span><strong className={`status status--${tone(run.status)}`}>{run.status}</strong></article><article className="panel"><span>Progress</span><strong>{run.completedCases}/{run.totalCases}</strong></article><article className="panel"><span>Mode</span><strong>{run.mode}</strong></article><article className="panel"><span>Errors</span><strong>{run.operationalErrorCount}</strong></article><article className="panel"><span>Event chain</span><strong className={`status status--${historyUnavailable ? 'warning' : chain?.valid ? 'positive' : 'critical'}`}>{historyUnavailable ? 'N/A' : chain?.valid ? 'VALID' : 'INVALID'}</strong></article><article className="panel"><span>Control</span><button className="danger-button" type="button" disabled={!cancellableRunStatuses.has(run.status) || !currentReviewer || busy} onClick={()=>void cancelRun()}>{cancellingRunId === run.id ? '취소 처리 중…' : '실행 취소'}</button></article></section>
       <div className="content-grid execution-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">TRACE TIMELINE</p><h2>{events.length} execution events</h2></div><ShortHash value={chain?.headHash??run.eventHeadHash}/></div>{historyUnavailable?<p className="file-hint" role="status">이전 Trace 보존 기간이 지났습니다. 현재 Run snapshot 이후의 이벤트만 표시합니다.</p>:null}<div className="event-list">{events.map(e=><details key={e.eventId}><summary><span>#{e.sequence}</span><strong>{e.eventType}</strong><em>{e.toolName??e.reasonCode??''}</em><time>{formatDate(e.occurredAt)}</time></summary><pre>{JSON.stringify({input:e.input,policyDecision:e.policyDecision,output:e.output,metadata:e.metadata,eventHash:e.eventHash},null,2)}</pre></details>)}</div></section>
       <aside className="execution-side"><ResultList title="ORACLE RESULTS" filters={<label>Outcome<select aria-label="Oracle outcome filter" value={oracleOutcomeFilter} onChange={e=>setOracleOutcomeFilter(e.target.value)}><option value="">전체 outcome</option><option value="ATTACK_SUCCESS">ATTACK_SUCCESS</option><option value="ATTACK_BLOCKED">ATTACK_BLOCKED</option><option value="INCONCLUSIVE">INCONCLUSIVE</option><option value="NORMAL_SUCCESS">NORMAL_SUCCESS</option><option value="NORMAL_FAILURE">NORMAL_FAILURE</option></select></label>} items={filteredOracles.map(o=>({id:o.id,title:o.oracleType,status:o.outcome,note:o.reasonCode}))}/><ResultList title="FINDINGS" filters={<><label>Category<select aria-label="Finding category filter" value={findingCategoryFilter} onChange={e=>setFindingCategoryFilter(e.target.value)}><option value="">전체 category</option>{findingCategories.map(value=><option key={value} value={value}>{value}</option>)}</select></label><label>Severity<select aria-label="Finding severity filter" value={findingSeverityFilter} onChange={e=>setFindingSeverityFilter(e.target.value)}><option value="">전체 severity</option>{findingSeverities.map(value=><option key={value} value={value}>{value}</option>)}</select></label><label>Status<select aria-label="Finding status filter" value={findingStatusFilter} onChange={e=>setFindingStatusFilter(e.target.value)}><option value="">전체 status</option>{findingStatuses.map(value=><option key={value} value={value}>{value}</option>)}</select></label></>} items={filteredFindings.map(f=>({id:f.id,title:`${f.category} · ${f.title}`,status:f.status,note:f.severity}))}/></aside></div></>}</>}
 

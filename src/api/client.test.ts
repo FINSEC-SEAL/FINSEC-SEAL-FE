@@ -1,5 +1,5 @@
 import { FinsecApiClient, FinsecApiError, RunStartError } from './client'
-import type { ExecutionEvent, TestRunStart } from './contracts'
+import type { ExecutionEvent, TestRun, TestRunStart } from './contracts'
 
 function jsonResponse(body: unknown, status = 200): Response {
   return new Response(JSON.stringify(body), {
@@ -26,6 +26,16 @@ const runInput: TestRunStart = {
 const runReceipt = {
   runId, status: 'QUEUED', statusUrl: `/api/v1/test-runs/${runId}`,
   streamUrl: `/api/v1/test-runs/${runId}/events`,
+}
+const cancelledRun: TestRun = {
+  id: runId, releaseId: 'release-1', suiteId: 'suite-1', contractVersionId: null,
+  mode: 'BASELINE', status: 'CANCELLED', agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`,
+  releaseFingerprint: `sha256:${'2'.repeat(64)}`, fixtureVersion: '1.0',
+  fixtureDigest: `sha256:${'3'.repeat(64)}`, totalCases: 12, completedCases: 0,
+  operationalErrorCount: 0, latestSequence: 2, latestEventType: 'RUN_CANCEL_REQUESTED',
+  eventHeadHash: `sha256:${'4'.repeat(64)}`, summary: { cancelledCases: 12 },
+  startedAt: '2026-09-01T00:00:00Z', completedAt: '2026-09-01T00:00:01Z',
+  createdAt: '2026-09-01T00:00:00Z',
 }
 function reviewerEnvelope() {
   return { data: {
@@ -296,6 +306,33 @@ describe('FinsecApiClient', () => {
     expect(headers.get('Idempotency-Key')).toBe('test-run-start-fixed-key')
     expect(headers.has('X-Contract-Reviewer-Key')).toBe(false)
     expect(JSON.stringify(fetchMock.mock.calls.map(([url]) => url))).not.toMatch(/PRIVATE_CSRF_CANARY|PRIVATE_REVIEWER_KEY_CANARY/)
+  })
+
+  it('cancels a Run with the exact confirmed session and does not retry the POST', async () => {
+    const sessionBody = reviewerEnvelope()
+    const fetchMock = vi.spyOn(globalThis, 'fetch')
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse(sessionBody))
+      .mockResolvedValueOnce(jsonResponse({ data: cancelledRun }))
+    const client = new FinsecApiClient('https://api.test', { maxRetries: 3 })
+    const session = await client.connectRunReviewerSession('PRIVATE_REVIEWER_KEY_CANARY')
+
+    await expect(client.cancelTestRun(runId, session, 'test-run-cancel-fixed-key')).resolves.toEqual(cancelledRun)
+
+    expect(fetchMock).toHaveBeenCalledTimes(3)
+    expect(fetchMock).toHaveBeenLastCalledWith(
+      `https://api.test/api/v1/test-runs/${runId}:cancel`,
+      expect.objectContaining({
+        method: 'POST', credentials: 'include', redirect: 'error', cache: 'no-store',
+      }),
+    )
+    const [, init] = fetchMock.mock.calls[2]!
+    const headers = new Headers(init?.headers)
+    expect(init?.body).toBeUndefined()
+    expect(headers.get('X-Actor-Id')).toBe('verified-reviewer')
+    expect(headers.get('X-CSRF-Token')).toBe('PRIVATE_CSRF_CANARY')
+    expect(headers.get('Idempotency-Key')).toBe('test-run-cancel-fixed-key')
+    expect(headers.has('X-Contract-Reviewer-Key')).toBe(false)
   })
 
   it('does not send a Run when HTTPS, same-client provenance, expiry, or key validation fails', async () => {

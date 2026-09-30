@@ -81,6 +81,7 @@ export function createDemoPlatform(): PlatformClient & { setReportReady: (ready:
     async listTestRuns() { return [] },
     async listReplayComparisons() { return [] },
     async startTestRun() { throw new Error('체험 모드에서는 실제 Test Run을 시작할 수 없습니다.') },
+    async cancelTestRun() { throw new Error('체험 모드에서는 실제 Test Run을 취소할 수 없습니다.') },
     async testRun() { throw new Error('체험 모드에는 조회할 실제 Test Run이 없습니다.') },
   }
 }

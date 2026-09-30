@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { api, RunStartError } from '../api/client'
-import type { Agent, Attestation, Fingerprint, JsonValue, PendingRecovery, Release, ValidationResult } from '../api/contracts'
+import type { Agent, Attestation, Fingerprint, JsonValue, PendingRecovery, Release, TestRun, ValidationResult } from '../api/contracts'
 import type { ReviewerSession } from './policy/reviewerSession'
 import { AgentsPage, ReleasesPage } from './AgentsReleases'
 import { AuditPage } from './Audit'
@@ -482,6 +482,77 @@ describe('Role A feature consoles', () => {
     expect(screen.queryByText('NORMAL_TASK')).not.toBeInTheDocument()
     expect(screen.getByText('FA-04 · Outbound exfiltration')).toBeInTheDocument()
     expect(screen.queryByText('FA-02 · Benign note')).not.toBeInTheDocument()
+  })
+
+  it('cancels an active Run through the confirmed reviewer session', async () => {
+    const nativeEventSource = globalThis.EventSource
+    class MockEventSource {
+      onopen: ((this: EventSource, ev: Event) => unknown) | null = null
+      onerror: ((this: EventSource, ev: Event) => unknown) | null = null
+      constructor(public url: string) {}
+      addEventListener() {}
+      close() {}
+    }
+    // @ts-expect-error test-only EventSource replacement
+    globalThis.EventSource = MockEventSource
+    const activeRun: TestRun = {
+      id: effectRunId, releaseId: release.id, suiteId: 'suite-1', contractVersionId: null,
+      mode: 'BASELINE', status: 'RUNNING', agentArtifactFingerprint: `sha256:${'1'.repeat(64)}`,
+      releaseFingerprint: `sha256:${'2'.repeat(64)}`, fixtureVersion: '1.0',
+      fixtureDigest: `sha256:${'3'.repeat(64)}`, totalCases: 12, completedCases: 5,
+      operationalErrorCount: 0, latestSequence: 10, latestEventType: 'RUN_STARTED',
+      eventHeadHash: `sha256:${'4'.repeat(64)}`, summary: {},
+      startedAt: '2026-09-01T00:00:00Z', completedAt: null, createdAt: '2026-09-01T00:00:00Z',
+    }
+    const cancelledRun: TestRun = {
+      ...activeRun, status: 'CANCELLED', completedAt: '2026-09-01T00:01:00Z',
+      latestSequence: 11, latestEventType: 'RUN_CANCEL_REQUESTED', summary: { cancelledCases: 7 },
+    }
+
+    try {
+      vi.spyOn(api, 'listTestSuites').mockResolvedValue([
+        { id: 'suite-1', releaseId: release.id, version: '1.0', status: 'READY', suiteHash: 'sha256:suite', caseCount: 12 },
+      ])
+      vi.spyOn(api, 'listTestRuns').mockResolvedValue([{
+        id: effectRunId, releaseId: release.id, suiteId: 'suite-1', mode: 'BASELINE', status: 'RUNNING',
+        totalCases: 12, completedCases: 5, operationalErrorCount: 0, latestSequence: 10,
+        startedAt: '2026-09-01T00:00:00Z', completedAt: null,
+      }])
+      vi.spyOn(api, 'listReplayComparisons').mockResolvedValue([])
+      vi.spyOn(api, 'testRun').mockResolvedValue(activeRun)
+      vi.spyOn(api, 'eventHistory').mockResolvedValue({ items: [], headSequence: 10, nextCursor: null })
+      vi.spyOn(api, 'verifyEventChain').mockResolvedValue({
+        runId: effectRunId, valid: true, eventCount: 0, firstInvalidSequence: null,
+        headHash: `sha256:${'4'.repeat(64)}`,
+      })
+      vi.spyOn(api, 'runOracleResults').mockResolvedValue([])
+      vi.spyOn(api, 'runFindings').mockResolvedValue([])
+      const session = runReviewer()
+      vi.spyOn(api, 'connectRunReviewerSession').mockResolvedValue(session)
+      const cancel = vi.spyOn(api, 'cancelTestRun').mockResolvedValue(cancelledRun)
+      const user = userEvent.setup()
+      render(<ExecutionPage releases={[release]} actorId="untrusted-page-actor" />)
+
+      await waitFor(() => expect(screen.getByLabelText('Test Run ID')).toHaveValue(effectRunId))
+      await user.click(screen.getByRole('button', { name: 'Run 조회' }))
+      await user.click(screen.getByRole('button', { name: '기존 세션 확인' }))
+      await waitFor(() => expect(screen.getByRole('button', { name: '실행 취소' })).toBeEnabled())
+      await user.click(screen.getByRole('button', { name: '실행 취소' }))
+
+      await waitFor(() => expect(cancel).toHaveBeenCalledOnce())
+      const [cancelledId, credential, idempotencyKey] = cancel.mock.calls[0]!
+      expect(cancelledId).toBe(effectRunId)
+      expect(credential).toBe(session)
+      expect(idempotencyKey).toMatch(/^test-run-cancel-[0-9a-f-]{36}$/)
+      await waitFor(() => {
+        const runSummary = document.querySelector('.run-summary')
+        expect(runSummary).not.toBeNull()
+        expect(within(runSummary as HTMLElement).getByText('CANCELLED')).toBeInTheDocument()
+      })
+      expect(screen.getByRole('button', { name: '실행 취소' })).toBeDisabled()
+    } finally {
+      globalThis.EventSource = nativeEventSource
+    }
   })
 
   it('subscribes to SSE for active runs and appends realtime events', async () => {

@@ -1,7 +1,7 @@
 import { act, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import { api, FinsecApiError } from '../api/client'
-import type { ExecutionEvent, Release, TestRun } from '../api/contracts'
+import type { ExecutionEvent, Release, TestRun, TestRunStatus } from '../api/contracts'
 import { ExecutionPage } from './Execution'
 
 const release: Release = {
@@ -11,7 +11,7 @@ const release: Release = {
   analyzedAt: null, lastTestedAt: null, createdAt: '2026-09-01T00:00:00Z', updatedAt: '2026-09-01T00:00:00Z',
 }
 
-function run(latestSequence: number, status = 'RUNNING'): TestRun {
+function run(latestSequence: number, status: TestRunStatus = 'RUNNING'): TestRun {
   return {
     id: 'run-1', releaseId: release.id, suiteId: 'suite-1', contractVersionId: null, mode: 'BASELINE', status,
     agentArtifactFingerprint: 'sha256:a', releaseFingerprint: 'sha256:b', fixtureVersion: '1.0', fixtureDigest: 'sha256:c',
