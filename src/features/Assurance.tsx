@@ -1,7 +1,8 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { api } from '../api/client'
 import type { DecisionProposal, DecisionValue, JsonValue, MetricValue, MetricsView, Release, ReplaySummary } from '../api/contracts'
 import { EmptyState, ErrorBanner, LoadingBlock, PageHeader, ShortHash } from '../components/Primitives'
+import { AssuranceEvidence, filteredProposalSnapshot, RequiredCohortEvidence } from './AssuranceEvidence'
 
 function metricText(metric: MetricValue): string {
   if (metric.status === 'N_A' || metric.value === null) return 'N/A'
@@ -42,13 +43,22 @@ function ReplayPanel({ summary }: { summary?: ReplaySummary | null }) {
 
 export function AssurancePage({ releases, actorId, preferredReleaseId, onReleaseChange }: { releases: Release[]; actorId: string; preferredReleaseId?: string; onReleaseChange?: (releaseId: string) => void }) {
   const [releaseId, setReleaseId] = useState(preferredReleaseId && releases.some((release) => release.id === preferredReleaseId) ? preferredReleaseId : releases[0]?.id ?? '')
-  const [metrics, setMetrics] = useState<MetricsView | null>(null)
-  const [proposal, setProposal] = useState<DecisionProposal | null>(null)
+  const [storedMetrics, setMetrics] = useState<{ key: string; value: MetricsView } | null>(null)
+  const [storedProposal, setProposal] = useState<{ key: string; value: DecisionProposal } | null>(null)
   const [decision, setDecision] = useState<DecisionValue>('REVIEW')
   const [comment, setComment] = useState('')
-  const [busy, setBusy] = useState(false)
-  const [error, setError] = useState<unknown>()
-  const [receipt, setReceipt] = useState<string>()
+  const [busyKey, setBusy] = useState<string | null>(null)
+  const [storedError, setError] = useState<{ key: string; cause: unknown }>()
+  const [storedReceipt, setReceipt] = useState<{ key: string; text: string }>()
+  const selectionKey = `${releaseId}:${actorId}`
+  const selectionRef = useRef(selectionKey)
+  selectionRef.current = selectionKey
+  const requestVersion = useRef(0)
+  const metrics = storedMetrics?.key === selectionKey ? storedMetrics.value : null
+  const proposal = storedProposal?.key === selectionKey ? storedProposal.value : null
+  const error = storedError?.key === selectionKey ? storedError.cause : undefined
+  const receipt = storedReceipt?.key === selectionKey ? storedReceipt.text : undefined
+  const busy = busyKey === selectionKey
 
   useEffect(() => {
     if (preferredReleaseId && releases.some((release) => release.id === preferredReleaseId) && preferredReleaseId !== releaseId) setReleaseId(preferredReleaseId)
@@ -56,32 +66,65 @@ export function AssurancePage({ releases, actorId, preferredReleaseId, onRelease
   }, [preferredReleaseId, releaseId, releases])
 
   function chooseRelease(nextReleaseId: string) {
+    requestVersion.current++
+    setMetrics(null); setProposal(null); setReceipt(undefined); setError(undefined); setBusy(null); setComment('')
     setReleaseId(nextReleaseId); onReleaseChange?.(nextReleaseId)
   }
 
   async function loadMetrics() {
     if (!releaseId) return
-    setBusy(true); setError(undefined); setProposal(null); setReceipt(undefined)
-    try { setMetrics(await api.metrics(releaseId, actorId)) }
-    catch (cause) { setError(cause) }
-    finally { setBusy(false) }
+    const request = ++requestVersion.current
+    const key = selectionKey
+    const current = () => request === requestVersion.current && key === selectionRef.current
+    setBusy(key); setError(undefined); setProposal(null); setReceipt(undefined)
+    try {
+      const value = await api.metrics(releaseId, actorId)
+      if (!current()) return
+      if (value.releaseId !== releaseId) throw new Error('Metrics 응답의 Release가 요청과 일치하지 않습니다.')
+      setMetrics({ key, value })
+    }
+    catch (cause) { if (current()) setError({ key, cause }) }
+    finally { if (current()) setBusy(null) }
   }
 
-  useEffect(() => { void loadMetrics() }, [releaseId]) // eslint-disable-line react-hooks/exhaustive-deps
+  useEffect(() => {
+    setComment('')
+    void loadMetrics()
+    return () => { requestVersion.current++ }
+  }, [releaseId, actorId]) // eslint-disable-line react-hooks/exhaustive-deps
 
   async function evaluate() {
-    setBusy(true); setError(undefined); setReceipt(undefined)
-    try { const next = await api.evaluateDecision(releaseId, actorId); setProposal(next); setDecision(next.proposedDecision) }
-    catch (cause) { setError(cause) }
-    finally { setBusy(false) }
+    const request = ++requestVersion.current
+    const key = selectionKey
+    const current = () => request === requestVersion.current && key === selectionRef.current
+    setBusy(key); setError(undefined); setReceipt(undefined)
+    try {
+      const next = await api.evaluateDecision(releaseId, actorId)
+      if (!current()) return
+      if (next.releaseId !== releaseId || asRecord(asRecord(next.inputSnapshot)?.release)?.id !== releaseId) {
+        throw new Error('Decision 후보와 snapshot의 Release가 요청과 일치하지 않습니다.')
+      }
+      setProposal({ key, value: next }); setDecision(next.proposedDecision)
+    }
+    catch (cause) { if (current()) setError({ key, cause }) }
+    finally { if (current()) setBusy(null) }
   }
 
   async function confirm() {
-    if (!proposal || !comment.trim()) return
-    setBusy(true); setError(undefined)
-    try { const result = await api.confirmDecision(releaseId, proposal.inputDigest, decision, comment.trim(), actorId); setReceipt(`${result.decision} confirmed by ${result.confirmedBy}`); setProposal(null); setComment('') }
-    catch (cause) { setError(cause) }
-    finally { setBusy(false) }
+    if (!proposal || proposal.releaseId !== releaseId || !comment.trim()) return
+    const input = { releaseId: proposal.releaseId, digest: proposal.inputDigest, decision, comment: comment.trim(), actorId }
+    const request = ++requestVersion.current
+    const key = selectionKey
+    const current = () => request === requestVersion.current && key === selectionRef.current
+    setBusy(key); setError(undefined)
+    try {
+      const result = await api.confirmDecision(input.releaseId, input.digest, input.decision, input.comment, input.actorId)
+      if (!current()) return
+      if (result.releaseId !== input.releaseId) throw new Error('Decision 확정 응답의 Release가 요청과 일치하지 않습니다.')
+      setReceipt({ key, text: `${result.decision} confirmed by ${result.confirmedBy}` }); setProposal(null); setComment('')
+    }
+    catch (cause) { if (current()) setError({ key, cause }) }
+    finally { if (current()) setBusy(null) }
   }
 
   const values = metrics?.metrics
@@ -96,9 +139,12 @@ export function AssurancePage({ releases, actorId, preferredReleaseId, onRelease
       <div className="content-grid"><section className="panel"><div className="panel-heading"><div><p className="eyebrow">ACTUAL IMPACT</p><h2>Observed security effects</h2></div></div><dl className="impact-grid"><div><dt>Unauthorized records</dt><dd>{effectCountText(values.unauthorizedRecordExposureCount)}</dd></div><div><dt>Sensitive fields</dt><dd>{effectCountText(values.sensitiveFieldExposureCount)}</dd></div><div><dt>Exfiltrations</dt><dd>{effectCountText(values.exfiltrationSuccessCount)}</dd></div><div><dt>High-impact mutations</dt><dd>{effectCountText(values.highImpactMutationCount)}</dd></div></dl><p className="file-hint">Synthetic Sandbox evidence only. N/A는 0이 아니라 정확한 건수를 입증할 저장 증거가 부족하거나 모순됨을 의미합니다.</p></section>
       <section className="panel"><div className="panel-heading"><div><p className="eyebrow">TRIAL COVERAGE</p><h2>{values.trials.length} evaluated trials</h2></div></div><div className="trial-chips">{values.trials.length ? values.trials.map((trial) => <span key={trial.caseRunId}>{trial.mode} · {trial.category} · {trial.outcomes.join('/') || trial.status}</span>) : <p className="muted">아직 평가된 trial이 없습니다.</p>}</div></section></div>
       <ReplayPanel summary={metrics?.replaySummary} />
+      {metrics ? <AssuranceEvidence reports={metrics} /> : null}
+      {!proposal ? <RequiredCohortEvidence /> : null}
     </>}
     {proposal ? <section className="panel decision-panel"><div className="panel-heading"><div><p className="eyebrow">PROPOSED DECISION</p><h2>{proposal.proposedDecision}</h2></div><span className={`decision-mark decision-mark--${proposal.proposedDecision.toLowerCase()}`}>{proposal.proposedDecision}</span></div><dl className="detail-grid"><div><dt>Gate policy</dt><dd>{proposal.gatePolicyVersion}</dd></div><div><dt>Input digest</dt><dd><ShortHash value={proposal.inputDigest} /></dd></div></dl>
       <div className="gate-rules"><h3>Gate 판정 근거</h3>{rules.length ? rules.map((rule) => <div key={rule.ruleId} className={rule.triggered ? 'gate-rule gate-rule--triggered' : 'gate-rule'}><span>{rule.triggered ? '!' : '✓'}</span><div><strong>{rule.ruleId.replaceAll('_', ' ')}</strong><p>{rule.detail || (rule.triggered ? '검토 조건이 발생했습니다.' : '통과')}</p></div></div>) : <p className="muted">세부 Rule trace가 snapshot에 없습니다.</p>}</div>
-      <details><summary>Decision input snapshot</summary><pre>{JSON.stringify(proposal.inputSnapshot, null, 2)}</pre></details><div className="decision-confirm"><label>Final decision<select aria-label="Final decision" value={decision} onChange={(event) => setDecision(event.target.value as DecisionValue)}><option>PASS</option><option>REVIEW</option><option>BLOCKED</option></select></label><label>Reviewer comment<textarea aria-label="Decision comment" rows={3} maxLength={1000} value={comment} onChange={(event) => setComment(event.target.value)} placeholder="판정 근거를 기록하세요." /><small>{comment.length}/1000</small></label><button className="danger-button" disabled={busy || !comment.trim()} onClick={() => void confirm()}>Decision 확정</button></div></section> : null}
+      <RequiredCohortEvidence snapshot={proposal.inputSnapshot} />
+      <details><summary>Decision input snapshot · 알려진 필드 보기</summary><p className="file-hint">필터링한 후보 표시입니다. 원본 snapshot과 input digest는 변경하지 않습니다.</p><pre>{JSON.stringify(filteredProposalSnapshot(proposal.inputSnapshot), null, 2)}</pre></details><div className="decision-confirm"><label>Final decision<select aria-label="Final decision" value={decision} onChange={(event) => setDecision(event.target.value as DecisionValue)}><option>PASS</option><option>REVIEW</option><option>BLOCKED</option></select></label><label>Reviewer comment<textarea aria-label="Decision comment" rows={3} maxLength={1000} value={comment} onChange={(event) => setComment(event.target.value)} placeholder="판정 근거를 기록하세요." /><small>{comment.length}/1000</small></label><button className="danger-button" disabled={busy || !comment.trim()} onClick={() => void confirm()}>Decision 확정</button></div></section> : null}
   </>
 }
