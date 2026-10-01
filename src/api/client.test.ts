@@ -590,3 +590,193 @@ describe('FinsecApiClient', () => {
     } satisfies Partial<FinsecApiError>)
   })
 })
+
+
+describe('Attestation export raw download', () => {
+  function downloadMocks(response: Response) {
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
+    const create = vi.fn((_blob: Blob) => 'blob:attestation-export')
+    const revoke = vi.fn((_url: string) => undefined)
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: create })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, writable: true, value: revoke })
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(() => undefined)
+    const fetchMock = vi.spyOn(globalThis, 'fetch').mockResolvedValue(response)
+    const body = {
+      blob: vi.spyOn(response, 'blob'),
+      json: vi.spyOn(response, 'json'),
+      text: vi.spyOn(response, 'text'),
+    }
+    return {
+      create, revoke, click, fetchMock, body,
+      restore() {
+        body.blob.mockRestore()
+        body.json.mockRestore()
+        body.text.mockRestore()
+        fetchMock.mockRestore()
+        click.mockRestore()
+        if (createDescriptor) Object.defineProperty(URL, 'createObjectURL', createDescriptor)
+        else Reflect.deleteProperty(URL, 'createObjectURL')
+        if (revokeDescriptor) Object.defineProperty(URL, 'revokeObjectURL', revokeDescriptor)
+        else Reflect.deleteProperty(URL, 'revokeObjectURL')
+      },
+    }
+  }
+
+  async function withDownloadMocks(response: Response, check: (mocks: ReturnType<typeof downloadMocks>) => Promise<void>) {
+    const mocks = downloadMocks(response)
+    try {
+      await check(mocks)
+    } finally {
+      mocks.restore()
+    }
+  }
+
+  it('passes literal precise UTF-8 bytes and the native Blob through the encoded GET', async () => {
+    const literal = '{"unicode":"정밀 ✨","metrics":{"value":8.000000000000001,"notApplicable":null,"status":"N_A","zero":0},"ordered":["z","a"]}'
+    const response = new Response(literal, {
+      headers: {
+        'Content-Type': 'application/json; profile="urn:finsec-seal:attestation:json-precise:v1"',
+        'Content-Disposition': 'attachment; filename="release-precise.json"',
+      },
+    })
+    await withDownloadMocks(response, async ({ create, revoke, click, fetchMock, body }) => {
+      const controller = new AbortController()
+      await new FinsecApiClient('http://api.test').downloadAttestation('release/한 글', 'json-precise', 'actor:a', controller.signal)
+      expect(fetchMock).toHaveBeenCalledOnce()
+      const [url, init] = fetchMock.mock.calls[0]!
+      expect(url).toBe(`http://api.test/api/v1/releases/${encodeURIComponent('release/한 글')}/evidence-export?format=json-precise`)
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('actor:a')
+      expect(init?.signal).toBe(controller.signal)
+      expect(init?.method).toBeUndefined()
+      expect(init?.body).toBeUndefined()
+      expect(body.blob).toHaveBeenCalledOnce()
+      expect(body.json).not.toHaveBeenCalled()
+      expect(body.text).not.toHaveBeenCalled()
+      expect(create).toHaveBeenCalledOnce()
+      const downloadedBlob = create.mock.calls[0]![0]
+      expect(downloadedBlob).toBe(await body.blob.mock.results[0]!.value)
+      expect(Array.from(new Uint8Array(await downloadedBlob.arrayBuffer()))).toEqual(Array.from(new TextEncoder().encode(literal)))
+      expect(click).toHaveBeenCalledOnce()
+      expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe('release-precise.json')
+      expect(revoke).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledWith('blob:attestation-export')
+    })
+  })
+
+  it.each(['json', 'html', 'json-precise'] as const)('keeps the server filename for %s', async format => {
+    const response = new Response('server body', { headers: { 'Content-Disposition': 'attachment; filename="server-file.bin"' } })
+    await withDownloadMocks(response, async ({ click, revoke }) => {
+      await new FinsecApiClient('http://api.test').downloadAttestation('release-1', format, 'actor:a')
+      expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe('server-file.bin')
+      expect(click).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledWith('blob:attestation-export')
+    })
+  })
+
+  it.each([
+    ['json', 'finsec-attestation.json'],
+    ['html', 'finsec-attestation.html'],
+    ['json-precise', 'finsec-attestation-precise.json'],
+  ] as const)('uses the %s fallback when the response header is unavailable', async (format, filename) => {
+    const response = new Response('server body')
+    expect(response.headers.get('Content-Disposition')).toBeNull()
+    await withDownloadMocks(response, async ({ click, revoke }) => {
+      await new FinsecApiClient('http://api.test').downloadAttestation('release-1', format, 'actor:a')
+      expect((click.mock.contexts[0] as HTMLAnchorElement).download).toBe(filename)
+      expect(click).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledWith('blob:attestation-export')
+    })
+  })
+
+  it('does not create a URL or click after cancellation while the Blob is pending', async () => {
+    const response = new Response('raw body')
+    const nativeBlob = await new Response('raw body').blob()
+    await withDownloadMocks(response, async ({ body, create, revoke, click }) => {
+      let finish!: (blob: Blob) => void
+      body.blob.mockReturnValue(new Promise(resolve => { finish = resolve }))
+      const controller = new AbortController()
+      const pending = new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a', controller.signal)
+      await vi.waitFor(() => expect(body.blob).toHaveBeenCalledOnce())
+      const rejected = expect(pending).rejects.toMatchObject({ name: 'AbortError' })
+      controller.abort()
+      finish(nativeBlob)
+      await rejected
+      expect(create).not.toHaveBeenCalled()
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).not.toHaveBeenCalled()
+    })
+  })
+
+  it('revokes an allocated URL without clicking when cancellation happens during allocation', async () => {
+    await withDownloadMocks(new Response('raw body'), async ({ create, revoke, click }) => {
+      const controller = new AbortController()
+      create.mockImplementation(() => { controller.abort(); return 'blob:attestation-export' })
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a', controller.signal))
+        .rejects.toMatchObject({ name: 'AbortError' })
+      expect(create).toHaveBeenCalledOnce()
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledWith('blob:attestation-export')
+    })
+  })
+
+  it('preserves a JSON Problem without allocating a download', async () => {
+    const response = new Response('{"status":409,"code":"STALE_ATTESTATION","detail":"Stored evidence is stale","traceId":"trace-a","retryable":false}', { status: 409 })
+    await withDownloadMocks(response, async ({ create, revoke, click, body }) => {
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a'))
+        .rejects.toMatchObject({ name: 'FinsecApiError', status: 409, code: 'STALE_ATTESTATION', message: 'Stored evidence is stale', traceId: 'trace-a', retryable: false })
+      expect(body.json).toHaveBeenCalledOnce()
+      expect(body.blob).not.toHaveBeenCalled()
+      expect(create).not.toHaveBeenCalled()
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).not.toHaveBeenCalled()
+    })
+  })
+
+  it('preserves the HTTP status for a non-JSON error without allocating a download', async () => {
+    await withDownloadMocks(new Response('<html>Unavailable</html>', { status: 503, statusText: 'Unavailable' }), async ({ create, revoke, click, body }) => {
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a'))
+        .rejects.toMatchObject({ name: 'FinsecApiError', status: 503, code: 'UNKNOWN_ERROR', message: 'Unavailable' })
+      expect(body.blob).not.toHaveBeenCalled()
+      expect(create).not.toHaveBeenCalled()
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).not.toHaveBeenCalled()
+    })
+  })
+
+  it.each(['fetch', 'blob'] as const)('propagates a %s failure without allocating a download', async stage => {
+    await withDownloadMocks(new Response('raw body'), async ({ fetchMock, body, create, revoke, click }) => {
+      const failure = new Error(`${stage} failed`)
+      if (stage === 'fetch') fetchMock.mockRejectedValue(failure)
+      else body.blob.mockRejectedValue(failure)
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a')).rejects.toBe(failure)
+      expect(create).not.toHaveBeenCalled()
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).not.toHaveBeenCalled()
+    })
+  })
+
+  it('revokes the allocated URL and propagates an anchor click failure', async () => {
+    await withDownloadMocks(new Response('raw body'), async ({ click, create, revoke }) => {
+      const failure = new Error('click failed')
+      click.mockImplementation(() => { throw failure })
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a')).rejects.toBe(failure)
+      expect(create).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledOnce()
+      expect(revoke).toHaveBeenCalledWith('blob:attestation-export')
+    })
+  })
+
+  it('propagates a URL allocation failure without revoking a nonexistent URL', async () => {
+    await withDownloadMocks(new Response('raw body'), async ({ create, revoke, click }) => {
+      const failure = new Error('allocation failed')
+      create.mockImplementation(() => { throw failure })
+      await expect(new FinsecApiClient('http://api.test').downloadAttestation('release-1', 'json-precise', 'actor:a')).rejects.toBe(failure)
+      expect(click).not.toHaveBeenCalled()
+      expect(revoke).not.toHaveBeenCalled()
+    })
+  })
+})
