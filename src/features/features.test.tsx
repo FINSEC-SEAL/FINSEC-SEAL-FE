@@ -915,3 +915,335 @@ describe('Role A feature consoles', () => {
     expect(screen.getByText('role-a-console')).toBeInTheDocument()
   })
 })
+
+
+describe('Role A precise Evidence downloads', () => {
+  const formats = [
+    ['json', 'JSON 내려받기'], ['html', 'HTML 내려받기'], ['json-precise', '정밀 JSON 내려받기'],
+  ] as const
+
+  function pending<T>() {
+    let resolve!: (value: T) => void
+    let reject!: (cause: unknown) => void
+    const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no })
+    return { promise, resolve, reject }
+  }
+
+  async function inspect(user: ReturnType<typeof userEvent.setup>) {
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+    await screen.findByRole('heading', { name: /^(Current|Historical) attestation$/ })
+  }
+
+  function expectExports(disabled: boolean) {
+    for (const [, label] of formats) {
+      if (disabled) expect(screen.getByRole('button', { name: label })).toBeDisabled()
+      else expect(screen.getByRole('button', { name: label })).toBeEnabled()
+    }
+  }
+
+  it.each(formats)('passes %s, actor and one live signal through the shared busy lifetime', async (format, label) => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    const completion = pending<void>()
+    const download = vi.spyOn(api, 'downloadAttestation').mockReturnValue(completion.promise)
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="precise-actor" />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: label }))
+    const signal = download.mock.calls[0]![3]!
+    expect(download).toHaveBeenCalledExactlyOnceWith(release.id, format, 'precise-actor', signal)
+    expect(signal.aborted).toBe(false)
+    expectExports(true)
+    expect(screen.getByRole('button', { name: '검증 중…' })).toBeDisabled()
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    expect(download).toHaveBeenCalledOnce()
+    await act(async () => completion.resolve())
+    expectExports(false)
+    expect(signal.aborted).toBe(false)
+    expect(screen.getAllByText('REVIEW')).toHaveLength(2)
+  })
+
+  it.each([
+    ['demo', true, { decision: { value: 'REVIEW' } }],
+    ['missing decision', false, {}],
+    ['unknown decision', false, { decision: { value: 'UNKNOWN' } }],
+  ] as const)('blocks all export actions for %s without changing the stored view', async (_name, simulated, document) => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation(document))
+    const download = vi.spyOn(api, 'downloadAttestation')
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="precise-actor" simulated={simulated} />)
+    await inspect(user)
+    expectExports(true)
+    for (const [, label] of formats) await user.click(screen.getByRole('button', { name: label }))
+    expect(download).not.toHaveBeenCalled()
+    if (simulated) expect(screen.getByText(/DEMO_ONLY/)).toBeInTheDocument()
+    else expect(screen.getAllByText('INVALID')).toHaveLength(2)
+  })
+
+  it('has no export actions before inspection, during inspection or for an unknown Release', async () => {
+    const readResult = pending<Attestation>()
+    const read = vi.spyOn(api, 'attestation').mockReturnValue(readResult.promise)
+    const download = vi.spyOn(api, 'downloadAttestation')
+    const user = userEvent.setup()
+    const view = render(<EvidencePage releases={[release]} actorId="precise-actor" />)
+    expect(screen.queryByRole('button', { name: '정밀 JSON 내려받기' })).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+    expect(screen.queryByRole('button', { name: '정밀 JSON 내려받기' })).not.toBeInTheDocument()
+    view.rerender(<EvidencePage releases={[release]} actorId="precise-actor" preferredReleaseId="unknown" />)
+    await act(async () => readResult.resolve(effectAttestation({ decision: { value: 'PASS' } })))
+    expect(screen.getByLabelText('Release')).toHaveValue('')
+    expect(screen.getByRole('button', { name: 'Attestation 검증' })).toBeDisabled()
+    expect(screen.queryByRole('button', { name: 'JSON 내려받기' })).not.toBeInTheDocument()
+    expect(read).toHaveBeenCalledOnce()
+    expect(download).not.toHaveBeenCalled()
+  })
+
+  it.each(['REVIEW', 'BLOCKED'] as const)('keeps stale %s evidence downloadable and explains precision without certifying the current Release', async value => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value } }, true))
+    const download = vi.spyOn(api, 'downloadAttestation').mockResolvedValue(undefined)
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="precise-actor" />)
+    await inspect(user)
+    expectExports(false)
+    for (const [, label] of formats) await user.click(screen.getByRole('button', { name: label }))
+    expect(download.mock.calls.map(call => call[1])).toEqual(['json', 'html', 'json-precise'])
+    expect(screen.getByRole('heading', { name: 'Historical attestation' })).toBeInTheDocument()
+    expect(screen.getByText('STALE / NEEDS REVALIDATION')).toBeInTheDocument()
+    expect(screen.getByText('Document hash')).toBeInTheDocument()
+    expect(screen.getByText(/현대 네 보고서의 저장 수치와 배열 순서/)).toHaveTextContent('정밀 파일의 바이트 해시가 아닙니다')
+    expect(screen.getByText(/현대 네 보고서의 저장 수치와 배열 순서/)).toHaveTextContent('원래 숫자 표기나 소실된 과거 값은 복원하지 않습니다')
+    expect(screen.getByText('이전 증명서에는 관측 효과 건수가 없습니다. 0건으로 간주하지 않습니다.')).toBeInTheDocument()
+    expect(screen.getByText(value, { selector: '.attestation-summary dd' })).toBeInTheDocument()
+  })
+
+  it('shows a current export error, supports dismissal and a user retry with a fresh signal', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    const download = vi.spyOn(api, 'downloadAttestation').mockRejectedValueOnce(new Error('precise export unavailable')).mockResolvedValueOnce(undefined)
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="precise-actor" />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    expect(await screen.findByRole('alert')).toHaveTextContent('precise export unavailable')
+    expectExports(false)
+    await user.click(screen.getByRole('button', { name: '오류 닫기' }))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    await waitFor(() => expectExports(false))
+    expect(download).toHaveBeenCalledTimes(2)
+    expect(download.mock.calls[0]![3]).not.toBe(download.mock.calls[1]![3])
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('silently settles an actual AbortError in the current context', async () => {
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    vi.spyOn(api, 'downloadAttestation').mockRejectedValue(new DOMException('cancelled', 'AbortError'))
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release]} actorId="precise-actor" />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    await waitFor(() => expectExports(false))
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it('aborts a selected Release export and an old finally cannot clear the newer controller or busy state', async () => {
+    const second = { ...release, id: 'precise-release-2', version: '2.0' }
+    const third = { ...release, id: 'precise-release-3', version: '3.0' }
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    const old = pending<void>(), current = pending<void>()
+    const download = vi.spyOn(api, 'downloadAttestation').mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    const user = userEvent.setup()
+    render(<EvidencePage releases={[release, second, third]} actorId="precise-actor" />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    const oldSignal = download.mock.calls[0]![3]!
+    await user.selectOptions(screen.getByLabelText('Release'), second.id)
+    expect(oldSignal.aborted).toBe(true)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    const currentSignal = download.mock.calls[1]![3]!
+    await act(async () => old.reject(new Error('obsolete Release export')))
+    expectExports(true)
+    expect(currentSignal.aborted).toBe(false)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    await user.selectOptions(screen.getByLabelText('Release'), third.id)
+    expect(currentSignal.aborted).toBe(true)
+    await act(async () => current.resolve())
+    expect(screen.getByLabelText('Release')).toHaveValue(third.id)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it.each(['release', 'actor'] as const)('retains a new pending export across %s ABA and obsolete success/finally', async dimension => {
+    const second = { ...release, id: 'precise-release-2', version: '2.0' }
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' }, marker: 'current-evidence' }))
+    const old = pending<void>(), current = pending<void>()
+    const download = vi.spyOn(api, 'downloadAttestation').mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    const user = userEvent.setup()
+    const props = { releases: [release, second], actorId: 'actor-A', preferredReleaseId: release.id }
+    const view = render(<EvidencePage {...props} />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    const oldSignal = download.mock.calls[0]![3]!
+    view.rerender(<EvidencePage {...props} actorId={dimension === 'actor' ? 'actor-B' : props.actorId} preferredReleaseId={dimension === 'release' ? second.id : release.id} />)
+    expect(oldSignal.aborted).toBe(true)
+    view.rerender(<EvidencePage {...props} />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    const currentSignal = download.mock.calls[1]![3]!
+    expect(currentSignal).not.toBe(oldSignal)
+    await act(async () => old.resolve())
+    expectExports(true)
+    expect(currentSignal.aborted).toBe(false)
+    expect(document.querySelector('.document-preview pre')).toHaveTextContent('current-evidence')
+    await act(async () => current.resolve())
+    expectExports(false)
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+  })
+
+  it.each(['release', 'actor'] as const)('does not replace current %s ABA export errors with obsolete errors', async dimension => {
+    const second = { ...release, id: 'precise-release-2', version: '2.0' }
+    vi.spyOn(api, 'attestation').mockResolvedValue(effectAttestation({ decision: { value: 'REVIEW' } }))
+    const old = pending<void>(), current = pending<void>()
+    const download = vi.spyOn(api, 'downloadAttestation').mockReturnValueOnce(old.promise).mockReturnValueOnce(current.promise)
+    const user = userEvent.setup()
+    const props = { releases: [release, second], actorId: 'actor-A', preferredReleaseId: release.id }
+    const view = render(<EvidencePage {...props} />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    view.rerender(<EvidencePage {...props} actorId={dimension === 'actor' ? 'actor-B' : props.actorId} preferredReleaseId={dimension === 'release' ? second.id : release.id} />)
+    expect(download.mock.calls[0]![3]!.aborted).toBe(true)
+    view.rerender(<EvidencePage {...props} />)
+    await inspect(user)
+    await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+    await act(async () => current.reject(new Error('current ABA export')))
+    expect(await screen.findByRole('alert')).toHaveTextContent('current ABA export')
+    await act(async () => old.reject(new Error('obsolete ABA export')))
+    expect(screen.getByRole('alert')).toHaveTextContent('current ABA export')
+    expect(screen.getByRole('alert')).not.toHaveTextContent('obsolete')
+    expectExports(false)
+  })
+
+  it.each(['success', 'error'] as const)('discards an obsolete read %s after ABA while retaining the current document', async outcome => {
+    const second = { ...release, id: 'precise-release-2', version: '2.0' }
+    const old = pending<Attestation>()
+    vi.spyOn(api, 'attestation').mockReturnValueOnce(old.promise).mockResolvedValueOnce(effectAttestation({ decision: { value: 'BLOCKED' }, marker: 'new-current-document' }))
+    const user = userEvent.setup()
+    const props = { releases: [release, second], actorId: 'actor-A', preferredReleaseId: release.id }
+    const view = render(<EvidencePage {...props} />)
+    await user.click(screen.getByRole('button', { name: 'Attestation 검증' }))
+    view.rerender(<EvidencePage {...props} preferredReleaseId={second.id} />)
+    view.rerender(<EvidencePage {...props} />)
+    await inspect(user)
+    await act(async () => {
+      if (outcome === 'success') old.resolve(effectAttestation({ decision: { value: 'PASS' }, marker: 'obsolete-document' }))
+      else old.reject(new Error('obsolete read'))
+    })
+    expect(document.querySelector('.document-preview pre')).toHaveTextContent('new-current-document')
+    expect(document.querySelector('.document-preview pre')).not.toHaveTextContent('obsolete-document')
+    expect(screen.queryByRole('alert')).not.toBeInTheDocument()
+    expectExports(false)
+    expect(screen.getAllByText('BLOCKED')).toHaveLength(2)
+  })
+
+  async function nativeExport(response: Response) {
+    const { FinsecApiClient } = await import('../api/client')
+    const client = new FinsecApiClient('https://seal.example', { maxRetries: 0 })
+    const createDescriptor = Object.getOwnPropertyDescriptor(URL, 'createObjectURL')
+    const revokeDescriptor = Object.getOwnPropertyDescriptor(URL, 'revokeObjectURL')
+    const create = vi.fn((_blob: Blob) => 'blob:precise-ui')
+    const revoke = vi.fn()
+    Object.defineProperty(URL, 'createObjectURL', { configurable: true, writable: true, value: create })
+    Object.defineProperty(URL, 'revokeObjectURL', { configurable: true, writable: true, value: revoke })
+    const clicked: Array<{ href: string; filename: string }> = []
+    const click = vi.spyOn(HTMLAnchorElement.prototype, 'click').mockImplementation(function (this: HTMLAnchorElement) {
+      clicked.push({ href: this.href, filename: this.download })
+    })
+    const fetch = vi.spyOn(globalThis, 'fetch').mockResolvedValueOnce(new Response(JSON.stringify({
+      data: effectAttestation({ decision: { value: 'REVIEW' }, displayedNumber: 8.000000000000002 }), traceId: 'ui-fixture', timestamp: '2026-10-01T00:00:00Z',
+    }), { headers: { 'Content-Type': 'application/json' } })).mockResolvedValueOnce(response)
+    const blob = vi.spyOn(response, 'blob')
+    const json = vi.spyOn(response, 'json')
+    const text = vi.spyOn(response, 'text')
+    const download = vi.spyOn(client, 'downloadAttestation')
+    return { client, create, revoke, clicked, fetch, blob, json, text, download, restore() {
+      download.mockRestore(); blob.mockRestore(); json.mockRestore(); text.mockRestore(); fetch.mockRestore(); click.mockRestore()
+      if (createDescriptor) Object.defineProperty(URL, 'createObjectURL', createDescriptor)
+      else Reflect.deleteProperty(URL, 'createObjectURL')
+      if (revokeDescriptor) Object.defineProperty(URL, 'revokeObjectURL', revokeDescriptor)
+      else Reflect.deleteProperty(URL, 'revokeObjectURL')
+    } }
+  }
+
+  const preciseLiteral = '{"unicode":"정밀 ✨","metrics":{"value":8.000000000000001,"notApplicable":null,"status":"N_A","zero":0},"ordered":["z","a"]}'
+
+  it.each([
+    ['server filename', 'attachment; filename="server-evidence-precise.json"', 'server-evidence-precise.json'],
+    ['unexposed filename', null, 'finsec-attestation-precise.json'],
+  ] as const)('delivers native bytes through the actual client with %s', async (_name, disposition, filename) => {
+    const response = new Response(preciseLiteral, { headers: {
+      'Content-Type': 'application/json; profile="urn:finsec-seal:attestation:json-precise:v1"',
+      ...(disposition ? { 'Content-Disposition': disposition } : {}),
+    } })
+    const fixture = await nativeExport(response)
+    try {
+      const user = userEvent.setup()
+      render(<EvidencePage releases={[release]} actorId="native-actor" client={fixture.client} />)
+      await inspect(user)
+      await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+      await waitFor(() => expect(fixture.create).toHaveBeenCalledOnce())
+      const transferred = fixture.create.mock.calls[0]![0]
+      expect(transferred).toBe(await fixture.blob.mock.results[0]!.value)
+      expect(Array.from(new Uint8Array(await transferred.arrayBuffer()))).toEqual(Array.from(new TextEncoder().encode(preciseLiteral)))
+      expect(fixture.json).not.toHaveBeenCalled()
+      expect(fixture.text).not.toHaveBeenCalled()
+      expect(fixture.clicked).toEqual([{ href: 'blob:precise-ui', filename }])
+      expect(fixture.revoke).toHaveBeenCalledExactlyOnceWith('blob:precise-ui')
+      const [url, init] = fixture.fetch.mock.calls[1]!
+      expect(url).toBe(`https://seal.example/api/v1/releases/${release.id}/evidence-export?format=json-precise`)
+      expect(new Headers(init?.headers).get('X-Actor-Id')).toBe('native-actor')
+      expect(init?.signal).toBe(fixture.download.mock.calls[0]![3])
+      expect(init?.signal?.aborted).toBe(false)
+      expectExports(false)
+    } finally { fixture.restore() }
+  })
+
+  it('aborts the actual export signal on unmount and a late native Blob cannot create or click a URL', async () => {
+    const response = new Response(preciseLiteral)
+    const nativeBlob = response.blob.bind(response)
+    const fixture = await nativeExport(response)
+    const completion = pending<Blob>()
+    fixture.blob.mockReturnValue(completion.promise)
+    try {
+      const user = userEvent.setup()
+      const view = render(<EvidencePage releases={[release]} actorId="native-actor" client={fixture.client} />)
+      await inspect(user)
+      await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+      await waitFor(() => expect(fixture.blob).toHaveBeenCalledOnce())
+      const signal = fixture.download.mock.calls[0]![3]!
+      expect(signal.aborted).toBe(false)
+      view.unmount()
+      expect(signal.aborted).toBe(true)
+      const lateBlob = await nativeBlob()
+      await act(async () => completion.resolve(lateBlob))
+      expect(fixture.create).not.toHaveBeenCalled()
+      expect(fixture.clicked).toEqual([])
+      expect(fixture.revoke).not.toHaveBeenCalled()
+      expect(fixture.json).not.toHaveBeenCalled()
+      expect(fixture.text).not.toHaveBeenCalled()
+    } finally { fixture.restore() }
+  })
+
+  it('surfaces an actual non-OK export without creating a download URL', async () => {
+    const fixture = await nativeExport(new Response(JSON.stringify({ code: 'EXPORT_UNAVAILABLE', detail: 'export denied' }), { status: 409, headers: { 'Content-Type': 'application/json' } }))
+    try {
+      const user = userEvent.setup()
+      render(<EvidencePage releases={[release]} actorId="native-actor" client={fixture.client} />)
+      await inspect(user)
+      await user.click(screen.getByRole('button', { name: '정밀 JSON 내려받기' }))
+      expect(await screen.findByRole('alert')).toHaveTextContent('export denied')
+      expect(fixture.create).not.toHaveBeenCalled()
+      expect(fixture.clicked).toEqual([])
+      expect(fixture.revoke).not.toHaveBeenCalled()
+      expect(fixture.json).toHaveBeenCalledOnce()
+      expectExports(false)
+    } finally { fixture.restore() }
+  })
+})
