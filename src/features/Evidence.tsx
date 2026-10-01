@@ -123,7 +123,7 @@ export function EvidencePage({ releases, actorId, preferredReleaseId, onReleaseC
     finally { if (current()) setBusyKey(null) }
   }
 
-  async function download(format: 'json' | 'html') {
+  async function download(format: 'json' | 'html' | 'json-precise') {
     if (!validReleaseId) return
     const request = ++requestVersion.current
     const current = () => request === requestVersion.current && selectionKey === selectionKeyRef.current
@@ -162,7 +162,8 @@ export function EvidencePage({ releases, actorId, preferredReleaseId, onReleaseC
                   <dd>{effect.status === 'AVAILABLE' ? `${effect.value.toLocaleString('ko-KR')}건` : `N/A · ${effect.reason}`}</dd>
                 </div>)}</dl>}
           </section>
-          <div className="button-row"><button className="secondary-button" disabled={simulated || busy || !decision} onClick={() => void download('json')}>JSON 내려받기</button><button className="primary-button" disabled={simulated || busy || !decision} onClick={() => void download('html')}>HTML 내려받기</button></div>
+          <div className="button-row"><button className="secondary-button" disabled={simulated || busy || !decision} onClick={() => void download('json')}>JSON 내려받기</button><button className="primary-button" disabled={simulated || busy || !decision} onClick={() => void download('html')}>HTML 내려받기</button><button className="secondary-button" disabled={simulated || busy || !decision} onClick={() => void download('json-precise')}>정밀 JSON 내려받기</button></div>
+          <p className="muted">정밀 JSON은 현대 네 보고서의 저장 수치와 배열 순서를 보존합니다. Document hash는 canonical 문서 기준이며 정밀 파일의 바이트 해시가 아닙니다. 원래 숫자 표기나 소실된 과거 값은 복원하지 않습니다.</p>
           {simulated ? <p className="muted">DEMO_ONLY · 합성 예시의 실제 증적 내보내기는 비활성화됩니다.</p> : null}
         </article>
         <article className="panel document-preview"><div className="panel-heading"><div><p className="eyebrow">CANONICAL DOCUMENT</p><h2>Evidence snapshot</h2></div></div><pre>{JSON.stringify(attestation.document, null, 2)}</pre></article>

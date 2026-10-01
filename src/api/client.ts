@@ -515,7 +515,7 @@ export class FinsecApiClient {
     })
   }
 
-  async downloadAttestation(releaseId: string, format: 'json' | 'html', actorId: string, signal?: AbortSignal): Promise<void> {
+  async downloadAttestation(releaseId: string, format: 'json' | 'html' | 'json-precise', actorId: string, signal?: AbortSignal): Promise<void> {
     const response = await fetch(
       `${this.baseUrl}/api/v1/releases/${encodeURIComponent(releaseId)}/evidence-export?format=${format}`,
       { headers: { 'X-Actor-Id': actorId }, signal },
@@ -532,7 +532,7 @@ export class FinsecApiClient {
     const blob = await response.blob()
     if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
     const disposition = response.headers.get('Content-Disposition') ?? ''
-    const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? `finsec-attestation.${format}`
+    const name = disposition.match(/filename="?([^";]+)"?/)?.[1] ?? (format === 'json-precise' ? 'finsec-attestation-precise.json' : `finsec-attestation.${format}`)
     const href = URL.createObjectURL(blob)
     try {
       if (signal?.aborted) throw new DOMException('Attestation export cancelled', 'AbortError')
