@@ -366,7 +366,9 @@ export function createGovernanceSessionClient(base = defaultBase): GovernanceSes
       if (shared.flight?.context === context) {
         shared.flight.abortCode = 'stale'
         invalidate(shared, 'unknown', 'unavailable'); shared.flight.controller.abort(); notify(shared)
-      } else if (shared.members.size === 0) invalidate(shared, 'disconnected')
+      } else if (shared.members.size === 0) {
+        invalidate(shared, shared.flight ? 'unknown' : 'disconnected', shared.flight ? shared.snapshot.error : null)
+      }
       cleanChannel()
     },
   })
