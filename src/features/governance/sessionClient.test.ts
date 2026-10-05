@@ -439,6 +439,63 @@ describe('separate governance session lifecycle', () => {
     expect(peer.isCurrent(peer.getHandle())).toBe(true)
   })
 
+
+  it.each(['fetch', 'body'] as const)
+  ('keeps a retained %s flight unknown through repeated last-member disposal and reopening', async kind => {
+    const firstClient = clients.length, safeError = 'unavailable' as const
+    const waiting = deferred<Response>(), body = deferred<string>(), first = response()
+    const bodyRead = kind === 'body' ? vi.spyOn(first, 'text').mockImplementation(() => body.promise) : null
+    transport((_, index) => index === 0 ? (kind === 'fetch' ? waiting.promise : first)
+      : response(wire({ actorId: 'Explicitly recovered reviewer' })))
+    const owner = make(), pending = owner.connect(bootstrap)
+    const cancelled = rejected(pending, 'stale')
+    const finish = (): void => { waiting.resolve(first); body.resolve(JSON.stringify(envelope())) }
+    try {
+      if (bodyRead) await vi.waitFor(() => expect(bodyRead).toHaveBeenCalledTimes(1))
+      expect(calls).toHaveLength(1)
+      owner.dispose(); await cancelled
+      expect(calls[0]!.init.signal?.aborted).toBe(true)
+      for (let cycle = 0; cycle < 3; cycle++) {
+        const reopened = make()
+        expect(reopened.getSnapshot()).toMatchObject({ phase: 'unknown', identity: null, error: safeError, pending: true })
+        expect(reopened.getHandle()).toBeNull()
+        await rejected(reopened.connect(bootstrap), 'busy')
+        await rejected(reopened.current(), 'busy')
+        expect(reopened.getSnapshot().error).toBe(safeError)
+        expect(calls).toHaveLength(1)
+        safePublic(reopened)
+        reopened.dispose()
+      }
+      const retained = make(), held = retained.getSnapshot()
+      expect(held).toMatchObject({ phase: 'unknown', identity: null, error: safeError, pending: true })
+      expect(retained.getHandle()).toBeNull()
+      finish()
+      await vi.waitFor(() => expect(retained.getSnapshot())
+        .toMatchObject({ phase: 'unknown', identity: null, error: safeError, pending: false }))
+      expect(held).toMatchObject({ pending: true, error: safeError })
+      expect(retained.getHandle()).toBeNull()
+      expect(calls).toHaveLength(1)
+      safePublic(retained)
+      await retained.current()
+      expect(calls).toHaveLength(2)
+      expect(calls[1]!.headers).toEqual({ accept: 'application/json' })
+      expect(calls[1]!.init).toMatchObject({ method: 'GET', credentials: 'include' })
+      expect(retained.getSnapshot()).toMatchObject({ phase: 'connected', pending: false,
+        identity: { actorId: 'Explicitly recovered reviewer' } })
+      expect(retained.isCurrent(retained.getHandle())).toBe(true)
+      retained.dispose()
+      const clean = make()
+      expect(clean.getSnapshot()).toEqual({ phase: 'disconnected', identity: null, error: null, pending: false })
+      expect(clean.getHandle()).toBeNull()
+      expect(calls).toHaveLength(2)
+      clean.dispose()
+    } finally {
+      for (const client of clients.slice(firstClient)) client.dispose()
+      finish(); await cancelled
+      await new Promise<void>(done => setTimeout(done, 0))
+    }
+  })
+
   it('rejects forged/copied/C-shaped handles before invoking getters or sending DELETE', async () => {
     transport(() => response())
     const client = make(); await client.current()

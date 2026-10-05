@@ -2,6 +2,7 @@ import { StrictMode } from 'react'
 import { act, cleanup, fireEvent, render, screen, within } from '@testing-library/react'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { GovernanceSessionPanel } from './GovernanceSessionPanel'
+import * as sessionClientModule from './sessionClient'
 
 // Synthetic fetch/jsdom through the real client: not browser cookie/CORS or BE/D evidence.
 const now = Date.parse('2026-10-04T22:00:00Z')
@@ -338,6 +339,105 @@ describe('standalone governance session panel', () => {
     expect(calls).toHaveLength(2)
     expect(calls[1]!.headers.has('Authorization')).toBe(false)
     publicSafe()
+  })
+
+
+  it.each(['fetch', 'body'] as const)
+  ('keeps a retained %s flight unknown through repeated last-panel close/reopen and explicit recovery', async kind => {
+    const actualFactory = sessionClientModule.createGovernanceSessionClient
+    const created: ReturnType<typeof actualFactory>[] = []
+    const safeError = 'unavailable' as const
+    const factory = vi.spyOn(sessionClientModule, 'createGovernanceSessionClient').mockImplementation(apiBase => {
+      const client = actualFactory(apiBase)
+      created.push(client)
+      return client
+    })
+    const body = kind === 'body' ? slowBody() : null
+    const bodyRead = body ? vi.spyOn(body.reply, 'text') : null
+    let resolve!: (value: Response) => void
+    const waiting = kind === 'fetch' ? new Promise<Response>(done => { resolve = done }) : null
+    const finish = (): void => {
+      if (kind === 'fetch') resolve(response())
+      else body!.finish()
+    }
+    if (kind === 'fetch') remaining.push(finish)
+    transport(index => index === 0 ? (waiting ?? body!.reply) : response(wire('명시적으로 회복된 검토자')))
+    let owner: ReturnType<typeof mount> | null = null
+    let reopened: ReturnType<typeof mount> | null = null
+    try {
+      owner = mount()
+      expect(created).toHaveLength(1)
+      connect(owner.ui); await settle()
+      if (bodyRead) expect(bodyRead).toHaveBeenCalledTimes(1)
+      expect(calls).toHaveLength(1)
+      owner.unmount()
+      expect(calls[0]!.init.signal?.aborted).toBe(true)
+      for (let cycle = 0; cycle < 3; cycle++) {
+        reopened = mount(); await settle()
+        expect(created).toHaveLength(cycle + 2)
+        expect(created.at(-1)!.getSnapshot()).toMatchObject({
+          phase: 'unknown', identity: null, error: safeError, pending: true,
+        })
+        expect(created.at(-1)!.getHandle()).toBeNull()
+        expect(reopened.ui.getByRole('status')).toHaveTextContent('결과 미확정')
+        expect(reopened.ui.getByRole('region', { name: '거버넌스 세션' })).toHaveAttribute('aria-busy', 'true')
+        expect(reopened.ui.queryByText('거버넌스 검토자')).not.toBeInTheDocument()
+        expect(input(reopened.ui)).toHaveValue('')
+        busyButtons(reopened.ui)
+        expect(calls).toHaveLength(1)
+        publicSafe()
+        reopened.unmount(); reopened = null
+      }
+      reopened = mount(); await settle()
+      expect(created).toHaveLength(5)
+      const retainedClient = created.at(-1)!
+      expect(retainedClient.getSnapshot()).toMatchObject({
+        phase: 'unknown', identity: null, error: safeError, pending: true,
+      })
+      expect(retainedClient.getHandle()).toBeNull()
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('결과 미확정')
+      busyButtons(reopened.ui)
+      publicSafe()
+      await act(async () => {
+        finish()
+        await vi.waitFor(() => expect(retainedClient.getSnapshot()).toMatchObject({
+          phase: 'unknown', identity: null, error: safeError, pending: false,
+        }))
+      }); await settle()
+      expect(retainedClient.getHandle()).toBeNull()
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('결과 미확정')
+      expect(reopened.ui.getByRole('region', { name: '거버넌스 세션' })).toHaveAttribute('aria-busy', 'false')
+      expect(reopened.ui.queryByText('거버넌스 검토자')).not.toBeInTheDocument()
+      expect(reopened.ui.getByRole('button', { name: '연결' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '해제' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '상태 확인' })).toBeEnabled()
+      expect(calls).toHaveLength(1)
+      publicSafe()
+      fireEvent.click(reopened.ui.getByRole('button', { name: '상태 확인' })); await settle()
+      expect(reopened.ui.getByText('명시적으로 회복된 검토자')).toBeInTheDocument()
+      expect(calls).toHaveLength(2)
+      expect(calls[1]!.headers.has('Authorization')).toBe(false)
+      expect(calls[1]!.headers.has('X-CSRF-Token')).toBe(false)
+      expect(calls[1]!.init).toMatchObject({ method: 'GET', credentials: 'include' })
+      expect(retainedClient.isCurrent(retainedClient.getHandle())).toBe(true)
+      publicSafe()
+      reopened.unmount(); reopened = mount(); await settle()
+      expect(created).toHaveLength(6)
+      expect(created.at(-1)!.getSnapshot()).toEqual({
+        phase: 'disconnected', identity: null, error: null, pending: false,
+      })
+      expect(created.at(-1)!.getHandle()).toBeNull()
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('연결되지 않음')
+      expect(reopened.ui.getByRole('region', { name: '거버넌스 세션' })).toHaveAttribute('aria-busy', 'false')
+      expect(reopened.ui.getByRole('button', { name: '연결' })).toBeEnabled()
+      expect(input(reopened.ui)).toHaveValue('')
+      expect(calls).toHaveLength(2)
+    } finally {
+      owner?.unmount(); reopened?.unmount()
+      for (const client of created) client.dispose()
+      await act(async () => finish()); await settle()
+      factory.mockRestore()
+    }
   })
 
   it('does not restore the first A response during an A-to-B-to-A origin change', async () => {
