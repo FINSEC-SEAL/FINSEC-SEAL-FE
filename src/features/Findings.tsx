@@ -17,7 +17,8 @@ const categoryLabels = Object.fromEntries(categories.filter((item) => item.value
 function FindingBadge({ value, kind }: { value: string; kind: 'severity' | 'status' | 'outcome' }) {
   const critical = ['CRITICAL', 'HIGH', 'ATTACK_SUCCESS', 'OPEN'].includes(value)
   const positive = ['ATTACK_BLOCKED', 'NORMAL_SUCCESS', 'TRIAGED', 'RESOLVED', 'CLOSED'].includes(value)
-  return <span className={`status status--${critical ? 'critical' : positive ? 'positive' : kind === 'outcome' ? 'warning' : 'neutral'}`}>{value.replaceAll('_', ' ')}</span>
+  const warning = kind === 'outcome' || (kind === 'status' && value === 'ACCEPTED_RISK')
+  return <span className={`status status--${critical ? 'critical' : positive ? 'positive' : warning ? 'warning' : 'neutral'}`}>{value.replaceAll('_', ' ')}</span>
 }
 
 export function FindingsPage({ releases, actorId, preferredReleaseId, onReleaseChange }: { releases: Release[]; actorId: string; preferredReleaseId?: string; onReleaseChange?: (releaseId: string) => void }) {
@@ -164,7 +165,7 @@ function FindingReview({ releases, actorId, releaseId, category, status, setCate
     <section className="panel finding-filters">
       <label>검사할 Agent 버전<select aria-label="Finding Release" value={releaseId} onChange={(event) => chooseRelease(event.target.value)}><option value="">Release 선택</option>{releases.map((release) => <option key={release.id} value={release.id}>Release v{release.version} · {release.effectiveStatus}</option>)}</select></label>
       <label>공격 유형<select aria-label="Finding category" value={category} onChange={(event) => setCategory(event.target.value)}>{categories.map((item) => <option key={item.value || 'all'} value={item.value}>{item.label}</option>)}</select></label>
-      <label>Status<select aria-label="Finding status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">전체 status</option><option>OPEN</option><option>TRIAGED</option><option>RESOLVED</option><option>CLOSED</option></select></label>
+      <label>Status<select aria-label="Finding status" value={status} onChange={(event) => setStatus(event.target.value)}><option value="">전체 status</option><option>OPEN</option><option>TRIAGED</option><option>ACCEPTED_RISK</option><option>RESOLVED</option><option>CLOSED</option></select></label>
       <button className="primary-button" disabled={!releaseId || loading} onClick={() => void loadFindings()}>조회</button>
     </section>
     {releaseId && items !== null ? <section className="finding-summary" aria-label="Finding summary">
@@ -178,6 +179,7 @@ function FindingReview({ releases, actorId, releaseId, category, status, setCate
         <section className="panel table-wrap"><div className="panel-heading"><div><p className="eyebrow">VIOLATIONS</p><h2>{items.length} findings</h2></div></div><table><thead><tr><th>Finding</th><th>Severity</th><th>Status</th><th>Updated</th></tr></thead><tbody>{items.map((item) => <tr key={item.id} className={detail?.finding.id === item.id ? 'selected-row' : undefined} onClick={() => void inspect(item)}><td><strong>{categoryLabels[item.category] ?? item.category} · {item.title}</strong><small>{item.violatedInvariant} · {item.findingGroupKey ? 'grouped finding' : 'single finding'}</small></td><td><FindingBadge value={item.severity} kind="severity" /></td><td><FindingBadge value={item.status} kind="status" /></td><td>{formatDate(item.updatedAt)}</td></tr>)}</tbody></table></section>
         <section className="panel finding-detail">{detail ? <>
           <div className="panel-heading"><div><p className="eyebrow">ORACLE EVIDENCE</p><h2>{detail.finding.title}</h2></div><FindingBadge value={detail.oracleResult.outcome} kind="outcome" /></div>
+          {detail.finding.status === 'ACCEPTED_RISK' ? <p role="note"><FindingBadge value={detail.finding.status} kind="status" /> · 위험 수용은 Finding 해결이나 Release PASS를 뜻하지 않습니다. BLOCKED 조건이 우선하며, 그 외에는 REVIEW 대상입니다.</p> : null}
           <dl className="detail-grid"><div><dt>Oracle</dt><dd>{detail.oracleResult.oracleType} v{detail.oracleResult.oracleVersion}</dd></div><div><dt>Reason</dt><dd>{detail.oracleResult.reasonCode}</dd></div><div><dt>Invariant</dt><dd>{detail.oracleResult.invariantId}</dd></div><div><dt>Source event</dt><dd><ShortHash value={detail.oracleResult.sourceEventId} /></dd></div><div><dt>Evidence digest</dt><dd><ShortHash value={detail.oracleResult.evidenceDigest} /></dd></div><div><dt>Evaluated</dt><dd>{formatDate(detail.oracleResult.evaluatedAt)}</dd></div></dl>
           <details open><summary>검증된 Evidence JSON</summary><pre>{JSON.stringify(detail.oracleResult.evidence, null, 2)}</pre></details>
           <details><summary>Root cause</summary><pre>{JSON.stringify(detail.finding.rootCause, null, 2)}</pre></details>
