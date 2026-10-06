@@ -1,4 +1,4 @@
-import { act, render, screen, waitFor, within } from '@testing-library/react'
+import { act, fireEvent, render, screen, waitFor, within } from '@testing-library/react'
 import userEvent from '@testing-library/user-event'
 import App from './App'
 import type { Fingerprint, Release } from './api/contracts'
@@ -1007,5 +1007,359 @@ describe('LIVE stored Replay policy routing', () => {
     expect(screen.queryByRole('heading', { name: '저장된 Replay 정책 비교' })).not.toBeInTheDocument()
     expect(screen.queryByRole('navigation', { name: '정책 화면 이동' })).not.toBeInTheDocument()
     expect(fetch).not.toHaveBeenCalled()
+  })
+})
+
+
+// Shell integration through frozen published A/C modules and synthetic HTTP only.
+// Native dialog cancel is exercised in jsdom; this is not browser Escape/CORS/cookie proof.
+describe('LIVE settings governance session integration', () => {
+  const bootstrap = 'SYNTHETIC_SETTINGS_GOV_BOOTSTRAP_PRIVATE_0123456789'
+  const csrf = '00000000-0000-4000-8000-000000000051:00000000-0000-4000-8000-000000000052'
+  const cookieCanary = 'SYNTHETIC_SETTINGS_HTTPONLY_COOKIE_NEVER_PUBLIC'
+  const actor = 'settings-governance-reviewer'
+  const workspace = '019903ac-abcd-7000-8000-000000000051'
+  const session = '019903ac-abcd-7000-8000-000000000052'
+  const path = '/api/v1/governance-reviewer-session'
+  type User = ReturnType<typeof userEvent.setup>
+  type View = ReturnType<typeof render>
+  type Call = { pathname: string; method: string; headers: Headers; credentials: RequestCredentials | undefined;
+    cache: RequestCache | undefined; redirect: RequestRedirect | undefined; signal: AbortSignal | null | undefined }
+  type Exit = 'Close' | 'X' | 'native cancel' | 'Actor apply' | 'mode button' | 'hash MODE' | 'App unmount'
+
+  function wireText(): string {
+    const now = Date.now()
+    return JSON.stringify({ data: { csrfToken: csrf, expiresAt: Math.floor(now / 1000) + 1800,
+      actorId: actor, workspaceId: workspace, role: 'AI_GOVERNANCE_REVIEWER', sessionId: session, demoMode: true },
+    traceId: '019903ac-abcd-7000-8000-000000000053', timestamp: new Date(now).toISOString() })
+  }
+  function reply(text: string): Response {
+    return new Response(text, { status: 200, headers: { 'Content-Type': 'application/json',
+      'Set-Cookie': `__Host-FINSEC_GOVERNANCE=${cookieCanary}` } })
+  }
+  function transport(backend: ReturnType<typeof livePolicyApi>, custom?: (call: Call, index: number) => Response | Promise<Response>) {
+    const original = backend.fetch.getMockImplementation()!
+    const text = wireText()
+    const calls: Call[] = []
+    backend.fetch.mockImplementation(async (input, init = {}) => {
+      const url = new URL(String(input), window.location.origin)
+      if (url.pathname !== path && url.pathname !== `${path}/${session}`) return original(input, init)
+      // The client erases credential Headers later; snapshot only at actual dispatch.
+      const call: Call = { pathname: url.pathname, method: init.method ?? 'GET', headers: new Headers(init.headers),
+        credentials: init.credentials, cache: init.cache, redirect: init.redirect, signal: init.signal }
+      calls.push(call)
+      if (custom) return custom(call, calls.length - 1)
+      if (call.method === 'GET' && call.pathname === path) return reply(text)
+      if (call.method === 'DELETE' && call.pathname === `${path}/${session}`) return new Response(null, { status: 204 })
+      throw new Error('Unexpected synthetic governance lifecycle request')
+    })
+    return { calls, text }
+  }
+  function publicSafe(): void {
+    for (const value of [bootstrap, csrf, cookieCanary]) {
+      expect(document.body.textContent?.includes(value)).toBe(false)
+      expect(document.body.innerHTML.includes(value)).toBe(false)
+      expect(window.location.href.includes(value)).toBe(false)
+      for (const storage of [window.localStorage, window.sessionStorage]) {
+        for (let index = 0; index < storage.length; index++) {
+          const key = storage.key(index)!
+          expect(key.includes(value)).toBe(false)
+          expect((storage.getItem(key) ?? '').includes(value)).toBe(false)
+        }
+      }
+    }
+  }
+  function governanceHeadersSafe(calls: readonly Call[]): void {
+    for (const [index, call] of calls.entries()) {
+      expect(call.headers.has('X-Contract-Reviewer-Key')).toBe(false)
+      expect(call.headers.has('X-Actor-Id')).toBe(false)
+      expect(call.headers.has('Cookie')).toBe(false)
+      expect(call.credentials).toBe('include'); expect(call.cache).toBe('no-store'); expect(call.redirect).toBe('error')
+      if (call.method === 'DELETE') {
+        expect(call.pathname).toBe(`${path}/${session}`)
+        expect(call.headers.has('Authorization')).toBe(false)
+        expect(call.headers.get('X-CSRF-Token') === csrf).toBe(true)
+        expect(call.headers.get('Idempotency-Key')).toMatch(/^gov-logout-[0-9a-f-]{36}$/)
+      } else {
+        expect(call.method).toBe('GET'); expect(call.pathname).toBe(path)
+        expect(call.headers.get('Authorization') === (index === 0 ? `GovernanceBootstrap ${bootstrap}` : null)).toBe(true)
+        expect(call.headers.has('X-CSRF-Token')).toBe(false)
+        expect(call.headers.has('Idempotency-Key')).toBe(false)
+      }
+    }
+  }
+  async function open(user: User) {
+    await user.click(screen.getByRole('button', { name: '환경 설정' }))
+    const dialog = screen.getByRole('dialog', { name: '워크스페이스 환경 설정' })
+    const panel = await within(dialog).findByRole('region', { name: '거버넌스 세션' })
+    await within(panel).findByRole('button', { name: '연결' })
+    return { dialog, panel, ui: within(panel) }
+  }
+  async function connect(user: User, ui: ReturnType<typeof within>): Promise<void> {
+    await user.type(ui.getByLabelText('거버넌스 연결 키'), bootstrap)
+    await user.click(ui.getByRole('button', { name: '연결' }))
+    expect(ui.getByLabelText('거버넌스 연결 키')).toHaveValue('')
+  }
+  function changeHash(hash: string): void {
+    act(() => { window.location.hash = hash; window.dispatchEvent(new HashChangeEvent('hashchange')) })
+  }
+  async function exit(kind: Exit, user: User, view: View, dialog: HTMLElement): Promise<void> {
+    if (kind === 'Close') await user.click(within(dialog).getByRole('button', { name: '닫기' }))
+    else if (kind === 'X') await user.click(within(dialog).getByRole('button', { name: '확인창 닫기' }))
+    else if (kind === 'native cancel') fireEvent(dialog, new Event('cancel', { bubbles: true, cancelable: true }))
+    else if (kind === 'Actor apply') {
+      await user.clear(within(dialog).getByLabelText('API actor ID'))
+      await user.type(within(dialog).getByLabelText('API actor ID'), 'settings-api-actor')
+      await user.click(within(dialog).getByRole('button', { name: 'Actor 적용' }))
+    } else if (kind === 'mode button') await user.click(within(dialog).getByRole('button', { name: '샘플 체험 모드로' }))
+    else if (kind === 'hash MODE') changeHash('/demo/overview')
+    else view.unmount()
+  }
+  function deferred(kind: 'fetch' | 'body') {
+    const text = wireText()
+    let finished = false
+    let bodyRead = false
+    let resolve!: (value: Response) => void
+    let controller!: ReadableStreamDefaultController<Uint8Array>
+    const pending = kind === 'fetch' ? new Promise<Response>(done => { resolve = done }) : null
+    const body = kind === 'body' ? new ReadableStream<Uint8Array>({
+      start(value) { controller = value },
+      pull() { bodyRead = true },
+      cancel() { finished = true },
+    }, { highWaterMark: 0 }) : null
+    const response = body ? new Response(body, { status: 200, headers: { 'Content-Type': 'application/json' } }) : null
+    return {
+      response: () => pending ?? response!,
+      bodyRead: () => bodyRead,
+      finish: () => {
+        if (finished) return
+        finished = true
+        if (kind === 'fetch') resolve(reply(text))
+        else { controller.enqueue(new TextEncoder().encode(text)); controller.close() }
+      },
+    }
+  }
+  async function settle(view: View, pending?: ReturnType<typeof deferred>): Promise<void> {
+    view.unmount()
+    await act(async () => { pending?.finish(); for (let i = 0; i < 20; i++) await Promise.resolve() })
+  }
+
+  it('keeps initial LIVE inventory separate from governance0 and never mounts or fetches governance in SIMULATED settings', async () => {
+    window.history.replaceState(null, '', '/#/live/overview')
+    const backend = livePolicyApi(), gov = transport(backend), user = userEvent.setup()
+    const view = render(<App />)
+    try {
+      await screen.findByRole('heading', { name: '검증 워크스페이스' })
+      expect(backend.fetch).toHaveBeenCalledTimes(2)
+      expect(screen.queryByRole('region', { name: '거버넌스 세션' })).not.toBeInTheDocument()
+      expect(gov.calls).toHaveLength(0)
+      const { dialog, panel } = await open(user)
+      expect(within(dialog).getAllByRole('region', { name: '거버넌스 세션' })).toHaveLength(1)
+      expect(gov.calls).toHaveLength(0)
+      const actorForm = within(dialog).getByLabelText('API actor ID').closest('form')!
+      const governanceForm = within(panel).getByLabelText('거버넌스 연결 키').closest('form')!
+      expect(actorForm).not.toBe(governanceForm)
+      expect(actorForm.contains(governanceForm)).toBe(false)
+      expect(governanceForm.contains(actorForm)).toBe(false)
+      await user.click(within(dialog).getByRole('button', { name: '샘플 체험 모드로' }))
+      await screen.findByText('SIMULATED · 합성 체험')
+      backend.fetch.mockClear()
+      await user.click(screen.getByRole('button', { name: '환경 설정' }))
+      expect(screen.queryByRole('region', { name: '거버넌스 세션' })).not.toBeInTheDocument()
+      expect(backend.fetch).not.toHaveBeenCalled()
+      expect(gov.calls).toHaveLength(0)
+    } finally { await settle(view) }
+  })
+
+  it('uses only explicit connect/current/own logout and keeps server identity separate from API Actor and selected Release', async () => {
+    window.history.replaceState(null, '', `/#/live/policy?releaseId=${selectedReleaseId}`)
+    const backend = livePolicyApi(), gov = transport(backend), user = userEvent.setup()
+    const view = render(<App />)
+    try {
+      await screen.findByRole('heading', { name: '안전 정책 검토' })
+      const { dialog, ui } = await open(user)
+      const actorBefore = (within(dialog).getByLabelText('API actor ID') as HTMLInputElement).value
+      await connect(user, ui)
+      await waitFor(() => expect(ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(gov.calls).toHaveLength(2)
+      expect(gov.calls[0]!.headers.get('Authorization') === `GovernanceBootstrap ${bootstrap}`).toBe(true)
+      expect(gov.calls[1]!.headers.has('Authorization')).toBe(false)
+      expect(ui.getByText(actor)).toBeInTheDocument()
+      expect(ui.getByText(workspace)).toBeInTheDocument()
+      expect(ui.getByText('AI_GOVERNANCE_REVIEWER')).toBeInTheDocument()
+      expect(within(dialog).getByLabelText('API actor ID')).toHaveValue(actorBefore)
+      expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+      for (const call of gov.calls) {
+        expect(call.method).toBe('GET')
+        expect(call.credentials).toBe('include'); expect(call.cache).toBe('no-store'); expect(call.redirect).toBe('error')
+        expect(call.headers.has('X-Actor-Id')).toBe(false)
+        expect(call.headers.has('X-Contract-Reviewer-Key')).toBe(false)
+      }
+      await user.click(ui.getByRole('button', { name: '상태 확인' }))
+      await waitFor(() => expect(ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(gov.calls).toHaveLength(3)
+      expect(gov.calls[2]!.headers.has('Authorization')).toBe(false)
+      await user.click(ui.getByRole('button', { name: '해제' }))
+      await waitFor(() => expect(ui.getByRole('status')).toHaveTextContent('연결되지 않음'))
+      expect(gov.calls).toHaveLength(4)
+      const logout = gov.calls[3]!
+      expect(logout.method).toBe('DELETE'); expect(logout.pathname).toBe(`${path}/${session}`)
+      expect(logout.headers.get('X-CSRF-Token') === csrf).toBe(true)
+      expect(logout.headers.get('Idempotency-Key')).toMatch(/^gov-logout-[0-9a-f-]{36}$/)
+      expect(logout.headers.has('Authorization')).toBe(false)
+      governanceHeadersSafe(gov.calls)
+      publicSafe()
+    } finally { await settle(view) }
+  })
+
+  const pendingExits = (['fetch', 'body'] as const).flatMap(kind =>
+    (['Close', 'X', 'native cancel', 'Actor apply', 'mode button', 'hash MODE', 'App unmount'] as const).map(kindOfExit => ({ kind, kindOfExit })))
+  it.each(pendingExits)('disposes $kind pending work through $kindOfExit without auto restore or false disconnected claims', async ({ kind, kindOfExit }) => {
+    window.history.replaceState(null, '', `/#/live/overview?releaseId=${selectedReleaseId}`)
+    const backend = livePolicyApi(), pending = deferred(kind)
+    const gov = transport(backend, (call, index) => index === 0 ? pending.response() : reply(wireText()))
+    const user = userEvent.setup()
+    let view = render(<App />)
+    try {
+      await screen.findByRole('heading', { name: '검증 워크스페이스' })
+      const original = await open(user)
+      const oldInput = original.ui.getByLabelText('거버넌스 연결 키')
+      await connect(user, original.ui)
+      await waitFor(() => expect(gov.calls).toHaveLength(1))
+      if (kind === 'body') await waitFor(() => expect(pending.bodyRead()).toBe(true))
+      expect(original.panel).toHaveAttribute('aria-busy', 'true')
+      expect(original.ui.queryByText(actor)).not.toBeInTheDocument()
+      await exit(kindOfExit, user, view, original.dialog)
+      expect(screen.queryByRole('region', { name: '거버넌스 세션' })).not.toBeInTheDocument()
+      expect(oldInput).toHaveValue('')
+      expect(gov.calls[0]!.signal?.aborted).toBe(true)
+      expect(gov.calls).toHaveLength(1)
+      if (kindOfExit === 'mode button' || kindOfExit === 'hash MODE') {
+        const total = backend.fetch.mock.calls.length
+        await user.click(screen.getByRole('button', { name: '환경 설정' }))
+        expect(screen.queryByRole('region', { name: '거버넌스 세션' })).not.toBeInTheDocument()
+        expect(backend.fetch).toHaveBeenCalledTimes(total)
+        changeHash(`/live/overview?releaseId=${selectedReleaseId}`)
+        await screen.findByRole('heading', { name: '검증 워크스페이스' })
+      } else if (kindOfExit === 'App unmount') view = render(<App />)
+      const reopened = await open(user)
+      expect(reopened.ui.getByLabelText('거버넌스 연결 키')).toHaveValue('')
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('결과 미확정')
+      expect(reopened.panel).toHaveAttribute('aria-busy', 'true')
+      expect(reopened.ui.getByRole('button', { name: '상태 확인' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '연결' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '해제' })).toBeDisabled()
+      expect(reopened.ui.queryByText(actor)).not.toBeInTheDocument()
+      expect(gov.calls).toHaveLength(1)
+      await act(async () => { pending.finish(); for (let i = 0; i < 20; i++) await Promise.resolve() })
+      await waitFor(() => expect(reopened.panel).toHaveAttribute('aria-busy', 'false'))
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('결과 미확정')
+      expect(reopened.ui.queryByText(actor)).not.toBeInTheDocument()
+      expect(reopened.ui.getByRole('button', { name: '연결' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '해제' })).toBeDisabled()
+      expect(reopened.ui.getByRole('button', { name: '상태 확인' })).toBeEnabled()
+      expect(gov.calls).toHaveLength(1)
+      await user.click(reopened.ui.getByRole('button', { name: '상태 확인' }))
+      await waitFor(() => expect(reopened.ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(gov.calls).toHaveLength(2)
+      expect(gov.calls[1]!.headers.has('Authorization')).toBe(false)
+      expect(gov.calls[1]!.headers.has('X-CSRF-Token')).toBe(false)
+      expect(reopened.ui.getByText(actor)).toBeInTheDocument()
+      publicSafe()
+    } finally { await settle(view, pending) }
+  })
+
+  it('clears a typed key and reopens disconnected only after the old flight-free origin channel was removed', async () => {
+    window.history.replaceState(null, '', '/#/live/overview')
+    const backend = livePolicyApi(), gov = transport(backend), user = userEvent.setup()
+    const view = render(<App />)
+    try {
+      await screen.findByRole('heading', { name: '검증 워크스페이스' })
+      const initial = await open(user)
+      const input = initial.ui.getByLabelText('거버넌스 연결 키')
+      await user.type(input, bootstrap)
+      expect(input).toHaveValue(bootstrap)
+      await user.click(within(initial.dialog).getByRole('button', { name: '닫기' }))
+      expect(input).toHaveValue('')
+      const reopened = await open(user)
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('연결되지 않음')
+      expect(reopened.panel).toHaveAttribute('aria-busy', 'false')
+      expect(reopened.ui.getByLabelText('거버넌스 연결 키')).toHaveValue('')
+      expect(gov.calls).toHaveLength(0)
+      await user.click(reopened.ui.getByRole('button', { name: '상태 확인' }))
+      await waitFor(() => expect(reopened.ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(gov.calls).toHaveLength(1)
+      expect(gov.calls[0]!.headers.has('Authorization')).toBe(false)
+      publicSafe()
+    } finally { await settle(view) }
+  })
+
+  it('preserves the same connected panel across SAME-LIVE page and Release hash changes', async () => {
+    window.history.replaceState(null, '', `/#/live/overview?releaseId=${selectedReleaseId}`)
+    const backend = livePolicyApi(), gov = transport(backend), user = userEvent.setup()
+    const view = render(<App />)
+    try {
+      await screen.findByRole('heading', { name: '검증 워크스페이스' })
+      const initial = await open(user)
+      const input = initial.ui.getByLabelText('거버넌스 연결 키')
+      await connect(user, initial.ui)
+      await waitFor(() => expect(initial.ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(gov.calls).toHaveLength(2)
+      changeHash(`/live/policy?releaseId=${selectedReleaseId}`)
+      await screen.findByRole('heading', { name: '안전 정책 검토' })
+      expect(screen.getByRole('region', { name: '거버넌스 세션' })).toBe(initial.panel)
+      expect(within(initial.panel).getByLabelText('거버넌스 연결 키')).toBe(input)
+      changeHash(`/live/policy?releaseId=${liveReleaseId}`)
+      await waitFor(() => expect(screen.getByLabelText('정책 Release')).toHaveValue(liveReleaseId))
+      expect(screen.getByRole('dialog', { name: '워크스페이스 환경 설정' })).toBe(initial.dialog)
+      expect(screen.getByRole('region', { name: '거버넌스 세션' })).toBe(initial.panel)
+      expect(initial.ui.getByRole('status')).toHaveTextContent('연결됨')
+      expect(initial.ui.getByText(actor)).toBeInTheDocument()
+      expect(gov.calls).toHaveLength(2)
+      await user.click(within(initial.dialog).getByRole('button', { name: '닫기' }))
+      const reopened = await open(user)
+      expect(reopened.ui.getByRole('status')).toHaveTextContent('연결되지 않음')
+      expect(gov.calls).toHaveLength(2)
+      publicSafe()
+    } finally { await settle(view) }
+  })
+
+  it('keeps the actual C local-reviewer workflow and selected Release separate while governance settings connect', async () => {
+    window.history.replaceState(null, '', `/#/live/policy?releaseId=${selectedReleaseId}`)
+    const backend = livePolicyApi(), gov = transport(backend), user = userEvent.setup()
+    const view = render(<App />)
+    try {
+      await applyLiveReviewer(user)
+      const cCount = backend.contracts().length
+      const { dialog, ui } = await open(user)
+      const apiActor = (within(dialog).getByLabelText('API actor ID') as HTMLInputElement).value
+      await connect(user, ui)
+      await waitFor(() => expect(ui.getByRole('status')).toHaveTextContent('연결됨'))
+      expect(backend.contracts()).toHaveLength(cCount)
+      expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+      expect(screen.getByLabelText('검토자 키')).toHaveValue(reviewerKey)
+      expect(within(dialog).getByLabelText('API actor ID')).toHaveValue(apiActor)
+      expect(gov.calls).toHaveLength(2)
+      governanceHeadersSafe(gov.calls)
+      publicSafe()
+      await user.click(within(dialog).getByRole('button', { name: '닫기' }))
+      await user.click(screen.getByRole('button', { name: '승인 검토' }))
+      const cDialog = await screen.findByRole('dialog', { name: '계약 승인 확인' })
+      await user.type(within(cDialog).getByLabelText('검토 의견'), '독립된 C 정책 검토 의견')
+      await user.click(within(cDialog).getByRole('checkbox', { name: consent }))
+      await user.click(within(cDialog).getByRole('button', { name: '승인 요청 전송' }))
+      await screen.findByText('계약 승인 요청이 처리되었습니다.')
+      expect(backend.posts()).toHaveLength(1)
+      expect(gov.calls).toHaveLength(2)
+      expect(screen.getByLabelText('정책 Release')).toHaveValue(selectedReleaseId)
+      for (const [, init] of backend.contracts()) {
+        const headers = new Headers(init?.headers)
+        expect(headers.get('X-Contract-Reviewer-Key') === reviewerKey).toBe(true)
+        expect(headers.has('Authorization')).toBe(false); expect(headers.has('X-CSRF-Token')).toBe(false)
+        expect(headers.has('X-Actor-Id')).toBe(false); expect(headers.has('Cookie')).toBe(false)
+        expect(init?.credentials).toBe('omit')
+      }
+      publicSafe()
+    } finally { await settle(view) }
   })
 })
